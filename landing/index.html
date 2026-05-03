@@ -3,163 +3,628 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Control - Manage your Claude Desktop setup</title>
-<meta name="description" content="A small local app to manage Claude Desktop MCPs and Skills. By Sekoia. macOS only. 100% local.">
+<title>Claude Control - Manage Claude Desktop. Beautifully.</title>
+<meta name="description" content="A small local app to manage Claude Desktop MCPs and Skills. By Sekoia. macOS only. 100% local. Zero tracking.">
 <meta property="og:title" content="Claude Control">
-<meta property="og:description" content="Toggle MCPs, manage Skills, restart Claude with one click.">
+<meta property="og:description" content="Toggle MCPs. Manage Skills. Restart Claude with one click. Locally on your Mac.">
 <meta property="og:url" content="https://claude.sekoia.ca">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%232C5F3F'/%3E%3Ctext x='50' y='66' font-size='44' text-anchor='middle' fill='white'%3ECC%3C/text%3E%3C/svg%3E">
-<script src="https://cdn.tailwindcss.com"></script>
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230E1A14'/%3E%3Ccircle cx='50' cy='50' r='12' fill='%23D97757'/%3E%3C/svg%3E">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1.4.2/dist/fonts/geist-sans/style.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1.4.2/dist/fonts/geist-mono/style.min.css">
+
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-body{font-family:'Inter',system-ui,sans-serif;}
-.gradient-bg{background:linear-gradient(180deg,#2C5F3F 0%,#14301F 100%);}
-.gradient-text{background:linear-gradient(135deg,#2C5F3F,#D97757);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
-.card-shadow{box-shadow:0 1px 3px rgba(0,0,0,.04),0 4px 12px rgba(0,0,0,.04);}
-.copper{background:linear-gradient(135deg,#D97757,#C15F3C);}
-.code{font-family:'SF Mono',Menlo,Monaco,monospace;}
-@keyframes pulseSoft{0%,100%{opacity:1}50%{opacity:.6}}
-.pulse-dot{animation:pulseSoft 2s infinite;}
-</style></head>
-<body class="bg-stone-50 text-stone-900 antialiased">
+:root {
+  --forest-deep: #08110D;
+  --forest: #0E1A14;
+  --forest-light: #16241D;
+  --forest-card: #131F19;
+  --sekoia: #2C5F3F;
+  --sekoia-bright: #3D8A60;
+  --copper: #D97757;
+  --copper-bright: #E08866;
+  --copper-glow: rgba(217, 119, 87, 0.15);
+  --cream: #F4F2ED;
+  --cream-muted: #BFC5BD;
+  --cream-subtle: #6E7A74;
+  --border: #1F2D26;
+  --border-bright: #2D3F36;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--forest);
+  color: var(--cream);
+  font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-feature-settings: "ss01", "cv01";
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+.display {
+  font-family: 'Instrument Serif', 'Times New Roman', serif;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+}
+.mono {
+  font-family: 'Geist Mono', 'SF Mono', Menlo, monospace;
+  font-feature-settings: "ss01";
+}
+/* Grain overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 100;
+  opacity: 0.025;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+/* Vertical "root" line through page */
+.root-line {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: linear-gradient(180deg, transparent 0%, var(--copper) 5%, var(--sekoia) 30%, var(--border) 60%, transparent 100%);
+  opacity: 0.4;
+  transform: translateX(-50%);
+  z-index: 0;
+  pointer-events: none;
+}
+/* Subtle radial glow behind hero */
+.hero-glow {
+  position: absolute;
+  top: -10%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 80%;
+  height: 100%;
+  background: radial-gradient(ellipse at center top, var(--copper-glow) 0%, transparent 50%);
+  pointer-events: none;
+  z-index: 0;
+}
+/* Reveal animation */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.rise {
+  opacity: 0;
+  animation: rise 1s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+}
+.rise-1 { animation-delay: 0.05s; }
+.rise-2 { animation-delay: 0.15s; }
+.rise-3 { animation-delay: 0.30s; }
+.rise-4 { animation-delay: 0.45s; }
+.rise-5 { animation-delay: 0.60s; }
+.rise-6 { animation-delay: 0.75s; }
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.pulse-dot { animation: pulse-soft 2.4s ease-in-out infinite; }
+/* Buttons */
+.btn-primary {
+  background: var(--copper);
+  color: var(--forest-deep);
+  font-weight: 500;
+  border: 1px solid var(--copper);
+  transition: all 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.btn-primary:hover {
+  background: var(--copper-bright);
+  border-color: var(--copper-bright);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 40px -10px rgba(217, 119, 87, 0.5);
+}
+.btn-secondary {
+  background: transparent;
+  color: var(--cream);
+  border: 1px solid var(--border-bright);
+  transition: all 0.2s;
+}
+.btn-secondary:hover {
+  border-color: var(--cream-muted);
+  background: rgba(255,255,255,0.02);
+}
+/* Cards */
+.card {
+  background: var(--forest-card);
+  border: 1px solid var(--border);
+  transition: border-color 0.3s;
+}
+.card:hover {
+  border-color: var(--border-bright);
+}
+.card-feature::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(135deg, transparent 0%, var(--copper-glow) 100%);
+  opacity: 0;
+  transition: opacity 0.4s;
+  pointer-events: none;
+}
+.card-feature:hover::before { opacity: 1; }
+/* Section divider numbering */
+.section-num {
+  font-family: 'Instrument Serif', serif;
+  font-style: italic;
+  color: var(--cream-subtle);
+  font-size: 0.875rem;
+}
+/* Code block */
+.code-block {
+  background: var(--forest-deep);
+  border: 1px solid var(--border);
+  font-family: 'Geist Mono', monospace;
+  position: relative;
+}
+/* Mockup window */
+.window-frame {
+  background: var(--forest-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 40px 80px -20px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.02) inset;
+}
+.window-bar {
+  background: var(--forest-light);
+  border-bottom: 1px solid var(--border);
+  height: 36px;
+}
+/* Subtle outline buttons in mockup */
+.mock-row {
+  background: rgba(255,255,255,0.015);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: all 0.2s;
+}
+.mock-row.active {
+  border-color: var(--sekoia);
+  background: rgba(60, 138, 96, 0.05);
+}
+.mock-check {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid var(--cream-subtle);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  flex-shrink: 0;
+}
+.mock-check.checked {
+  background: var(--sekoia-bright);
+  border-color: var(--sekoia-bright);
+  color: var(--forest-deep);
+}
+.tag-running {
+  background: rgba(60, 138, 96, 0.15);
+  color: var(--sekoia-bright);
+  border: 1px solid rgba(60, 138, 96, 0.3);
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+/* Selection */
+::selection {
+  background: var(--copper);
+  color: var(--forest-deep);
+}
+</style>
+</head>
+<body>
 
-<nav class="border-b border-stone-200 bg-white/70 backdrop-blur sticky top-0 z-50">
-<div class="max-w-6xl mx-auto px-6 py-4 flex justify-between items-center">
-<a href="/" class="flex items-center gap-2 font-semibold">
-<span class="w-7 h-7 rounded-md gradient-bg flex items-center justify-center text-white text-xs">CC</span>
-<span>Claude Control</span></a>
-<div class="flex items-center gap-6 text-sm">
-<a href="#features" class="text-stone-600 hover:text-stone-900 hidden sm:inline">Features</a>
-<a href="#install" class="text-stone-600 hover:text-stone-900">Install</a>
-<a href="https://github.com/fabultra/claude-control" target="_blank" rel="noopener" class="text-stone-600 hover:text-stone-900">GitHub</a>
-<a href="#install" class="bg-stone-900 hover:bg-stone-800 text-white px-4 py-1.5 rounded-lg font-medium">Get started</a>
-</div></div></nav>
+<div class="root-line"></div>
 
-<section class="max-w-6xl mx-auto px-6 pt-20 pb-16 text-center">
-<div class="inline-flex items-center gap-2 px-3 py-1 bg-stone-100 rounded-full text-xs font-medium text-stone-600 mb-6">
-<span class="w-1.5 h-1.5 rounded-full bg-green-500 pulse-dot"></span>
-<span>v1.0 - now available</span></div>
-<h1 class="text-5xl md:text-6xl font-bold tracking-tight mb-6">
-Take control of your<br><span class="gradient-text">Claude Desktop setup.</span></h1>
-<p class="text-lg md:text-xl text-stone-600 max-w-2xl mx-auto mb-10">
-Toggle MCPs, manage Skills, and restart Claude with one click. Beautiful local web interface. 100% local. Zero tracking.</p>
-<div class="flex flex-col sm:flex-row items-center justify-center gap-3 mb-4">
-<a href="#install" class="bg-stone-900 hover:bg-stone-800 text-white px-6 py-3 rounded-lg font-medium">Install for macOS</a>
-<a href="https://github.com/fabultra/claude-control" target="_blank" rel="noopener" class="text-stone-700 hover:text-stone-900 px-6 py-3 rounded-lg font-medium border border-stone-200 bg-white">View on GitHub</a>
-</div>
-<p class="text-xs text-stone-500">Free and open source - MIT - macOS 10.13+</p>
+<!-- ═══════════════════════════════════════════════════════════════
+     NAV
+     ═══════════════════════════════════════════════════════════════ -->
+<nav style="position:relative; z-index:10;">
+  <div style="max-width:1280px; margin:0 auto; padding:24px 40px; display:flex; justify-content:space-between; align-items:center;">
+    <a href="/" style="display:flex; align-items:center; gap:12px; text-decoration:none; color:var(--cream);">
+      <div style="width:28px; height:28px; border-radius:7px; background:linear-gradient(135deg, var(--sekoia) 0%, var(--forest-deep) 100%); display:flex; align-items:center; justify-content:center; border:1px solid var(--border-bright);">
+        <div style="width:8px; height:8px; border-radius:50%; background:var(--copper);"></div>
+      </div>
+      <span class="mono" style="font-size:13px; letter-spacing:0.02em;">claude·control</span>
+    </a>
+    <div style="display:flex; align-items:center; gap:32px;">
+      <a href="#why" class="mono" style="color:var(--cream-muted); text-decoration:none; font-size:12px; letter-spacing:0.05em;">WHY</a>
+      <a href="#features" class="mono" style="color:var(--cream-muted); text-decoration:none; font-size:12px; letter-spacing:0.05em;">FEATURES</a>
+      <a href="#install" class="mono" style="color:var(--cream-muted); text-decoration:none; font-size:12px; letter-spacing:0.05em;">INSTALL</a>
+      <a href="https://github.com/fabultra/claude-control" target="_blank" rel="noopener" class="mono" style="color:var(--cream-muted); text-decoration:none; font-size:12px; letter-spacing:0.05em;">GITHUB ↗</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     HERO
+     ═══════════════════════════════════════════════════════════════ -->
+<section style="position:relative; padding:80px 40px 120px; overflow:hidden;">
+  <div class="hero-glow"></div>
+  <div style="max-width:1280px; margin:0 auto; position:relative; z-index:2;">
+
+    <!-- Eyebrow -->
+    <div class="rise rise-1 mono" style="display:inline-flex; align-items:center; gap:10px; padding:6px 14px; border:1px solid var(--border-bright); border-radius:999px; font-size:11px; letter-spacing:0.1em; color:var(--cream-muted); text-transform:uppercase; margin-bottom:48px;">
+      <span style="width:6px; height:6px; border-radius:50%; background:var(--copper);" class="pulse-dot"></span>
+      <span>v1.0.0 — released today</span>
+    </div>
+
+    <!-- Headline -->
+    <h1 class="rise rise-2 display" style="font-size:clamp(56px, 9vw, 144px); line-height:0.92; margin:0 0 40px; max-width:1100px;">
+      Manage<br>
+      Claude&nbsp;Desktop.<br>
+      <em style="font-style:italic; color:var(--copper);">Beautifully.</em>
+    </h1>
+
+    <!-- Sub + CTAs in asymmetric grid -->
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:60px; max-width:1000px; align-items:end;">
+      <div class="rise rise-3">
+        <p style="font-size:20px; line-height:1.55; color:var(--cream-muted); margin:0 0 32px; max-width:420px;">
+          Toggle MCPs. Manage Skills. Restart Claude with one click. <span style="color:var(--cream);">Locally on your Mac.</span>
+        </p>
+        <div style="display:flex; gap:12px; flex-wrap:wrap;">
+          <a href="#install" class="btn-primary" style="padding:14px 24px; border-radius:8px; text-decoration:none; font-size:15px; display:inline-flex; align-items:center; gap:8px;">
+            Install for macOS <span style="opacity:0.6;">↓</span>
+          </a>
+          <a href="https://github.com/fabultra/claude-control" target="_blank" rel="noopener" class="btn-secondary" style="padding:14px 24px; border-radius:8px; text-decoration:none; font-size:15px; display:inline-flex; align-items:center; gap:8px;">
+            View source <span style="opacity:0.5;">↗</span>
+          </a>
+        </div>
+      </div>
+      <div class="rise rise-4 mono" style="font-size:11px; line-height:1.8; color:var(--cream-subtle); letter-spacing:0.05em;">
+        <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+          <span>PLATFORM</span><span style="color:var(--cream-muted);">macOS 10.13+</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+          <span>DEPENDENCIES</span><span style="color:var(--cream-muted);">zero</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+          <span>RUNTIME</span><span style="color:var(--cream-muted);">python · stdlib</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border);">
+          <span>LICENSE</span><span style="color:var(--cream-muted);">MIT</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; padding:6px 0;">
+          <span>BUILT BY</span><span style="color:var(--copper);">SEKOIA</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
 </section>
 
+<!-- ═══════════════════════════════════════════════════════════════
+     MOCKUP
+     ═══════════════════════════════════════════════════════════════ -->
+<section style="padding:0 40px 120px; position:relative; z-index:1;">
+  <div style="max-width:1180px; margin:0 auto;">
+    <div class="window-frame" style="position:relative;">
+      <div class="window-bar" style="display:flex; align-items:center; padding:0 16px; gap:8px;">
+        <div style="width:11px; height:11px; border-radius:50%; background:#3F3F3F; border:1px solid rgba(255,255,255,0.05);"></div>
+        <div style="width:11px; height:11px; border-radius:50%; background:#3F3F3F; border:1px solid rgba(255,255,255,0.05);"></div>
+        <div style="width:11px; height:11px; border-radius:50%; background:#3F3F3F; border:1px solid rgba(255,255,255,0.05);"></div>
+        <div class="mono" style="margin-left:16px; font-size:11px; color:var(--cream-subtle); letter-spacing:0.02em;">localhost:8765</div>
+        <div style="margin-left:auto;" class="mono" style="font-size:11px; color:var(--cream-subtle);">·  ·  ·</div>
+      </div>
+      <div style="padding:48px; background:var(--forest);">
+        <!-- App header -->
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:40px;">
+          <div>
+            <h3 class="display" style="font-size:36px; margin:0 0 8px; color:var(--cream);">Claude Control</h3>
+            <p class="mono" style="margin:0; font-size:11px; letter-spacing:0.1em; color:var(--cream-subtle); text-transform:uppercase;">Sekoia · v1.0.0</p>
+          </div>
+          <button style="background:var(--cream); color:var(--forest-deep); padding:10px 18px; border-radius:7px; border:none; font-size:13px; font-weight:500; font-family:inherit; cursor:pointer; display:inline-flex; align-items:center; gap:8px;">
+            <span style="font-size:14px;">↻</span>
+            <span>Restart Claude</span>
+          </button>
+        </div>
+        <!-- Two columns -->
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px;">
+          <!-- MCPs -->
+          <div>
+            <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:14px;">
+              <h4 style="margin:0; font-size:14px; font-weight:500; color:var(--cream);">MCP Servers</h4>
+              <span class="mono" style="font-size:10px; color:var(--cream-subtle);">04</span>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <div class="mock-row active" style="display:flex; align-items:center; gap:12px; padding:11px 14px;">
+                <span class="mock-check checked">✓</span>
+                <span style="font-size:14px; color:var(--cream);">sekoia-geo</span>
+                <span class="tag-running pulse-dot" style="margin-left:auto;">● running</span>
+              </div>
+              <div class="mock-row active" style="display:flex; align-items:center; gap:12px; padding:11px 14px;">
+                <span class="mock-check checked">✓</span>
+                <span style="font-size:14px; color:var(--cream);">klide-mongodb</span>
+                <span class="tag-running pulse-dot" style="margin-left:auto;">● running</span>
+              </div>
+              <div class="mock-row active" style="display:flex; align-items:center; gap:12px; padding:11px 14px;">
+                <span class="mock-check checked">✓</span>
+                <span style="font-size:14px; color:var(--cream);">compass</span>
+                <span class="tag-running pulse-dot" style="margin-left:auto;">● running</span>
+              </div>
+              <div class="mock-row" style="display:flex; align-items:center; gap:12px; padding:11px 14px; opacity:0.55;">
+                <span class="mock-check"></span>
+                <span style="font-size:14px; color:var(--cream-muted);">mailchimp</span>
+              </div>
+            </div>
+          </div>
+          <!-- Skills -->
+          <div>
+            <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:14px;">
+              <h4 style="margin:0; font-size:14px; font-weight:500; color:var(--cream);">Skills</h4>
+              <span class="mono" style="font-size:10px; color:var(--cream-subtle);">06 / 30</span>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <div class="mock-row active" style="display:flex; align-items:center; gap:12px; padding:11px 14px;">
+                <span class="mock-check checked">✓</span>
+                <span style="font-size:14px; color:var(--cream);">claude-control-app</span>
+              </div>
+              <div class="mock-row active" style="display:flex; align-items:center; gap:12px; padding:11px 14px;">
+                <span class="mock-check checked">✓</span>
+                <span style="font-size:14px; color:var(--cream);">claude-mem-setup</span>
+              </div>
+              <div class="mock-row active" style="display:flex; align-items:center; gap:12px; padding:11px 14px;">
+                <span class="mock-check checked">✓</span>
+                <span style="font-size:14px; color:var(--cream);">mcp-stability</span>
+              </div>
+              <div class="mock-row active" style="display:flex; align-items:center; gap:12px; padding:11px 14px;">
+                <span class="mock-check checked">✓</span>
+                <span style="font-size:14px; color:var(--cream);">code-quality-review</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
 
-<section class="max-w-5xl mx-auto px-6 pb-20">
-<div class="card-shadow rounded-2xl overflow-hidden bg-white border border-stone-200">
-<div class="bg-stone-100 px-4 py-2 border-b border-stone-200 flex items-center gap-2">
-<span class="w-3 h-3 rounded-full bg-red-400"></span>
-<span class="w-3 h-3 rounded-full bg-amber-400"></span>
-<span class="w-3 h-3 rounded-full bg-green-400"></span>
-<span class="ml-3 text-xs text-stone-500 code">localhost:8765</span></div>
-<div class="p-8 md:p-12 bg-gradient-to-b from-stone-50 to-white">
-<div class="flex justify-between items-start mb-8">
-<div><h3 class="text-2xl font-semibold">Claude Control</h3>
-<p class="text-sm text-stone-500">Sekoia - v1.0.0</p></div>
-<button class="bg-stone-900 text-white px-4 py-2 rounded-lg text-sm font-medium">Restart Claude</button></div>
-<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-<div class="bg-white border border-stone-200 rounded-xl p-4">
-<h4 class="font-semibold text-sm mb-3">MCP Servers</h4>
-<div class="space-y-2 text-sm">
-<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
-<input type="checkbox" checked class="accent-green-700">
-<span class="font-medium">sekoia-geo</span>
-<span class="ml-auto text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full pulse-dot">running</span></div>
-<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
-<input type="checkbox" checked class="accent-green-700">
-<span class="font-medium">klide-mongodb</span>
-<span class="ml-auto text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full pulse-dot">running</span></div>
-<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-100 opacity-60">
-<input type="checkbox" class="accent-green-700">
-<span class="font-medium">mailchimp</span></div></div></div>
-<div class="bg-white border border-stone-200 rounded-xl p-4">
-<h4 class="font-semibold text-sm mb-3">Skills</h4>
-<div class="space-y-2 text-sm">
-<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
-<input type="checkbox" checked class="accent-green-700">
-<span class="font-medium">claude-mem-setup</span></div>
-<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
-<input type="checkbox" checked class="accent-green-700">
-<span class="font-medium">mcp-stability</span></div>
-<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
-<input type="checkbox" checked class="accent-green-700">
-<span class="font-medium">code-quality-review</span></div></div></div>
-</div></div></div></section>
+<!-- ═══════════════════════════════════════════════════════════════
+     WHY — editorial problem statement
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="why" style="padding:140px 40px; border-top:1px solid var(--border); position:relative;">
+  <div style="max-width:1100px; margin:0 auto;">
+    <div style="display:grid; grid-template-columns:200px 1fr; gap:60px; align-items:start;">
+      <div>
+        <div class="section-num">01 — Why</div>
+      </div>
+      <div>
+        <h2 class="display" style="font-size:clamp(40px, 5vw, 72px); line-height:1.05; margin:0 0 48px; max-width:900px;">
+          Claude Desktop is brilliant.<br>
+          <em style="font-style:italic; color:var(--cream-muted);">Until you have five MCPs running.</em>
+        </h2>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:48px; max-width:900px;">
+          <div>
+            <p style="font-size:17px; line-height:1.65; color:var(--cream-muted); margin:0 0 16px;">
+              Then it freezes. Tool calls hang for 4 minutes. Zombie processes pile up. And editing <span class="mono" style="font-size:14px; color:var(--copper); background:rgba(217,119,87,0.08); padding:2px 6px; border-radius:4px;">claude_desktop_config.json</span> by hand stops feeling clever.
+            </p>
+          </div>
+          <div>
+            <p style="font-size:17px; line-height:1.65; color:var(--cream-muted); margin:0 0 16px;">
+              Skills sit in a folder with no UI. Importing a new MCP means manual JSON merging. Restarting takes a Cmd+Q hunt.
+            </p>
+            <p style="font-size:17px; line-height:1.65; color:var(--cream); margin:0;">
+              Claude Control is the small interface that should have shipped with the app.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
 
-<section id="features" class="max-w-6xl mx-auto px-6 py-20 border-t border-stone-200">
-<div class="text-center mb-16">
-<h2 class="text-4xl font-bold mb-4">Everything you need.<br>Nothing you don't.</h2>
-<p class="text-lg text-stone-600 max-w-2xl mx-auto">For power users who want a clean way to manage Claude Desktop without editing JSON.</p></div>
-<div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
-<div class="w-10 h-10 rounded-lg gradient-bg mb-4"></div>
-<h3 class="font-semibold mb-2">Toggle MCPs instantly</h3>
-<p class="text-sm text-stone-600">One checkbox. The app updates your config and you are done. No JSON, no typos.</p></div>
-<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
-<div class="w-10 h-10 rounded-lg gradient-bg mb-4"></div>
-<h3 class="font-semibold mb-2">See what is running</h3>
-<p class="text-sm text-stone-600">Live status indicator for each MCP. Spot zombies before they freeze your session.</p></div>
-<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
-<div class="w-10 h-10 rounded-lg gradient-bg mb-4"></div>
-<h3 class="font-semibold mb-2">Import in seconds</h3>
-<p class="text-sm text-stone-600">Paste JSON, drop a file path, or clone from Git. Works for MCPs and Skills.</p></div>
-<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
-<div class="w-10 h-10 rounded-lg copper mb-4"></div>
-<h3 class="font-semibold mb-2">Auto-update from GitHub</h3>
-<p class="text-sm text-stone-600">New release published? The app shows a badge. One click and you are on the latest version.</p></div>
-<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
-<div class="w-10 h-10 rounded-lg copper mb-4"></div>
-<h3 class="font-semibold mb-2">100% local</h3>
-<p class="text-sm text-stone-600">Runs on localhost:8765. No telemetry, no analytics, no cloud. Your config stays on your Mac.</p></div>
-<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
-<div class="w-10 h-10 rounded-lg copper mb-4"></div>
-<h3 class="font-semibold mb-2">Zero dependencies</h3>
-<p class="text-sm text-stone-600">Pure Python stdlib. No pip install, no node_modules. Just download and run.</p></div>
-</div></section>
+<!-- ═══════════════════════════════════════════════════════════════
+     FEATURES — asymmetric grid
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="features" style="padding:120px 40px; border-top:1px solid var(--border);">
+  <div style="max-width:1280px; margin:0 auto;">
+    <div style="display:grid; grid-template-columns:200px 1fr; gap:60px; align-items:start; margin-bottom:80px;">
+      <div class="section-num">02 — What it does</div>
+      <h2 class="display" style="font-size:clamp(40px, 5vw, 64px); line-height:1.05; margin:0; max-width:800px;">
+        Six things. Done <em style="font-style:italic; color:var(--copper);">precisely</em>.
+      </h2>
+    </div>
 
-<section id="install" class="max-w-3xl mx-auto px-6 py-20 border-t border-stone-200">
-<div class="text-center mb-10">
-<h2 class="text-4xl font-bold mb-4">Install in 30 seconds</h2>
-<p class="text-lg text-stone-600">macOS only. Requires git + python3 (preinstalled on macOS).</p></div>
-<div class="bg-stone-900 rounded-xl p-5 text-stone-100 mb-6 relative">
-<button onclick="copyInstall()" class="absolute top-3 right-3 text-xs text-stone-400 hover:text-white px-2 py-1 rounded">Copy</button>
-<code class="code text-sm break-all" id="install-cmd">curl -fsSL https://claude.sekoia.ca/install.sh | bash</code></div>
-<p class="text-center text-xs text-stone-500 mb-10">After install, double-click <strong>Claude Control.app</strong> on your Desktop.</p>
-<div class="border-t border-stone-200 pt-10">
-<h3 class="font-semibold mb-6 text-center">How it works</h3>
-<div class="space-y-4">
-<div class="flex gap-4 items-start">
-<div class="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center font-semibold text-sm shrink-0">1</div>
-<div><p class="font-medium">Clones the repo</p><p class="text-sm text-stone-600">Into <code class="code text-xs bg-stone-100 px-1 rounded">~/dev/claude-control</code></p></div></div>
-<div class="flex gap-4 items-start">
-<div class="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center font-semibold text-sm shrink-0">2</div>
-<div><p class="font-medium">Generates the icon</p><p class="text-sm text-stone-600">Squircle macOS-style with the Sekoia logo</p></div></div>
-<div class="flex gap-4 items-start">
-<div class="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center font-semibold text-sm shrink-0">3</div>
-<div><p class="font-medium">Builds the .app</p><p class="text-sm text-stone-600">Drops <code class="code text-xs bg-stone-100 px-1 rounded">Claude Control.app</code> on your Desktop</p></div></div>
-</div></div></section>
+    <div style="display:grid; grid-template-columns:repeat(6, 1fr); gap:20px;">
+      <!-- Big feature 1 -->
+      <div class="card card-feature" style="grid-column:span 4; padding:36px; border-radius:12px; position:relative; overflow:hidden;">
+        <div class="mono" style="font-size:11px; color:var(--copper); letter-spacing:0.1em; margin-bottom:24px;">FEATURE / 01</div>
+        <h3 class="display" style="font-size:36px; line-height:1.1; margin:0 0 16px;">Toggle MCPs and Skills with one click.</h3>
+        <p style="font-size:16px; line-height:1.6; color:var(--cream-muted); margin:0; max-width:520px;">
+          A clean checkbox UI for what is currently a JSON file you grep through. Disable temporarily for a focused session, re-enable when needed. Backups happen automatically before each write.
+        </p>
+      </div>
+      <!-- Small 1 -->
+      <div class="card card-feature" style="grid-column:span 2; padding:36px; border-radius:12px; position:relative; overflow:hidden;">
+        <div class="mono" style="font-size:11px; color:var(--copper); letter-spacing:0.1em; margin-bottom:24px;">FEATURE / 02</div>
+        <h3 class="display" style="font-size:28px; line-height:1.15; margin:0 0 12px;">Live status.</h3>
+        <p style="font-size:14px; line-height:1.55; color:var(--cream-muted); margin:0;">
+          Pulse indicator next to each MCP. Spot zombies before they freeze your session.
+        </p>
+      </div>
+      <!-- Small 2 -->
+      <div class="card card-feature" style="grid-column:span 2; padding:36px; border-radius:12px; position:relative; overflow:hidden;">
+        <div class="mono" style="font-size:11px; color:var(--copper); letter-spacing:0.1em; margin-bottom:24px;">FEATURE / 03</div>
+        <h3 class="display" style="font-size:28px; line-height:1.15; margin:0 0 12px;">Import in seconds.</h3>
+        <p style="font-size:14px; line-height:1.55; color:var(--cream-muted); margin:0;">
+          Paste JSON. Drop a path. Clone from Git. Works for MCPs and Skills.
+        </p>
+      </div>
+      <!-- Big 2 -->
+      <div class="card card-feature" style="grid-column:span 4; padding:36px; border-radius:12px; position:relative; overflow:hidden;">
+        <div class="mono" style="font-size:11px; color:var(--copper); letter-spacing:0.1em; margin-bottom:24px;">FEATURE / 04</div>
+        <h3 class="display" style="font-size:36px; line-height:1.1; margin:0 0 16px;">Auto-update from <em style="font-style:italic;">GitHub Releases</em>.</h3>
+        <p style="font-size:16px; line-height:1.6; color:var(--cream-muted); margin:0; max-width:520px;">
+          When a new version ships, the app shows a copper badge in the header. One click, git pull, and you are on the latest. The way software updates should feel.
+        </p>
+      </div>
+      <!-- Small 3 -->
+      <div class="card card-feature" style="grid-column:span 3; padding:36px; border-radius:12px; position:relative; overflow:hidden;">
+        <div class="mono" style="font-size:11px; color:var(--copper); letter-spacing:0.1em; margin-bottom:24px;">FEATURE / 05</div>
+        <h3 class="display" style="font-size:28px; line-height:1.15; margin:0 0 12px;">100% local. Zero tracking.</h3>
+        <p style="font-size:14px; line-height:1.55; color:var(--cream-muted); margin:0;">
+          Runs on localhost:8765. No cloud. No analytics. No telemetry. Your config stays on your Mac, where it belongs.
+        </p>
+      </div>
+      <!-- Small 4 -->
+      <div class="card card-feature" style="grid-column:span 3; padding:36px; border-radius:12px; position:relative; overflow:hidden;">
+        <div class="mono" style="font-size:11px; color:var(--copper); letter-spacing:0.1em; margin-bottom:24px;">FEATURE / 06</div>
+        <h3 class="display" style="font-size:28px; line-height:1.15; margin:0 0 12px;">Zero dependencies.</h3>
+        <p style="font-size:14px; line-height:1.55; color:var(--cream-muted); margin:0;">
+          Pure Python stdlib. No pip install, no node_modules, no virtualenv. One file. Audit the source in 10 minutes.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
 
-<footer class="border-t border-stone-200 py-12 mt-10">
-<div class="max-w-6xl mx-auto px-6 flex flex-col md:flex-row justify-between items-center gap-6">
-<div class="text-sm text-stone-600">Made with care in Montreal by <a href="https://sekoia.ca" class="text-stone-900 font-medium hover:underline">Sekoia</a>.</div>
-<div class="flex items-center gap-6 text-sm text-stone-600">
-<a href="https://github.com/fabultra/claude-control" target="_blank" rel="noopener" class="hover:text-stone-900">GitHub</a>
-<a href="https://github.com/fabultra/claude-control/issues" target="_blank" rel="noopener" class="hover:text-stone-900">Issues</a>
-<a href="https://sekoia.ca" target="_blank" rel="noopener" class="hover:text-stone-900">Sekoia.ca</a>
-</div></div></footer>
+<!-- ═══════════════════════════════════════════════════════════════
+     INSTALL
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="install" style="padding:140px 40px; border-top:1px solid var(--border); position:relative;">
+  <div style="max-width:1100px; margin:0 auto;">
+    <div style="display:grid; grid-template-columns:200px 1fr; gap:60px; align-items:start; margin-bottom:64px;">
+      <div class="section-num">03 — Install</div>
+      <div>
+        <h2 class="display" style="font-size:clamp(40px, 5vw, 64px); line-height:1.05; margin:0 0 16px;">
+          Thirty seconds.<br>
+          <em style="font-style:italic; color:var(--cream-muted);">One command.</em>
+        </h2>
+        <p style="font-size:17px; color:var(--cream-muted); margin:0;">macOS only. Requires git and python3 (preinstalled on macOS).</p>
+      </div>
+    </div>
+
+    <!-- Code block -->
+    <div class="code-block" style="border-radius:12px; padding:0; overflow:hidden; max-width:900px; margin:0 auto;">
+      <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 20px; border-bottom:1px solid var(--border); background:var(--forest);">
+        <span class="mono" style="font-size:11px; color:var(--cream-subtle); letter-spacing:0.1em; text-transform:uppercase;">Terminal</span>
+        <button onclick="copyInstall(this)" class="mono" style="background:transparent; border:1px solid var(--border-bright); color:var(--cream-muted); padding:5px 12px; border-radius:5px; font-size:11px; cursor:pointer; font-family:'Geist Mono', monospace; letter-spacing:0.05em;">COPY</button>
+      </div>
+      <div style="padding:24px 20px; background:var(--forest-deep);">
+        <code id="install-cmd" style="font-family:'Geist Mono', monospace; font-size:14px; color:var(--cream); display:block; line-height:1.6;">
+          <span style="color:var(--cream-subtle);">$</span> curl -fsSL <span style="color:var(--copper);">https://claude.sekoia.ca/install.sh</span> | bash
+        </code>
+      </div>
+    </div>
+
+    <p class="mono" style="text-align:center; margin:24px 0 0; font-size:11px; color:var(--cream-subtle); letter-spacing:0.05em; text-transform:uppercase;">
+      After install, double-click <span style="color:var(--copper);">Claude Control.app</span> on your Desktop.
+    </p>
+
+    <!-- Steps -->
+    <div style="margin-top:80px; max-width:900px; margin-left:auto; margin-right:auto;">
+      <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:32px;">
+        <div>
+          <div class="display" style="font-size:48px; color:var(--copper); line-height:1; margin-bottom:16px; font-style:italic;">i.</div>
+          <h4 style="margin:0 0 8px; font-size:15px; font-weight:500; color:var(--cream);">Clone</h4>
+          <p style="margin:0; font-size:14px; color:var(--cream-muted); line-height:1.5;">Pulls the repo into <span class="mono" style="font-size:12px; color:var(--cream); background:var(--forest-light); padding:1px 6px; border-radius:4px;">~/dev/claude-control</span>.</p>
+        </div>
+        <div>
+          <div class="display" style="font-size:48px; color:var(--copper); line-height:1; margin-bottom:16px; font-style:italic;">ii.</div>
+          <h4 style="margin:0 0 8px; font-size:15px; font-weight:500; color:var(--cream);">Build</h4>
+          <p style="margin:0; font-size:14px; color:var(--cream-muted); line-height:1.5;">Generates the icon. Squircle macOS-style with the Sekoia logo.</p>
+        </div>
+        <div>
+          <div class="display" style="font-size:48px; color:var(--copper); line-height:1; margin-bottom:16px; font-style:italic;">iii.</div>
+          <h4 style="margin:0 0 8px; font-size:15px; font-weight:500; color:var(--cream);">Drop</h4>
+          <p style="margin:0; font-size:14px; color:var(--cream-muted); line-height:1.5;">Drops <span class="mono" style="font-size:12px; color:var(--cream); background:var(--forest-light); padding:1px 6px; border-radius:4px;">Claude Control.app</span> on your Desktop. Ready.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     OPEN SOURCE
+     ═══════════════════════════════════════════════════════════════ -->
+<section style="padding:120px 40px; border-top:1px solid var(--border);">
+  <div style="max-width:900px; margin:0 auto; text-align:center;">
+    <div class="mono" style="font-size:11px; color:var(--cream-subtle); letter-spacing:0.15em; text-transform:uppercase; margin-bottom:32px;">Open source · MIT licensed</div>
+    <h2 class="display" style="font-size:clamp(36px, 5vw, 56px); line-height:1.1; margin:0 0 32px;">
+      Built in the open.<br>
+      <em style="font-style:italic; color:var(--copper);">Maintained by humans.</em>
+    </h2>
+    <p style="font-size:17px; color:var(--cream-muted); margin:0 0 40px; max-width:620px; margin-left:auto; margin-right:auto;">
+      The whole app is one Python file. Read it. Fork it. Send a PR. The roadmap is in the README and the issues are open.
+    </p>
+    <div style="display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
+      <a href="https://github.com/fabultra/claude-control" target="_blank" rel="noopener" class="btn-secondary" style="padding:12px 22px; border-radius:8px; text-decoration:none; font-size:14px; display:inline-flex; align-items:center; gap:8px;">
+        Repository <span style="opacity:0.5;">↗</span>
+      </a>
+      <a href="https://github.com/fabultra/claude-control/issues" target="_blank" rel="noopener" class="btn-secondary" style="padding:12px 22px; border-radius:8px; text-decoration:none; font-size:14px; display:inline-flex; align-items:center; gap:8px;">
+        Issues <span style="opacity:0.5;">↗</span>
+      </a>
+      <a href="https://github.com/fabultra/claude-control/releases" target="_blank" rel="noopener" class="btn-secondary" style="padding:12px 22px; border-radius:8px; text-decoration:none; font-size:14px; display:inline-flex; align-items:center; gap:8px;">
+        Releases <span style="opacity:0.5;">↗</span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     FOOTER
+     ═══════════════════════════════════════════════════════════════ -->
+<footer style="padding:48px 40px; border-top:1px solid var(--border); position:relative;">
+  <div style="max-width:1280px; margin:0 auto; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:24px;">
+    <div style="display:flex; align-items:center; gap:12px;">
+      <div style="width:24px; height:24px; border-radius:6px; background:linear-gradient(135deg, var(--sekoia) 0%, var(--forest-deep) 100%); display:flex; align-items:center; justify-content:center; border:1px solid var(--border-bright);">
+        <div style="width:6px; height:6px; border-radius:50%; background:var(--copper);"></div>
+      </div>
+      <span class="mono" style="font-size:11px; color:var(--cream-subtle); letter-spacing:0.05em;">
+        Made with care in Montréal by <a href="https://sekoia.ca" target="_blank" rel="noopener" style="color:var(--copper); text-decoration:none;">SEKOIA</a>.
+      </span>
+    </div>
+    <div class="mono" style="font-size:11px; color:var(--cream-subtle); letter-spacing:0.05em;">
+      © 2026 · MIT
+    </div>
+  </div>
+</footer>
 
 <script>
-function copyInstall(){
-  const cmd=document.getElementById('install-cmd').textContent;
+function copyInstall(btn){
+  const cmd = 'curl -fsSL https://claude.sekoia.ca/install.sh | bash';
   navigator.clipboard.writeText(cmd);
-  event.target.textContent='Copied';
-  setTimeout(()=>{event.target.textContent='Copy'},2000);
+  const original = btn.textContent;
+  btn.textContent = 'COPIED ✓';
+  btn.style.color = 'var(--copper)';
+  btn.style.borderColor = 'var(--copper)';
+  setTimeout(() => {
+    btn.textContent = original;
+    btn.style.color = '';
+    btn.style.borderColor = '';
+  }, 1800);
 }
+
+// Reveal on scroll
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.style.opacity = '1';
+      entry.target.style.transform = 'translateY(0)';
+    }
+  });
+}, { threshold: 0.1, rootMargin: '0px 0px -80px 0px' });
+
+document.querySelectorAll('section').forEach((s, i) => {
+  if (i === 0) return; // skip hero, already animated
+  s.style.opacity = '0';
+  s.style.transform = 'translateY(24px)';
+  s.style.transition = 'opacity 0.9s cubic-bezier(0.2, 0.8, 0.2, 1), transform 0.9s cubic-bezier(0.2, 0.8, 0.2, 1)';
+  observer.observe(s);
+});
 </script>
-</body></html>
+
+</body>
+</html>
