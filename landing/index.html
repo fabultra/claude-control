@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Control - Manage your Claude Desktop setup</title>
+<meta name="description" content="A small local app to manage Claude Desktop MCPs and Skills. By Sekoia. macOS only. 100% local.">
+<meta property="og:title" content="Claude Control">
+<meta property="og:description" content="Toggle MCPs, manage Skills, restart Claude with one click.">
+<meta property="og:url" content="https://claude.sekoia.ca">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%232C5F3F'/%3E%3Ctext x='50' y='66' font-size='44' text-anchor='middle' fill='white'%3ECC%3C/text%3E%3C/svg%3E">
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+body{font-family:'Inter',system-ui,sans-serif;}
+.gradient-bg{background:linear-gradient(180deg,#2C5F3F 0%,#14301F 100%);}
+.gradient-text{background:linear-gradient(135deg,#2C5F3F,#D97757);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
+.card-shadow{box-shadow:0 1px 3px rgba(0,0,0,.04),0 4px 12px rgba(0,0,0,.04);}
+.copper{background:linear-gradient(135deg,#D97757,#C15F3C);}
+.code{font-family:'SF Mono',Menlo,Monaco,monospace;}
+@keyframes pulseSoft{0%,100%{opacity:1}50%{opacity:.6}}
+.pulse-dot{animation:pulseSoft 2s infinite;}
+</style></head>
+<body class="bg-stone-50 text-stone-900 antialiased">
+
+<nav class="border-b border-stone-200 bg-white/70 backdrop-blur sticky top-0 z-50">
+<div class="max-w-6xl mx-auto px-6 py-4 flex justify-between items-center">
+<a href="/" class="flex items-center gap-2 font-semibold">
+<span class="w-7 h-7 rounded-md gradient-bg flex items-center justify-center text-white text-xs">CC</span>
+<span>Claude Control</span></a>
+<div class="flex items-center gap-6 text-sm">
+<a href="#features" class="text-stone-600 hover:text-stone-900 hidden sm:inline">Features</a>
+<a href="#install" class="text-stone-600 hover:text-stone-900">Install</a>
+<a href="https://github.com/fabultra/claude-control" target="_blank" rel="noopener" class="text-stone-600 hover:text-stone-900">GitHub</a>
+<a href="#install" class="bg-stone-900 hover:bg-stone-800 text-white px-4 py-1.5 rounded-lg font-medium">Get started</a>
+</div></div></nav>
+
+<section class="max-w-6xl mx-auto px-6 pt-20 pb-16 text-center">
+<div class="inline-flex items-center gap-2 px-3 py-1 bg-stone-100 rounded-full text-xs font-medium text-stone-600 mb-6">
+<span class="w-1.5 h-1.5 rounded-full bg-green-500 pulse-dot"></span>
+<span>v1.0 - now available</span></div>
+<h1 class="text-5xl md:text-6xl font-bold tracking-tight mb-6">
+Take control of your<br><span class="gradient-text">Claude Desktop setup.</span></h1>
+<p class="text-lg md:text-xl text-stone-600 max-w-2xl mx-auto mb-10">
+Toggle MCPs, manage Skills, and restart Claude with one click. Beautiful local web interface. 100% local. Zero tracking.</p>
+<div class="flex flex-col sm:flex-row items-center justify-center gap-3 mb-4">
+<a href="#install" class="bg-stone-900 hover:bg-stone-800 text-white px-6 py-3 rounded-lg font-medium">Install for macOS</a>
+<a href="https://github.com/fabultra/claude-control" target="_blank" rel="noopener" class="text-stone-700 hover:text-stone-900 px-6 py-3 rounded-lg font-medium border border-stone-200 bg-white">View on GitHub</a>
+</div>
+<p class="text-xs text-stone-500">Free and open source - MIT - macOS 10.13+</p>
+</section>
+
+
+<section class="max-w-5xl mx-auto px-6 pb-20">
+<div class="card-shadow rounded-2xl overflow-hidden bg-white border border-stone-200">
+<div class="bg-stone-100 px-4 py-2 border-b border-stone-200 flex items-center gap-2">
+<span class="w-3 h-3 rounded-full bg-red-400"></span>
+<span class="w-3 h-3 rounded-full bg-amber-400"></span>
+<span class="w-3 h-3 rounded-full bg-green-400"></span>
+<span class="ml-3 text-xs text-stone-500 code">localhost:8765</span></div>
+<div class="p-8 md:p-12 bg-gradient-to-b from-stone-50 to-white">
+<div class="flex justify-between items-start mb-8">
+<div><h3 class="text-2xl font-semibold">Claude Control</h3>
+<p class="text-sm text-stone-500">Sekoia - v1.0.0</p></div>
+<button class="bg-stone-900 text-white px-4 py-2 rounded-lg text-sm font-medium">Restart Claude</button></div>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+<div class="bg-white border border-stone-200 rounded-xl p-4">
+<h4 class="font-semibold text-sm mb-3">MCP Servers</h4>
+<div class="space-y-2 text-sm">
+<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
+<input type="checkbox" checked class="accent-green-700">
+<span class="font-medium">sekoia-geo</span>
+<span class="ml-auto text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full pulse-dot">running</span></div>
+<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
+<input type="checkbox" checked class="accent-green-700">
+<span class="font-medium">klide-mongodb</span>
+<span class="ml-auto text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full pulse-dot">running</span></div>
+<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-100 opacity-60">
+<input type="checkbox" class="accent-green-700">
+<span class="font-medium">mailchimp</span></div></div></div>
+<div class="bg-white border border-stone-200 rounded-xl p-4">
+<h4 class="font-semibold text-sm mb-3">Skills</h4>
+<div class="space-y-2 text-sm">
+<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
+<input type="checkbox" checked class="accent-green-700">
+<span class="font-medium">claude-mem-setup</span></div>
+<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
+<input type="checkbox" checked class="accent-green-700">
+<span class="font-medium">mcp-stability</span></div>
+<div class="flex items-center gap-2 p-2 rounded-lg border border-stone-200">
+<input type="checkbox" checked class="accent-green-700">
+<span class="font-medium">code-quality-review</span></div></div></div>
+</div></div></div></section>
+
+<section id="features" class="max-w-6xl mx-auto px-6 py-20 border-t border-stone-200">
+<div class="text-center mb-16">
+<h2 class="text-4xl font-bold mb-4">Everything you need.<br>Nothing you don't.</h2>
+<p class="text-lg text-stone-600 max-w-2xl mx-auto">For power users who want a clean way to manage Claude Desktop without editing JSON.</p></div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
+<div class="w-10 h-10 rounded-lg gradient-bg mb-4"></div>
+<h3 class="font-semibold mb-2">Toggle MCPs instantly</h3>
+<p class="text-sm text-stone-600">One checkbox. The app updates your config and you are done. No JSON, no typos.</p></div>
+<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
+<div class="w-10 h-10 rounded-lg gradient-bg mb-4"></div>
+<h3 class="font-semibold mb-2">See what is running</h3>
+<p class="text-sm text-stone-600">Live status indicator for each MCP. Spot zombies before they freeze your session.</p></div>
+<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
+<div class="w-10 h-10 rounded-lg gradient-bg mb-4"></div>
+<h3 class="font-semibold mb-2">Import in seconds</h3>
+<p class="text-sm text-stone-600">Paste JSON, drop a file path, or clone from Git. Works for MCPs and Skills.</p></div>
+<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
+<div class="w-10 h-10 rounded-lg copper mb-4"></div>
+<h3 class="font-semibold mb-2">Auto-update from GitHub</h3>
+<p class="text-sm text-stone-600">New release published? The app shows a badge. One click and you are on the latest version.</p></div>
+<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
+<div class="w-10 h-10 rounded-lg copper mb-4"></div>
+<h3 class="font-semibold mb-2">100% local</h3>
+<p class="text-sm text-stone-600">Runs on localhost:8765. No telemetry, no analytics, no cloud. Your config stays on your Mac.</p></div>
+<div class="bg-white p-6 rounded-2xl border border-stone-200 card-shadow">
+<div class="w-10 h-10 rounded-lg copper mb-4"></div>
+<h3 class="font-semibold mb-2">Zero dependencies</h3>
+<p class="text-sm text-stone-600">Pure Python stdlib. No pip install, no node_modules. Just download and run.</p></div>
+</div></section>
+
+<section id="install" class="max-w-3xl mx-auto px-6 py-20 border-t border-stone-200">
+<div class="text-center mb-10">
+<h2 class="text-4xl font-bold mb-4">Install in 30 seconds</h2>
+<p class="text-lg text-stone-600">macOS only. Requires git + python3 (preinstalled on macOS).</p></div>
+<div class="bg-stone-900 rounded-xl p-5 text-stone-100 mb-6 relative">
+<button onclick="copyInstall()" class="absolute top-3 right-3 text-xs text-stone-400 hover:text-white px-2 py-1 rounded">Copy</button>
+<code class="code text-sm break-all" id="install-cmd">curl -fsSL https://claude.sekoia.ca/install.sh | bash</code></div>
+<p class="text-center text-xs text-stone-500 mb-10">After install, double-click <strong>Claude Control.app</strong> on your Desktop.</p>
+<div class="border-t border-stone-200 pt-10">
+<h3 class="font-semibold mb-6 text-center">How it works</h3>
+<div class="space-y-4">
+<div class="flex gap-4 items-start">
+<div class="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center font-semibold text-sm shrink-0">1</div>
+<div><p class="font-medium">Clones the repo</p><p class="text-sm text-stone-600">Into <code class="code text-xs bg-stone-100 px-1 rounded">~/dev/claude-control</code></p></div></div>
+<div class="flex gap-4 items-start">
+<div class="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center font-semibold text-sm shrink-0">2</div>
+<div><p class="font-medium">Generates the icon</p><p class="text-sm text-stone-600">Squircle macOS-style with the Sekoia logo</p></div></div>
+<div class="flex gap-4 items-start">
+<div class="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center font-semibold text-sm shrink-0">3</div>
+<div><p class="font-medium">Builds the .app</p><p class="text-sm text-stone-600">Drops <code class="code text-xs bg-stone-100 px-1 rounded">Claude Control.app</code> on your Desktop</p></div></div>
+</div></div></section>
+
+<footer class="border-t border-stone-200 py-12 mt-10">
+<div class="max-w-6xl mx-auto px-6 flex flex-col md:flex-row justify-between items-center gap-6">
+<div class="text-sm text-stone-600">Made with care in Montreal by <a href="https://sekoia.ca" class="text-stone-900 font-medium hover:underline">Sekoia</a>.</div>
+<div class="flex items-center gap-6 text-sm text-stone-600">
+<a href="https://github.com/fabultra/claude-control" target="_blank" rel="noopener" class="hover:text-stone-900">GitHub</a>
+<a href="https://github.com/fabultra/claude-control/issues" target="_blank" rel="noopener" class="hover:text-stone-900">Issues</a>
+<a href="https://sekoia.ca" target="_blank" rel="noopener" class="hover:text-stone-900">Sekoia.ca</a>
+</div></div></footer>
+
+<script>
+function copyInstall(){
+  const cmd=document.getElementById('install-cmd').textContent;
+  navigator.clipboard.writeText(cmd);
+  event.target.textContent='Copied';
+  setTimeout(()=>{event.target.textContent='Copy'},2000);
+}
+</script>
+</body></html>
