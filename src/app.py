@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Claude Control - app locale pour gerer MCPs et Skills de Claude Desktop."""
-import http.server, json, socketserver, subprocess, time, webbrowser
+import http.server, json, re, shutil, socketserver, subprocess, time, webbrowser
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -11,12 +11,19 @@ CONFIG_PATH = HOME / "Library/Application Support/Claude/claude_desktop_config.j
 SKILLS_DIR = HOME / ".claude/skills"
 SKILLS_DISABLED_DIR = HOME / ".claude/skills-disabled"
 BACKUP_DIR = HOME / ".claude/backups/claude-control"
+IMPORTED_REPOS_DIR = HOME / ".claude/imported-mcps"
+PRESETS_FILE = HOME / ".claude/claude-control-presets.json"
+
+VERSION_FILE = HOME / "dev/claude-control/version.txt"
+GITHUB_REPO_FILE = HOME / "dev/claude-control/.github-repo"
+
 
 def load_config():
     if not CONFIG_PATH.exists():
         return {"mcpServers": {}, "_disabledMcps": {}}
     with open(CONFIG_PATH) as f:
         return json.load(f)
+
 
 def save_config(config):
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -25,8 +32,10 @@ def save_config(config):
         backup = BACKUP_DIR / f"config.{ts}.json"
         with open(CONFIG_PATH) as src, open(backup, "w") as dst:
             dst.write(src.read())
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
+
 
 def get_running_mcps():
     try:
@@ -45,6 +54,7 @@ def get_running_mcps():
                 running.add(label)
     return running
 
+
 def get_state():
     config = load_config()
     active = config.get("mcpServers", {})
@@ -63,6 +73,7 @@ def get_state():
                 + [{"name": n, "active": False} for n in disabled_skills],
     }
 
+
 def toggle_mcp(name):
     config = load_config()
     active = config.setdefault("mcpServers", {})
@@ -77,6 +88,7 @@ def toggle_mcp(name):
         return False, f"MCP '{name}' introuvable"
     save_config(config)
     return True, msg
+
 
 def toggle_skill(name):
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -95,171 +107,6 @@ def toggle_skill(name):
             return False, f"Conflit : {target} existe deja"
         src_d.rename(target)
         return True, f"Skill '{name}' active"
-    return False, f"Skill '{name}' introuvable"
-
-def restart_claude():
-    subprocess.run(["pkill", "-9", "-f", "Claude"], check=False)
-    time.sleep(2.5)
-    subprocess.run(["open", "-a", "Claude"], check=False)
-    return True, "Claude Desktop redemarre"
-
-HTML = r"""<!DOCTYPE html>
-<html lang="fr"><head><meta charset="utf-8"><title>Claude Control</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>
-body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
-.card{background:white;border:1px solid #e7e5e4;border-radius:12px;}
-.running-dot{animation:pulse 2s infinite;}
-@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.5;}}
-</style></head><body class="min-h-screen text-stone-900">
-<div class="max-w-5xl mx-auto px-6 py-10">
-<header class="flex justify-between items-center mb-8">
-<div><h1 class="text-3xl font-semibold">Claude Control</h1>
-<p class="text-sm text-stone-500 mt-1">Controle de Claude Desktop</p></div>
-<button onclick="restartClaude()" class="bg-stone-900 hover:bg-stone-800 text-white px-5 py-2.5 rounded-lg font-medium flex items-center gap-2">
-<span>↻</span><span>Redemarrer Claude</span></button></header>
-<div id="banner" class="hidden mb-4 p-3 rounded-lg text-sm border"></div>
-<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-<section class="card p-6">
-<h2 class="text-lg font-semibold mb-1">Serveurs MCP</h2>
-<p class="text-xs text-stone-500 mb-4">Coche = charge au demarrage de Claude Desktop</p>
-<div id="mcps" class="space-y-2"></div></section>
-<section class="card p-6">
-<h2 class="text-lg font-semibold mb-1">Skills</h2>
-<p class="text-xs text-stone-500 mb-4">Coche = disponible pour Claude</p>
-<div id="skills" class="space-y-2 max-h-[600px] overflow-y-auto"></div></section></div>
-<p class="text-xs text-stone-400 mt-8 text-center">Apres modifications, clique sur "Redemarrer Claude" pour appliquer.</p>
-</div><script>
-async function loadState(){
-  const r=await fetch('/api/state');const s=await r.json();
-  const mcps=document.getElementById('mcps');
-  mcps.innerHTML=s.mcps.length===0?'<p class="text-stone-400 text-sm">Aucun MCP configure</p>':s.mcps.map(m=>`
-    <label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}">
-    <div class="flex items-center gap-3 flex-1">
-    <input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-600">
-    <span class="font-medium">${m.name}</span>
-    ${m.running?'<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">● running</span>':(m.active?'<span class="text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full">○ pas demarre</span>':'')}
-    </div></label>`).join('');
-  const skills=document.getElementById('skills');
-  skills.innerHTML=s.skills.length===0?'<p class="text-stone-400 text-sm">Aucun skill</p>':s.skills.map(sk=>`
-    <label class="flex items-center gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}">
-    <input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-600">
-    <span class="font-medium text-sm">${sk.name}</span></label>`).join('');
-}
-async function toggleMcp(n){const r=await fetch('/api/toggle-mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});const j=await r.json();banner(j.success?'green':'red',j.message);loadState();}
-async function toggleSkill(n){const r=await fetch('/api/toggle-skill',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});const j=await r.json();banner(j.success?'green':'red',j.message);loadState();}
-async function restartClaude(){if(!confirm('Redemarrer Claude Desktop ? Toutes les conversations en cours seront fermees.'))return;banner('blue','Redemarrage...');const r=await fetch('/api/restart-claude',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const j=await r.json();banner(j.success?'green':'red',j.message);setTimeout(loadState,4000);}
-function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className=`mb-4 p-3 rounded-lg text-sm border ${cls[c]}`;b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4000);}
-loadState();setInterval(loadState,5000);
-</script></body></html>"""
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def _send_json(self, data, status=200):
-        body = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-    def do_GET(self):
-        path = urlparse(self.path).path
-        if path in ("/", "/index.html"):
-            body = HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif path == "/api/state":
-            self._send_json(get_state())
-        else:
-            self.send_response(404); self.end_headers()
-    def do_POST(self):
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        try:
-            data = json.loads(self.rfile.read(length)) if length else {}
-        except Exception:
-            data = {}
-        if path == "/api/toggle-mcp":
-            ok, msg = toggle_mcp(data.get("name", ""))
-        elif path == "/api/toggle-skill":
-            ok, msg = toggle_skill(data.get("name", ""))
-        elif path == "/api/restart-claude":
-            ok, msg = restart_claude()
-        else:
-            self.send_response(404); self.end_headers(); return
-        self._send_json({"success": ok, "message": msg})
-    def log_message(self, *args):
-        return
-
-def main():
-    SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"\n  Claude Control - http://localhost:{PORT}\n  Cmd+C pour arreter\n")
-    webbrowser.open(f"http://localhost:{PORT}")
-    try:
-        with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as server:
-            server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n  Au revoir.")
-    except OSError as e:
-        if e.errno == 48:
-            print(f"\n  Port {PORT} deja utilise. App deja ouverte ?")
-            webbrowser.open(f"http://localhost:{PORT}")
-        else:
-            raise
-
-if __name__ == "__main__":
-    main()
-
-
-def get_state():
-    config = load_config()
-    active = config.get("mcpServers", {})
-    disabled = config.get("_disabledMcps", {})
-    running = get_running_mcps()
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
-    active_skills = sorted([d.name for d in SKILLS_DIR.iterdir()
-                            if d.is_dir() and (d / "SKILL.md").exists() and not d.name.startswith(".")])
-    disabled_skills = sorted([d.name for d in SKILLS_DISABLED_DIR.iterdir()
-                              if d.is_dir() and not d.name.startswith(".")])
-    return {
-        "mcps": [{"name": n, "active": True, "running": n in running} for n in sorted(active.keys())]
-              + [{"name": n, "active": False, "running": False} for n in sorted(disabled.keys())],
-        "skills": [{"name": n, "active": True} for n in active_skills]
-                + [{"name": n, "active": False} for n in disabled_skills],
-    }
-
-
-def toggle_mcp(name):
-    config = load_config()
-    active = config.setdefault("mcpServers", {})
-    disabled = config.setdefault("_disabledMcps", {})
-    if name in active:
-        disabled[name] = active.pop(name); msg = f"MCP '{name}' desactive"
-    elif name in disabled:
-        active[name] = disabled.pop(name); msg = f"MCP '{name}' active"
-    else:
-        return False, f"MCP '{name}' introuvable"
-    save_config(config)
-    return True, msg
-
-
-def toggle_skill(name):
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
-    src_a = SKILLS_DIR / name
-    src_d = SKILLS_DISABLED_DIR / name
-    if src_a.exists():
-        target = SKILLS_DISABLED_DIR / name
-        if target.exists(): return False, f"Conflit: {target}"
-        src_a.rename(target); return True, f"Skill '{name}' desactive"
-    elif src_d.exists():
-        target = SKILLS_DIR / name
-        if target.exists(): return False, f"Conflit: {target}"
-        src_d.rename(target); return True, f"Skill '{name}' active"
     return False, f"Skill '{name}' introuvable"
 
 
@@ -291,7 +138,8 @@ def import_mcp_json(json_str):
 
 def import_mcp_file(path):
     p = Path(path).expanduser()
-    if not p.exists(): return False, f"Fichier introuvable : {p}"
+    if not p.exists():
+        return False, f"Fichier introuvable : {p}"
     try:
         return import_mcp_json(p.read_text())
     except Exception as e:
@@ -378,12 +226,79 @@ def import_skill_markdown(name, content):
     return True, f"Skill '{name}' cree"
 
 
+# === PRESETS ===
+
+def load_presets():
+    if not PRESETS_FILE.exists():
+        return {"presets": {}}
+    try:
+        with open(PRESETS_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or "presets" not in data:
+            return {"presets": {}}
+        return data
+    except Exception:
+        return {"presets": {}}
+
+
+def save_presets_file(data):
+    PRESETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(PRESETS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def list_presets():
+    return load_presets().get("presets", {})
+
+
+def save_preset(name, mcps):
+    name = (name or "").strip()
+    if not name:
+        return False, "Nom de preset requis"
+    if not isinstance(mcps, list):
+        return False, "Liste de MCPs invalide"
+    data = load_presets()
+    data.setdefault("presets", {})[name] = sorted({str(m) for m in mcps if m})
+    save_presets_file(data)
+    return True, f"Preset '{name}' sauvegarde ({len(data['presets'][name])} MCP(s))"
+
+
+def apply_preset(name):
+    presets = list_presets()
+    if name not in presets:
+        return False, f"Preset '{name}' introuvable"
+    target_names = set(presets[name])
+    config = load_config()
+    active = config.setdefault("mcpServers", {})
+    disabled = config.setdefault("_disabledMcps", {})
+    all_mcps = {**active, **disabled}
+    new_active, new_disabled = {}, {}
+    for n, cfg in all_mcps.items():
+        if n in target_names:
+            new_active[n] = cfg
+        else:
+            new_disabled[n] = cfg
+    config["mcpServers"] = new_active
+    config["_disabledMcps"] = new_disabled
+    save_config(config)
+    missing = sorted(target_names - set(all_mcps.keys()))
+    msg = f"Preset '{name}' applique : {len(new_active)} actif(s), {len(new_disabled)} desactive(s)"
+    if missing:
+        msg += f" (introuvables : {', '.join(missing)})"
+    return True, msg
+
+
+def delete_preset(name):
+    data = load_presets()
+    presets = data.setdefault("presets", {})
+    if name not in presets:
+        return False, f"Preset '{name}' introuvable"
+    del presets[name]
+    save_presets_file(data)
+    return True, f"Preset '{name}' supprime"
+
+
 # === AUTO-UPDATE (interroge GitHub releases) ===
-
-VERSION_FILE = HOME / "dev/claude-control/version.txt"
-# GITHUB_REPO sera defini lors du premier deploiement, ex: "sekoia-ca/claude-control"
-GITHUB_REPO_FILE = HOME / "dev/claude-control/.github-repo"
-
 
 def get_github_repo():
     if GITHUB_REPO_FILE.exists():
@@ -439,7 +354,6 @@ def apply_update():
             return False, f"git pull : {r.stderr[:200]}"
     except Exception as e:
         return False, f"Erreur git : {e}"
-    # Copie le nouveau app.py vers l'emplacement d'execution
     src = repo_dir / "src/app.py"
     dst = HOME / "Applications/claude-control/app.py"
     if src.exists():
@@ -461,6 +375,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 .tab-btn{transition:all .15s;}
 .tab-btn.active{background:white;box-shadow:0 1px 2px rgba(0,0,0,0.05);}
 .update-badge{background:linear-gradient(135deg,#D97757,#C15F3C);}
+.modal-bg{background:rgba(0,0,0,0.4);}
 </style></head><body class="min-h-screen text-stone-900">
 <div class="max-w-5xl mx-auto px-6 py-10">
 <header class="flex justify-between items-start mb-8 gap-4">
@@ -474,6 +389,13 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
 <section class="card p-6"><h2 class="text-lg font-semibold mb-1">Serveurs MCP</h2>
 <p class="text-xs text-stone-500 mb-4">Coche = charge au demarrage de Claude Desktop</p>
+<div class="mb-4 p-3 bg-stone-50 rounded-lg border border-stone-200">
+<div class="flex items-center justify-between mb-2">
+<span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Presets</span>
+<button onclick="openSavePreset()" class="text-xs text-stone-700 hover:text-stone-900 font-medium">+ Sauvegarder l'actuel</button>
+</div>
+<div id="presets-list" class="space-y-1.5"></div>
+</div>
 <div id="mcps" class="space-y-2"></div></section>
 <section class="card p-6"><h2 class="text-lg font-semibold mb-1">Skills</h2>
 <p class="text-xs text-stone-500 mb-4">Coche = disponible pour Claude</p>
@@ -518,11 +440,43 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </div>
 <p class="text-xs text-stone-400 mt-8 text-center">Apres modifications, clique sur "Redemarrer Claude" pour appliquer.</p>
 </div>
+<div id="preset-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
+<div class="card p-6 w-96 max-w-[90vw]">
+<h3 class="text-lg font-semibold mb-1">Sauvegarder un preset</h3>
+<p class="text-xs text-stone-500 mb-4">Capture les MCPs actuellement actifs sous un nom.</p>
+<input id="preset-name-in" type="text" class="w-full p-3 border border-stone-200 rounded-lg text-sm mb-2" placeholder="Ex: Klide, Audit client..." autocomplete="off"/>
+<p id="preset-modal-info" class="text-xs text-stone-500 mb-4"></p>
+<div class="flex gap-2 justify-end">
+<button onclick="closeSavePreset()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50">Annuler</button>
+<button onclick="confirmSavePreset()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium">Sauvegarder</button>
+</div>
+</div>
+</div>
 <script>
+let CURRENT_STATE = {mcps:[], skills:[]};
 async function loadState(){
   const s = await (await fetch('/api/state')).json();
+  CURRENT_STATE = s;
   document.getElementById('mcps').innerHTML = s.mcps.length===0 ? '<p class="text-stone-400 text-sm">Aucun MCP</p>' : s.mcps.map(m=>`<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium">${m.name}</span>${m.running?'<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">running</span>':(m.active?'<span class="text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full">pas demarre</span>':'')}</div></label>`).join('');
   document.getElementById('skills').innerHTML = s.skills.length===0 ? '<p class="text-stone-400 text-sm">Aucun skill</p>' : s.skills.map(sk=>`<label class="flex items-center gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}"><input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium text-sm">${sk.name}</span></label>`).join('');
+}
+function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');}
+async function loadPresets(){
+  try{
+    const j = await (await fetch('/api/presets')).json();
+    const presets = j.presets || {};
+    const names = Object.keys(presets).sort();
+    const list = document.getElementById('presets-list');
+    if(names.length===0){
+      list.innerHTML = '<p class="text-xs text-stone-400">Aucun preset. Active des MCPs puis sauvegarde.</p>';
+      return;
+    }
+    list.innerHTML = names.map(n=>{
+      const count = (presets[n]||[]).length;
+      const ne = escAttr(n);
+      return `<div class="flex items-center justify-between gap-2 p-2 bg-white border border-stone-200 rounded-md"><div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${ne}</div><div class="text-xs text-stone-500">${count} MCP${count>1?'s':''}</div></div><button onclick="applyPreset('${ne}')" class="text-xs px-2.5 py-1 rounded-md bg-stone-900 hover:bg-stone-800 text-white font-medium">Apply</button><button onclick="deletePreset('${ne}')" title="Supprimer" class="text-stone-400 hover:text-red-600 text-lg leading-none px-1">&times;</button></div>`;
+    }).join('');
+  }catch(e){}
 }
 async function checkUpdate(){
   try{
@@ -553,10 +507,41 @@ async function addMcpGit(){const v=document.getElementById('mcp-git-in').value.t
 async function addSkillFolder(){const v=document.getElementById('sk-folder-in').value.trim();if(!v)return;const j=await api('/api/import-skill-folder',{path:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-folder-in').value='';loadState();}}
 async function addSkillGit(){const v=document.getElementById('sk-git-in').value.trim();if(!v)return;banner('blue','Clonage...');const j=await api('/api/import-skill-git',{url:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-git-in').value='';loadState();}}
 async function addSkillMd(){const n=document.getElementById('sk-md-name').value.trim();const c=document.getElementById('sk-md-content').value;if(!n||!c)return;const j=await api('/api/import-skill-markdown',{name:n,content:c});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-md-name').value='';document.getElementById('sk-md-content').value='';loadState();}}
+function openSavePreset(){
+  const active = (CURRENT_STATE.mcps||[]).filter(m=>m.active).map(m=>m.name);
+  document.getElementById('preset-modal-info').textContent = active.length===0 ? 'Aucun MCP actif a sauvegarder.' : `MCPs actifs (${active.length}) : ${active.join(', ')}`;
+  document.getElementById('preset-name-in').value='';
+  document.getElementById('preset-modal').classList.remove('hidden');
+  setTimeout(()=>document.getElementById('preset-name-in').focus(),50);
+}
+function closeSavePreset(){document.getElementById('preset-modal').classList.add('hidden');}
+async function confirmSavePreset(){
+  const name = document.getElementById('preset-name-in').value.trim();
+  if(!name){banner('red','Nom requis');return;}
+  const active = (CURRENT_STATE.mcps||[]).filter(m=>m.active).map(m=>m.name);
+  const j = await api('/api/preset-save',{name:name, mcps:active});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){closeSavePreset();loadPresets();}
+}
+async function applyPreset(name){
+  if(!confirm(`Appliquer le preset "${name}" ?\n\nLes MCPs non listes seront desactives.`))return;
+  const j = await api('/api/preset-apply',{name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadState();}
+}
+async function deletePreset(name){
+  if(!confirm(`Supprimer le preset "${name}" ?`))return;
+  const j = await api('/api/preset-delete',{name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadPresets();}
+}
+document.addEventListener('keydown', e=>{
+  if(e.key==='Escape') closeSavePreset();
+  if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
+});
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-loadState();checkUpdate();setInterval(loadState,5000);setInterval(checkUpdate,3600000);
+loadState();loadPresets();checkUpdate();setInterval(loadState,5000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
-
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -581,6 +566,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(get_state())
         elif path == "/api/check-update":
             self._json(check_update())
+        elif path == "/api/presets":
+            self._json({"presets": list_presets()})
         else:
             self.send_response(404); self.end_headers()
 
@@ -602,6 +589,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/import-skill-folder": lambda: import_skill_folder(data.get("path", "")),
             "/api/import-skill-git": lambda: import_skill_git(data.get("url", "")),
             "/api/import-skill-markdown": lambda: import_skill_markdown(data.get("name", ""), data.get("content", "")),
+            "/api/preset-save": lambda: save_preset(data.get("name", ""), data.get("mcps", [])),
+            "/api/preset-apply": lambda: apply_preset(data.get("name", "")),
+            "/api/preset-delete": lambda: delete_preset(data.get("name", "")),
         }
         if path in routes:
             try:
