@@ -43,7 +43,8 @@ git clone https://github.com/fabultra/claude-control.git ~/dev/claude-control
 bash ~/dev/claude-control/scripts/install.sh
 ```
 
-After install, double-click **Claude Control.app** on your Desktop.
+After install, open Finder → Applications → double-click **Claude Control.app**
+(or drag it to your Dock for one-click access).
 
 ## How it works
 
@@ -57,7 +58,34 @@ After install, double-click **Claude Control.app** on your Desktop.
 ## Updating
 
 When a new release is published on GitHub, the app shows an "Update available" badge.
-Click it, the app does `git pull` and copies the new `app.py`. Quit and relaunch.
+Click it — the app pulls the new `app.py` and restarts itself in place via
+`os.execv`. No quit-and-relaunch needed.
+
+## If the .app icon stops launching
+
+Two macOS pitfalls can leave the bundle in a state where double-clicking the
+icon shows "L'application Claude Control.app n'est plus ouverte" with no
+visible activity:
+
+1. The bundle ended up on iCloud-synced `~/Desktop` and got partially evicted.
+2. macOS LaunchServices cached a stale entry pointing nowhere.
+
+To recover without opening Terminal:
+
+1. Open **Script Editor** (Spotlight → "Script Editor")
+2. Paste this and click ▶ Run:
+   ```applescript
+   try
+       do shell script "curl -fsSL https://raw.githubusercontent.com/fabultra/claude-control/main/scripts/repair.sh | bash"
+       display dialog "Done. Double-click Claude Control.app in ~/Applications" buttons {"OK"} default button 1
+   on error errMsg
+       display dialog ("Error: " & errMsg) buttons {"OK"} with icon stop
+   end try
+   ```
+
+`repair.sh` reinstalls the bundle at `~/Applications/Claude Control.app`
+(local, not iCloud), with a robust launcher that tries multiple `python3`
+locations and logs to `~/Library/Logs/claude-control-launch.log`.
 
 ## Manual workflows
 
