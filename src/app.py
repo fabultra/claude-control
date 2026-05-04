@@ -10,6 +10,8 @@ MAX_ZIP_SIZE = 50 * 1024 * 1024  # 50 Mo
 PORT = 8765
 HOME = Path.home()
 CONFIG_PATH = HOME / "Library/Application Support/Claude/claude_desktop_config.json"
+EXTENSIONS_INSTALL_FILE = HOME / "Library/Application Support/Claude/extensions-installations.json"
+EXTENSIONS_SETTINGS_DIR = HOME / "Library/Application Support/Claude/Claude Extensions Settings"
 SKILLS_DIR = HOME / ".claude/skills"
 SKILLS_DISABLED_DIR = HOME / ".claude/skills-disabled"
 COMMANDS_DIR = HOME / ".claude/commands"
@@ -202,9 +204,23 @@ def get_state():
             "source": it["_source"],
             "editable": False,
         })
+    mcps_list = (
+        [{"name": n, "active": True, "running": n in running, "type": "classic"} for n in sorted(active.keys())]
+        + [{"name": n, "active": False, "running": False, "type": "classic"} for n in sorted(disabled.keys())]
+    )
+    extensions = _list_extensions()
+    for e in extensions:
+        running_ext = bool(_extension_pids(e["name"]))
+        mcps_list.append({
+            "name": e["name"],
+            "active": e["enabled"],
+            "running": running_ext,
+            "type": "extension",
+            "extension_id": e["id"],
+            "version": e["version"],
+        })
     return {
-        "mcps": [{"name": n, "active": True, "running": n in running} for n in sorted(active.keys())]
-              + [{"name": n, "active": False, "running": False} for n in sorted(disabled.keys())],
+        "mcps": mcps_list,
         "skills": skills,
     }
 
@@ -277,16 +293,18 @@ def delete_skill(name):
 
 
 def restart_mcp(name):
-    """Redémarre un MCP sans toucher à Claude Desktop : kill le process puis
-    toggle off/on dans claude_desktop_config.json (Claude Desktop surveille ce
-    fichier, le toggle déclenche un respawn du MCP par son host MCP)."""
+    """Redémarre un MCP ou Desktop Extension sans toucher à Claude Desktop."""
     if not name:
         return False, "Nom MCP requis"
     config = load_config()
     is_active = name in config.get("mcpServers", {})
     is_disabled = name in config.get("_disabledMcps", {})
     if not (is_active or is_disabled):
-        return False, f"MCP '{name}' introuvable"
+        # Try as extension
+        extensions = _list_extensions()
+        if any(e["name"] == name or e["id"] == name for e in extensions):
+            return restart_extension(name)
+        return False, f"MCP / Extension '{name}' introuvable"
     pids = _mcp_pids(name) if "_mcp_pids" in globals() else []
     my_pid = os.getpid()
     killed = 0
@@ -635,13 +653,7 @@ def _mcp_pids(name):
     fp = _mcp_process_fingerprint(name)
     if not fp:
         return []
-    try:
-        r = subprocess.run(["pgrep", "-f", fp], capture_output=True, text=True, timeout=3)
-        if r.returncode != 0:
-            return []
-        return [int(p) for p in r.stdout.split() if p.strip().isdigit()]
-    except Exception:
-        return []
+    return _safe_pids_for_fingerprint(fp)
 
 
 def _mcp_log_says_frozen(name, within_seconds):
@@ -701,6 +713,193 @@ def _list_known_mcps():
     return sorted(set(list(config.get("mcpServers", {}).keys()) + list(config.get("_disabledMcps", {}).keys())))
 
 
+# === DESKTOP EXTENSIONS ===
+
+def _extension_settings_file(ext_id):
+    return EXTENSIONS_SETTINGS_DIR / f"{ext_id}.json"
+
+
+def _load_extension_settings(ext_id):
+    f = _extension_settings_file(ext_id)
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text(errors="replace"))
+    except Exception:
+        return {}
+
+
+def _save_extension_settings(ext_id, settings):
+    f = _extension_settings_file(ext_id)
+    if f.exists():
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe = re.sub(r'[^a-zA-Z0-9_\-.]', '_', ext_id)
+        try:
+            shutil.copy2(f, BACKUP_DIR / f"ext-settings-{safe}.{ts}.json")
+        except Exception:
+            pass
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, "w") as out:
+        json.dump(settings, out, indent=2)
+
+
+def _list_extensions():
+    """Liste les Desktop Extensions installées. Tolerant aux variations de
+    schéma (peut être un objet, une liste, ou un dict de dicts)."""
+    if not EXTENSIONS_INSTALL_FILE.exists():
+        return []
+    try:
+        data = json.loads(EXTENSIONS_INSTALL_FILE.read_text(errors="replace"))
+    except Exception:
+        return []
+    entries = []
+    if isinstance(data, list):
+        entries = data
+    elif isinstance(data, dict):
+        for key in ("installations", "extensions"):
+            if isinstance(data.get(key), list):
+                entries = data[key]
+                break
+            if isinstance(data.get(key), dict):
+                entries = list(data[key].values())
+                break
+        if not entries and all(isinstance(v, dict) for v in data.values()):
+            entries = list(data.values())
+    items = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        ext_id = e.get("id") or e.get("extensionId") or e.get("identifier")
+        if not ext_id:
+            continue
+        name = e.get("name") or e.get("displayName") or str(ext_id).split(".")[-1]
+        version = str(e.get("version") or e.get("manifestVersion") or "")
+        settings = _load_extension_settings(ext_id)
+        enabled = bool(settings.get("enabled", e.get("enabled", e.get("status") != "disabled")))
+        env_keys = list(settings.get("env", {}).keys()) if isinstance(settings.get("env"), dict) else []
+        items.append({
+            "id": ext_id,
+            "name": str(name),
+            "version": version,
+            "enabled": enabled,
+            "type": "extension",
+            "env_keys": env_keys,
+        })
+    items.sort(key=lambda x: x["name"].lower())
+    return items
+
+
+def toggle_extension(name, enabled=None):
+    """Toggle une extension via son fichier de settings (avec backup)."""
+    if not name:
+        return False, "Nom requis"
+    extensions = _list_extensions()
+    target = next((e for e in extensions if e["name"] == name or e["id"] == name), None)
+    if not target:
+        return False, f"Extension '{name}' introuvable"
+    settings = _load_extension_settings(target["id"])
+    if enabled is None:
+        enabled = not bool(settings.get("enabled", True))
+    settings["enabled"] = bool(enabled)
+    try:
+        _save_extension_settings(target["id"], settings)
+    except Exception as e:
+        return False, f"Erreur écriture settings : {e}"
+    label = "activée" if enabled else "désactivée"
+    return True, f"Extension '{name}' {label}"
+
+
+_KILL_ALLOWED_LAUNCHERS = {"node", "python", "python3", "npx", "bun", "deno",
+                            "java", "ruby", "uvx", "uv", "go", "rust", "cargo",
+                            "electron", "tsx", "ts-node"}
+
+
+def _safe_pids_for_fingerprint(fingerprint):
+    """Allow-list approach: a PID is killable only if its command's first token
+    is a known MCP launcher (node/python/npx/...) OR if the fingerprint appears
+    in the binary path itself. Anything else (shells, curl wrappers, timeout,
+    bash -c chains containing the fingerprint as an arg) is left alone."""
+    try:
+        r = subprocess.run(["pgrep", "-fla", fingerprint], capture_output=True, text=True, timeout=3)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    my_pid = os.getpid()
+    fp_lc = fingerprint.lower()
+    pids = []
+    for line in r.stdout.splitlines():
+        sp = line.strip().split(None, 1)
+        if len(sp) != 2:
+            continue
+        try:
+            pid = int(sp[0])
+        except Exception:
+            continue
+        if pid == my_pid:
+            continue
+        cmd = sp[1]
+        if "claude-control/app.py" in cmd or "Applications/claude-control/app.py" in cmd:
+            continue
+        first_token = cmd.split(None, 1)[0]
+        bn = Path(first_token).name.lower()
+        if bn in _KILL_ALLOWED_LAUNCHERS:
+            pids.append(pid)
+        elif fp_lc in first_token.lower():
+            pids.append(pid)
+    return pids
+
+
+def _extension_pids(ext_name_or_id):
+    """Trouve les PIDs d'une extension via fingerprints du plus spécifique au moins.
+    Premier fingerprint qui matche gagne — évite l'union qui ramène trop de bruit."""
+    extensions = _list_extensions()
+    target = next((e for e in extensions if e["name"] == ext_name_or_id or e["id"] == ext_name_or_id), None)
+    if not target:
+        return []
+    candidates = [target["id"], target["id"].split(".")[-1], target["name"]]
+    seen = set()
+    ordered = []
+    for fp in candidates:
+        if fp and len(fp) >= 6 and fp not in seen:
+            seen.add(fp)
+            ordered.append(fp)
+    for fp in ordered:
+        pids = _safe_pids_for_fingerprint(fp)
+        if pids:
+            return pids
+    return []
+
+
+def restart_extension(name):
+    """Bounce une extension : kill le process via fingerprints, puis toggle off/on
+    son setting (Claude Desktop respawn)."""
+    extensions = _list_extensions()
+    target = next((e for e in extensions if e["name"] == name or e["id"] == name), None)
+    if not target:
+        return False, f"Extension '{name}' introuvable"
+    pids = _extension_pids(name)
+    killed = 0
+    for pid in pids:
+        try:
+            os.kill(pid, 9)
+            killed += 1
+        except Exception:
+            pass
+    settings = _load_extension_settings(target["id"])
+    was_enabled = bool(settings.get("enabled", True))
+    settings["enabled"] = False
+    try:
+        _save_extension_settings(target["id"], settings)
+        time.sleep(1.5)
+        settings["enabled"] = was_enabled
+        _save_extension_settings(target["id"], settings)
+    except Exception as e:
+        return False, f"Erreur toggle settings : {e}"
+    return True, f"Extension '{name}' redémarrée (killed {killed}, settings togglée)"
+
+
 def scan_processes(pattern):
     """Recherche des process matchant un pattern via `pgrep -fla`. Retourne
     une liste [{pid, cmd}] limitée et tronquée. Defensive."""
@@ -738,14 +937,7 @@ def scan_processes(pattern):
 def _custom_target_pids(pattern):
     if not pattern or len(pattern) < 2:
         return []
-    try:
-        r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=3)
-        if r.returncode != 0:
-            return []
-        my_pid = os.getpid()
-        return [int(p) for p in r.stdout.split() if p.strip().isdigit() and int(p) != my_pid]
-    except Exception:
-        return []
+    return _safe_pids_for_fingerprint(pattern)
 
 
 def get_watchdog_status():
@@ -2444,6 +2636,7 @@ fr: {
   scan_no_match: "Aucun process ne contient « {p} » dans son ligne de commande.",
   scan_n_matches: "{n} process trouvé(s) qui contiennent « {p} » :",
   banner_pattern_too_short: "Pattern trop court (>= 2 caractères)",
+  ext_badge: "ext",
   btn_restart_mcp: "Redémarrer ce MCP (sans toucher à Claude)",
   skill_filter_mine: "Mes skills",
   skill_filter_plugins: "Plugins",
@@ -2620,6 +2813,7 @@ en: {
   scan_no_match: 'No process matches "{p}" in its command line.',
   scan_n_matches: '{n} process(es) match "{p}":',
   banner_pattern_too_short: "Pattern too short (>= 2 characters)",
+  ext_badge: "ext",
   btn_restart_mcp: "Restart this MCP (without touching Claude)",
   skill_filter_mine: "My skills",
   skill_filter_plugins: "Plugins",
@@ -2691,7 +2885,14 @@ let CURRENT_STATE = {mcps:[], skills:[]};
 async function loadState(){
   const s = await (await fetch('/api/state')).json();
   CURRENT_STATE = s;
-  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>`<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="text-stone-400 hover:text-amber-700 hover:bg-amber-50 rounded px-2 py-1 text-sm leading-none shrink-0">&#x21bb;</button><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button></label>`).join('');
+  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>{
+    const isExt = m.type === 'extension';
+    const extBadge = isExt ? `<span class="text-[10px] font-mono text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded" title="Desktop Extension">${tr('ext_badge')}</span>` : '';
+    const versionBadge = isExt && m.version ? `<span class="text-[10px] text-stone-400 font-mono">v${escAttr(m.version)}</span>` : '';
+    const toggleFn = isExt ? `toggleExtension('${m.name}', this.checked)` : `toggleMcp('${m.name}')`;
+    const deleteBtn = isExt ? '' : `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>`;
+    return `<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="${toggleFn}" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${extBadge}${versionBadge}${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active && !isExt?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="text-stone-400 hover:text-amber-700 hover:bg-amber-50 rounded px-2 py-1 text-sm leading-none shrink-0">&#x21bb;</button>${deleteBtn}</label>`;
+  }).join('');
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
 }
@@ -3164,6 +3365,7 @@ async function api(path, body){
   return r.json();
 }
 async function toggleMcp(n){const j=await api('/api/toggle-mcp',{name:n});banner(j.success?'green':'red',j.message);loadState();}
+async function toggleExtension(name, enabled){const j=await api('/api/toggle-extension',{name:name, enabled:enabled});banner(j.success?'green':'red',j.message);loadState();}
 let CURRENT_MCP_ERR = null;
 async function showMcpError(name){
   CURRENT_MCP_ERR = name;
@@ -3407,6 +3609,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
             "/api/restart-mcp": lambda: restart_mcp(data.get("name", "")),
+            "/api/toggle-extension": lambda: toggle_extension(data.get("name", ""), data.get("enabled")),
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
             "/api/watchdog-config": lambda: save_watchdog_config(data),
