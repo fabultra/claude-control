@@ -540,6 +540,7 @@ _DEFAULT_WATCHDOG = {
     "freeze_detection": False,
     "interval_seconds": 30,
     "freeze_timeout": 5,
+    "target": "claude_desktop",
 }
 
 
@@ -567,10 +568,64 @@ def save_watchdog_config(updates):
     cfg["enabled"] = bool(cfg["enabled"])
     cfg["auto_restart_on_crash"] = bool(cfg["auto_restart_on_crash"])
     cfg["freeze_detection"] = bool(cfg["freeze_detection"])
+    cfg["target"] = (cfg.get("target") or "claude_desktop").strip()
     WATCHDOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(WATCHDOG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
     return True, cfg
+
+
+def _mcp_process_fingerprint(name):
+    """Construit une regex de matching pour un MCP en se basant sur sa command/args."""
+    config = load_config()
+    mcp = config.get("mcpServers", {}).get(name) or config.get("_disabledMcps", {}).get(name)
+    if not isinstance(mcp, dict):
+        return None
+    cmd = mcp.get("command", "")
+    args = mcp.get("args") or []
+    parts = [str(cmd)] + [str(a) for a in args]
+    distinctive = [p for p in parts if "/" in p or len(p) > 8 or p.endswith(".js") or p.endswith(".py")]
+    if distinctive:
+        return distinctive[-1]
+    return cmd or None
+
+
+def _mcp_pids(name):
+    fp = _mcp_process_fingerprint(name)
+    if not fp:
+        return []
+    try:
+        r = subprocess.run(["pgrep", "-f", fp], capture_output=True, text=True, timeout=3)
+        if r.returncode != 0:
+            return []
+        return [int(p) for p in r.stdout.split() if p.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def _mcp_log_says_frozen(name, within_seconds):
+    """Lit mcp-server-<name>.log et regarde si une erreur 'transport closed' /
+    'process exiting early' est apparue dans la fenêtre."""
+    log = CLAUDE_LOGS_DIR / f"mcp-server-{name}.log"
+    if not log.exists():
+        return False
+    try:
+        mtime = log.stat().st_mtime
+    except Exception:
+        return False
+    if mtime < time.time() - within_seconds:
+        return False
+    try:
+        text = log.read_text(errors="replace")
+    except Exception:
+        return False
+    tail = text[-4000:].lower()
+    return any(k in tail for k in (
+        "transport closed unexpectedly",
+        "process exiting early",
+        "process exited early",
+        "server disconnected",
+    ))
 
 
 def _claude_pids():
@@ -600,15 +655,28 @@ def _claude_responsive(timeout=5):
         return True
 
 
+def _list_known_mcps():
+    config = load_config()
+    return sorted(set(list(config.get("mcpServers", {}).keys()) + list(config.get("_disabledMcps", {}).keys())))
+
+
 def get_watchdog_status():
     cfg = load_watchdog_config()
-    pids = _claude_pids()
+    target = cfg.get("target", "claude_desktop")
+    if target == "claude_desktop":
+        pids = _claude_pids()
+        target_label = "Claude Desktop"
+    else:
+        pids = _mcp_pids(target)
+        target_label = target
     with _WATCHDOG_EVENTS_LOCK:
         events = list(_WATCHDOG_EVENTS[-10:][::-1])
     return {
         "config": cfg,
         "claude_running": len(pids) > 0,
         "claude_pids": pids,
+        "target_label": target_label,
+        "available_targets": ["claude_desktop"] + _list_known_mcps(),
         "events": events,
     }
 
@@ -619,17 +687,40 @@ def _watchdog_loop():
             cfg = load_watchdog_config()
             interval = cfg["interval_seconds"]
             if cfg["enabled"]:
-                pids = _claude_pids()
-                if not pids:
-                    if cfg["auto_restart_on_crash"]:
-                        _watchdog_event("start", "Claude not running, launching")
-                        subprocess.run(["open", "-a", "Claude"], check=False)
-                elif cfg["freeze_detection"]:
-                    if not _claude_responsive(timeout=cfg["freeze_timeout"]):
-                        _watchdog_event("restart", f"Claude unresponsive >{cfg['freeze_timeout']}s, restarting")
-                        subprocess.run(["pkill", "-9", "-f", "Claude"], check=False)
-                        time.sleep(2)
-                        subprocess.run(["open", "-a", "Claude"], check=False)
+                target = cfg.get("target", "claude_desktop")
+                if target == "claude_desktop":
+                    pids = _claude_pids()
+                    if not pids:
+                        if cfg["auto_restart_on_crash"]:
+                            _watchdog_event("start", "Claude Desktop not running, launching")
+                            subprocess.run(["open", "-a", "Claude"], check=False)
+                    elif cfg["freeze_detection"]:
+                        if not _claude_responsive(timeout=cfg["freeze_timeout"]):
+                            _watchdog_event("restart", f"Claude Desktop unresponsive >{cfg['freeze_timeout']}s, restarting")
+                            subprocess.run(["pkill", "-9", "-f", "Claude"], check=False)
+                            time.sleep(2)
+                            subprocess.run(["open", "-a", "Claude"], check=False)
+                else:
+                    pids = _mcp_pids(target)
+                    if not pids:
+                        # MCP not running. Claude Desktop should respawn it on launch.
+                        # If Claude Desktop is also down, start it; otherwise nothing to do
+                        # (the MCP is presumably failing; user can use the diagnose modal).
+                        if cfg["auto_restart_on_crash"] and not _claude_pids():
+                            _watchdog_event("start", f"MCP '{target}' down + Claude Desktop down, launching Claude")
+                            subprocess.run(["open", "-a", "Claude"], check=False)
+                    elif cfg["freeze_detection"]:
+                        # Freeze detection for an MCP: scan its log for recent
+                        # "transport closed" / "exiting early" markers within
+                        # the last 2 * interval seconds.
+                        window = max(60, interval * 2)
+                        if _mcp_log_says_frozen(target, within_seconds=window):
+                            _watchdog_event("kill_mcp", f"MCP '{target}' shows freeze markers in log, killing PIDs to force respawn")
+                            for pid in pids:
+                                try:
+                                    os.kill(pid, 9)
+                                except Exception:
+                                    pass
         except Exception as e:
             _log(f"watchdog loop error: {e}")
             interval = 30
@@ -2241,6 +2332,7 @@ fr: {
   watchdog_enable: "Surveiller Claude Desktop",
   watchdog_crash: "Redémarrer si crash",
   watchdog_freeze: "Détecter freeze + redémarrer",
+  watchdog_target_label: "Cible",
   claude_running: "Claude tourne",
   claude_stopped: "Claude arrêté",
   tab_overview: "Vue d'ensemble",
@@ -2400,6 +2492,7 @@ en: {
   watchdog_enable: "Watch Claude Desktop",
   watchdog_crash: "Restart on crash",
   watchdog_freeze: "Detect freeze + restart",
+  watchdog_target_label: "Target",
   claude_running: "Claude running",
   claude_stopped: "Claude stopped",
   tab_overview: "Overview",
@@ -2640,12 +2733,18 @@ async function loadWatchdog(){
     if(!el) return;
     const cfg = d.config || {};
     const running = !!d.claude_running;
+    const targetLabel = d.target_label || cfg.target || 'Claude Desktop';
     const statusBadge = running
-      ? `<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('claude_running')}</span>`
-      : `<span class="text-xs text-stone-700 bg-stone-100 px-2 py-0.5 rounded-full">${tr('claude_stopped')}</span>`;
+      ? `<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${escAttr(targetLabel)} &middot; ${tr('claude_running')}</span>`
+      : `<span class="text-xs text-stone-700 bg-stone-100 px-2 py-0.5 rounded-full">${escAttr(targetLabel)} &middot; ${tr('claude_stopped')}</span>`;
     const events = (d.events || []).slice(0,3).map(ev=>`<div class="text-[10px] text-stone-500"><span class="font-mono">${escAttr(ev.ts.slice(11,19))}</span> &middot; ${escAttr(ev.action)} &middot; ${escAttr(ev.detail||'')}</div>`).join('');
+    const targets = (d.available_targets || ['claude_desktop']);
+    const targetOptions = targets.map(t=>{
+      const label = t === 'claude_desktop' ? 'Claude Desktop' : t;
+      return `<option value="${escAttr(t)}" ${cfg.target===t?'selected':''}>${escAttr(label)}</option>`;
+    }).join('');
     el.innerHTML = `<div class="p-3 rounded-lg border border-stone-200 bg-stone-50">
-<div class="flex items-baseline justify-between mb-2">
+<div class="flex items-baseline justify-between mb-2 flex-wrap gap-2">
 <div class="flex items-center gap-2">
 <span class="text-xs font-semibold uppercase tracking-wide text-stone-600">${tr('watchdog_label')}</span>
 ${statusBadge}
@@ -2654,6 +2753,9 @@ ${statusBadge}
 </div>
 <div class="flex flex-wrap items-center gap-3 text-xs">
 <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" ${cfg.enabled?'checked':''} onchange="updateWatchdog({enabled:this.checked})" class="w-4 h-4 rounded accent-green-700"><span>${tr('watchdog_enable')}</span></label>
+<label class="flex items-center gap-2 cursor-pointer ${cfg.enabled?'':'opacity-50'}"><span>${tr('watchdog_target_label')}:</span>
+<select onchange="updateWatchdog({target:this.value})" ${cfg.enabled?'':'disabled'} class="text-xs border border-stone-200 rounded px-2 py-1 bg-white">${targetOptions}</select>
+</label>
 <label class="flex items-center gap-2 cursor-pointer ${cfg.enabled?'':'opacity-50'}"><input type="checkbox" ${cfg.auto_restart_on_crash?'checked':''} ${cfg.enabled?'':'disabled'} onchange="updateWatchdog({auto_restart_on_crash:this.checked})" class="w-4 h-4 rounded accent-green-700"><span>${tr('watchdog_crash')}</span></label>
 <label class="flex items-center gap-2 cursor-pointer ${cfg.enabled?'':'opacity-50'}"><input type="checkbox" ${cfg.freeze_detection?'checked':''} ${cfg.enabled?'':'disabled'} onchange="updateWatchdog({freeze_detection:this.checked})" class="w-4 h-4 rounded accent-green-700"><span>${tr('watchdog_freeze')}</span></label>
 </div>
