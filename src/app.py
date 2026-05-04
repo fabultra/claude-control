@@ -293,8 +293,8 @@ def _detect_missing_env_var(text):
 
 
 def test_mcp(name):
-    """Lance la 'command' du MCP avec ses 'env' depuis claude_desktop_config.json,
-    capture stdout/stderr pendant 5s max, classifie le resultat."""
+    """Lance le MCP comme le ferait Claude Desktop (handshake JSON-RPC initialize)
+    et observe sa reponse. C'est le test reel, pas une simulation avec stdin/dev/null."""
     if not name:
         return False, {"error": "Nom MCP requis"}
     config = load_config()
@@ -313,57 +313,106 @@ def test_mcp(name):
     if isinstance(env_extra, dict):
         for k, v in env_extra.items():
             env[str(k)] = "" if v is None else str(v)
-    timed_out = False
-    stdout = ""
-    stderr = ""
-    exit_code = None
+
+    init_msg = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "claude-control-test", "version": "1.0"},
+        },
+    }) + "\n"
+
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [command, *args],
-            capture_output=True, text=True, env=env,
-            stdin=subprocess.DEVNULL, timeout=5,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, text=True, bufsize=1,
         )
-        exit_code = proc.returncode
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-    except subprocess.TimeoutExpired as e:
-        timed_out = True
-        stdout = (e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
-        stderr = (e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or ""))
     except FileNotFoundError:
         return True, {
-            "name": name, "exited": True, "exit_code": 127, "stdout": "", "stderr": f"command introuvable : {command}",
+            "name": name, "exit_code": 127, "stdout": "", "stderr": f"command introuvable : {command}",
             "suggestion": f"Le binaire '{command}' n'existe pas. Verifie le chemin dans la config MCP.",
-            "kind": "binary", "missing_env_var": None, "configured_env_keys": list((env_extra or {}).keys()),
+            "kind": "binary", "missing_env_var": None,
+            "handshake": None, "configured_env_keys": list((env_extra or {}).keys()),
         }
     except Exception as e:
         return True, {
-            "name": name, "exited": True, "exit_code": -1, "stdout": "", "stderr": str(e),
+            "name": name, "exit_code": -1, "stdout": "", "stderr": str(e),
             "suggestion": f"Erreur execution : {e}", "kind": None, "missing_env_var": None,
-            "configured_env_keys": list((env_extra or {}).keys()),
+            "handshake": None, "configured_env_keys": list((env_extra or {}).keys()),
         }
-    combined = stderr + "\n" + stdout
-    suggestion, kind = _suggest_mcp_fix(combined)
+
+    stdout_text = ""
+    stderr_text = ""
+    handshake_response = None
+    try:
+        stdout_text, stderr_text = proc.communicate(input=init_msg, timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            stdout_text, stderr_text = proc.communicate(timeout=2)
+        except Exception:
+            stdout_text, stderr_text = "", ""
+
+    for line in (stdout_text or "").splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict) and obj.get("id") == 1:
+                handshake_response = obj
+                break
+        except Exception:
+            pass
+
+    exit_code = proc.returncode
+    combined = (stderr_text or "") + "\n" + (stdout_text or "")
+    pattern_suggestion, pattern_kind = _suggest_mcp_fix(combined)
     missing_var = _detect_missing_env_var(combined)
-    if not suggestion:
-        if timed_out:
-            suggestion = "Le MCP demarre et reste actif au-dela de 5s sans crasher. Le probleme vient probablement de la communication avec Claude Desktop, pas du process lui-meme."
-            kind = "timeout_ok"
-        elif exit_code != 0:
-            suggestion = f"Le MCP a quitte avec code {exit_code}. Lis stderr ci-dessus."
-            kind = "nonzero_exit"
-        else:
-            suggestion = "Code de sortie 0 mais quitte immediatement. Le MCP n'est probablement pas conforme au protocole MCP."
-            kind = "exit_zero"
+
+    if handshake_response and "result" in handshake_response:
+        kind = "handshake_ok"
+        server_info = handshake_response.get("result", {}).get("serverInfo", {})
+        suggestion = (
+            f"Ton serveur MCP repond correctement au handshake `initialize` "
+            f"(serverInfo: {server_info.get('name', '?')} v{server_info.get('version', '?')}). "
+            f"Le serveur est sain. Si Claude Desktop affiche quand meme 'pas demarre', le probleme "
+            f"est dans Claude Desktop lui-meme : redemarre-le via le bouton en haut a droite, ou "
+            f"verifie que la version de Claude Desktop est compatible avec ton MCP."
+        )
+    elif handshake_response and "error" in handshake_response:
+        kind = "handshake_error"
+        err = handshake_response["error"]
+        suggestion = f"Le serveur a repondu au handshake mais avec une erreur : {err.get('message', 'inconnue')} (code {err.get('code')})."
+    elif pattern_suggestion:
+        kind = pattern_kind
+        suggestion = pattern_suggestion
+    elif exit_code is not None and exit_code != 0:
+        kind = "nonzero_exit"
+        suggestion = f"Le serveur a quitte avec code {exit_code} avant de repondre au handshake. Lis stderr ci-dessous."
+    elif exit_code == 0:
+        kind = "exit_zero"
+        suggestion = (
+            "Le serveur a quitte avec code 0 sans repondre au handshake `initialize`. "
+            "Soit le code n'a pas de boucle stdio bloquante, soit la version de la lib `mcp` "
+            "dans le venv ne correspond plus a l'API utilisee dans le code (essaye `pip install --upgrade mcp` "
+            "dans le venv du MCP)."
+        )
+    else:
+        kind = "no_response"
+        suggestion = "Aucune reponse au handshake apres 5s, mais le serveur tourne. Probable bug dans la logique du serveur (handler `initialize` non implemente)."
+
     return True, {
         "name": name,
-        "exited": not timed_out,
         "exit_code": exit_code,
-        "stdout": (stdout or "")[-3000:],
-        "stderr": (stderr or "")[-3000:],
+        "stdout": (stdout_text or "")[-3000:],
+        "stderr": (stderr_text or "")[-3000:],
         "suggestion": suggestion,
         "kind": kind,
         "missing_env_var": missing_var,
+        "handshake": handshake_response is not None,
         "configured_env_keys": list((env_extra or {}).keys()),
     }
 
@@ -1284,10 +1333,12 @@ async function runMcpTest(){
     if(!d.success){banner('red', d.message || 'Echec du test');return;}
     const summary = document.getElementById('mcp-err-test-summary');
     let badge, color;
-    if(d.kind === 'timeout_ok'){badge='OK'; color='bg-green-50 text-green-800 border border-green-200';}
-    else if(d.exited && d.exit_code === 0){badge='Quitte sans erreur (exit 0)'; color='bg-amber-50 text-amber-800 border border-amber-200';}
-    else if(d.exited){badge=`Quitte avec code ${d.exit_code}`; color='bg-red-50 text-red-800 border border-red-200';}
-    else {badge='Toujours actif'; color='bg-blue-50 text-blue-800 border border-blue-200';}
+    if(d.kind === 'handshake_ok'){badge='&#9989; Serveur MCP sain (handshake OK)'; color='bg-green-50 text-green-800 border border-green-200';}
+    else if(d.kind === 'handshake_error'){badge='&#9888; Handshake en erreur'; color='bg-amber-50 text-amber-800 border border-amber-200';}
+    else if(d.kind === 'no_response'){badge='&#9888; Pas de reponse au handshake'; color='bg-amber-50 text-amber-800 border border-amber-200';}
+    else if(d.exit_code !== null && d.exit_code !== 0){badge=`&#10060; Quitte avec code ${d.exit_code}`; color='bg-red-50 text-red-800 border border-red-200';}
+    else if(d.exit_code === 0){badge='&#10060; Quitte avec code 0 sans reponse'; color='bg-red-50 text-red-800 border border-red-200';}
+    else {badge='Inconnu'; color='bg-stone-50 text-stone-700 border border-stone-200';}
     summary.className = 'text-sm mb-2 p-2 rounded-lg ' + color;
     summary.innerHTML = `<div class="font-semibold mb-1">${badge}</div><div>${escAttr(d.suggestion||'')}</div>`;
     document.getElementById('mcp-err-test-stderr').textContent = d.stderr || '(vide)';
