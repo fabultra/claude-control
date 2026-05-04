@@ -12,6 +12,9 @@ HOME = Path.home()
 CONFIG_PATH = HOME / "Library/Application Support/Claude/claude_desktop_config.json"
 SKILLS_DIR = HOME / ".claude/skills"
 SKILLS_DISABLED_DIR = HOME / ".claude/skills-disabled"
+COMMANDS_DIR = HOME / ".claude/commands"
+COMMANDS_DISABLED_DIR = HOME / ".claude/commands-disabled"
+CLAUDE_MD_FILE = HOME / ".claude/CLAUDE.md"
 BACKUP_DIR = HOME / ".claude/backups/claude-control"
 IMPORTED_REPOS_DIR = HOME / ".claude/imported-mcps"
 PRESETS_FILE = HOME / ".claude/claude-control-presets.json"
@@ -154,6 +157,118 @@ def toggle_skill(name):
         src_d.rename(target)
         return True, f"Skill '{name}' active"
     return False, f"Skill '{name}' introuvable"
+
+
+def _read_command_preview(path, max_chars=400):
+    try:
+        text = path.read_text(errors="replace")
+    except Exception:
+        return ""
+    return text if len(text) <= max_chars else text[:max_chars] + "\n..."
+
+
+def list_commands():
+    """Liste les commands utilisateur (~/.claude/commands/) + celles fournies par
+    chaque plugin actif. Les commands plugin sont en lecture seule."""
+    commands = []
+    COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+    COMMANDS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
+    for f in sorted(COMMANDS_DIR.glob("*.md")):
+        commands.append({"name": f.stem, "source": "user", "active": True,
+                         "path": str(f), "editable": True})
+    for f in sorted(COMMANDS_DISABLED_DIR.glob("*.md")):
+        commands.append({"name": f.stem, "source": "user", "active": False,
+                         "path": str(f), "editable": True})
+    try:
+        installed = _load_installed_plugins()
+    except Exception:
+        installed = {}
+    settings = _load_settings()
+    enabled_map = settings.get("enabledPlugins", {}) if isinstance(settings, dict) else {}
+    for full_name, entries in installed.items():
+        if not enabled_map.get(full_name, True):
+            continue
+        if not isinstance(entries, list) or not entries:
+            continue
+        entry = entries[0]
+        if not isinstance(entry, dict):
+            continue
+        install_path = Path(entry.get("installPath", ""))
+        cmd_dir = install_path / "commands"
+        if not cmd_dir.is_dir():
+            continue
+        for f in sorted(cmd_dir.glob("*.md")):
+            commands.append({"name": f.stem, "source": f"plugin:{full_name}",
+                             "active": True, "path": str(f), "editable": False})
+    return commands
+
+
+def get_command(name, source):
+    if source == "user":
+        for base in (COMMANDS_DIR, COMMANDS_DISABLED_DIR):
+            p = base / f"{name}.md"
+            if p.exists():
+                return True, {"name": name, "source": "user", "content": p.read_text(errors="replace"),
+                              "path": str(p), "active": (base == COMMANDS_DIR), "editable": True}
+        return False, "Command introuvable"
+    if source.startswith("plugin:"):
+        full_name = source[len("plugin:"):]
+        installed = _load_installed_plugins()
+        if full_name not in installed:
+            return False, "Plugin introuvable"
+        entry = installed[full_name][0]
+        cmd_path = Path(entry.get("installPath", "")) / "commands" / f"{name}.md"
+        if not cmd_path.is_file():
+            return False, "Command introuvable dans le plugin"
+        return True, {"name": name, "source": source, "content": cmd_path.read_text(errors="replace"),
+                      "path": str(cmd_path), "active": True, "editable": False}
+    return False, "Source invalide"
+
+
+def toggle_command(name):
+    """Toggle une command utilisateur entre commands/ et commands-disabled/."""
+    if not name or "/" in name or name.startswith("."):
+        return False, "Nom de command invalide"
+    COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+    COMMANDS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
+    fname = f"{name}.md"
+    src_a = COMMANDS_DIR / fname
+    src_d = COMMANDS_DISABLED_DIR / fname
+    if src_a.exists():
+        target = COMMANDS_DISABLED_DIR / fname
+        if target.exists():
+            return False, f"Conflit : {target} existe déjà"
+        src_a.rename(target)
+        return True, f"Command '{name}' désactivée"
+    if src_d.exists():
+        target = COMMANDS_DIR / fname
+        if target.exists():
+            return False, f"Conflit : {target} existe déjà"
+        src_d.rename(target)
+        return True, f"Command '{name}' activée"
+    return False, f"Command '{name}' introuvable"
+
+
+def save_command(name, content):
+    """Sauvegarde une command utilisateur (avec backup si elle existait)."""
+    if not name or not re.match(r'^[a-zA-Z0-9_\-]+$', name):
+        return False, "Nom invalide (a-z, A-Z, 0-9, - et _ uniquement)"
+    if not isinstance(content, str):
+        return False, "Contenu invalide"
+    COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+    target_active = COMMANDS_DIR / f"{name}.md"
+    target_disabled = COMMANDS_DISABLED_DIR / f"{name}.md"
+    target = target_active if target_active.exists() or not target_disabled.exists() else target_disabled
+    if target.exists():
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = BACKUP_DIR / f"command-{name}.{ts}.md"
+        try:
+            shutil.copy2(target, backup)
+        except Exception:
+            pass
+    target.write_text(content)
+    return True, f"Command '{name}' enregistrée"
 
 
 def restart_claude():
@@ -1094,6 +1209,11 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <p class="text-xs text-stone-500 mb-4" data-i18n="plugins_help">Plugins Claude Code installés via marketplace</p>
 <div id="plugins" class="space-y-2"></div>
 </section>
+<section class="card p-6 mt-6">
+<h2 class="text-lg font-semibold mb-1" data-i18n="commands">Commands</h2>
+<p class="text-xs text-stone-500 mb-4" data-i18n="commands_help">Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs</p>
+<div id="commands" class="space-y-2 max-h-[500px] overflow-y-auto"></div>
+</section>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
 <section class="card p-6">
 <h2 class="text-lg font-semibold mb-1" data-i18n="add_mcp">+ Ajouter un MCP</h2>
@@ -1186,6 +1306,21 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <button onclick="restartClaude()" class="px-4 py-2 text-sm rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 font-medium" data-i18n="restart_claude">Redémarrer Claude</button>
 <button onclick="closeMcpError()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50" data-i18n="btn_close">Fermer</button>
 </div>
+</div>
+</div>
+</div>
+<div id="cmd-edit-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
+<div class="card p-6 w-[720px] max-w-[92vw] max-h-[85vh] overflow-y-auto">
+<div class="flex items-baseline justify-between mb-3">
+<h3 class="text-lg font-semibold"><span id="cmd-edit-name" class="font-mono"></span></h3>
+<button onclick="closeCmdEdit()" class="text-stone-400 hover:text-stone-700 text-xl leading-none px-2">&times;</button>
+</div>
+<p class="text-xs text-stone-500 mb-3"><span data-i18n="source_label">Source</span> : <span id="cmd-edit-source" class="font-mono"></span></p>
+<input id="cmd-edit-name-input" type="hidden" />
+<textarea id="cmd-edit-content" class="w-full p-3 border border-stone-200 rounded-lg font-mono text-xs h-72 focus:outline-none focus:border-stone-400" spellcheck="false"></textarea>
+<div class="flex gap-2 justify-end mt-3">
+<button onclick="closeCmdEdit()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50" data-i18n="btn_close">Fermer</button>
+<button id="cmd-edit-save" onclick="saveCommand()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium" data-i18n="btn_save">Sauvegarder</button>
 </div>
 </div>
 </div>
@@ -1297,6 +1432,17 @@ fr: {
   plugin_empty: "vide",
   plugin_no_content: "Aucun contenu détecté.",
   empty_capture: "(vide)",
+  commands: "Commands",
+  commands_help: "Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs",
+  commands_empty: "Aucune command. Crée-en une avec « + » ou installe un plugin qui en fournit.",
+  source_label: "Source",
+  source_user: "Utilisateur",
+  source_plugin: "Plugin",
+  toggle_command_title: "Activer / désactiver",
+  btn_edit: "Modifier",
+  btn_view: "Voir",
+  readonly: "lecture seule",
+  command_not_found: "Command introuvable",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -1392,6 +1538,17 @@ en: {
   plugin_empty: "empty",
   plugin_no_content: "No content detected.",
   empty_capture: "(empty)",
+  commands: "Commands",
+  commands_help: "User commands (~/.claude/commands/) and those provided by active plugins",
+  commands_empty: 'No command. Create one with "+" or install a plugin that ships them.',
+  source_label: "Source",
+  source_user: "User",
+  source_plugin: "Plugin",
+  toggle_command_title: "Enable / disable",
+  btn_edit: "Edit",
+  btn_view: "View",
+  readonly: "read-only",
+  command_not_found: "Command not found",
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -1412,6 +1569,7 @@ function applyLang(lang){
   if(typeof loadState==='function') loadState();
   if(typeof loadPlugins==='function') loadPlugins();
   if(typeof loadPresets==='function') loadPresets();
+  if(typeof loadCommands==='function') loadCommands();
 }
 function setLang(lang){applyLang(lang);}
 let CURRENT_STATE = {mcps:[], skills:[]};
@@ -1517,6 +1675,61 @@ async function cleanupOrphan(fn, version){
   const j = await api('/api/plugin-cleanup',{name:fn, version:version});
   banner(j.success?'green':'red',j.message);
   if(j.success){loadPlugins();}
+}
+async function loadCommands(){
+  try{
+    const j = await (await fetch('/api/commands')).json();
+    const commands = j.commands || [];
+    const list = document.getElementById('commands');
+    if(!list) return;
+    if(commands.length===0){list.innerHTML = `<p class="text-xs text-stone-400">${tr('commands_empty')}</p>`;return;}
+    list.innerHTML = commands.map(c=>{
+      const ne = escAttr(c.name);
+      const sourceLabel = c.source==='user' ? tr('source_user') : c.source.replace(/^plugin:/, tr('source_plugin')+' ');
+      const actions = c.editable
+        ? `<input type="checkbox" ${c.active?'checked':''} onchange="toggleCommand('${ne}')" class="w-5 h-5 rounded accent-green-700" title="${tr('toggle_command_title')}"><button onclick="editCommand('${ne}','${escAttr(c.source)}')" class="text-xs text-stone-700 hover:text-stone-900 font-medium">${tr('btn_edit')}</button>`
+        : `<button onclick="editCommand('${ne}','${escAttr(c.source)}')" class="text-xs text-stone-500 hover:text-stone-700 font-medium">${tr('btn_view')}</button>`;
+      const opacity = c.active ? '' : 'opacity-60';
+      return `<div class="flex items-center justify-between gap-3 p-3 rounded-lg border border-stone-200 ${opacity}">
+<div class="flex flex-col flex-1 min-w-0">
+<div class="flex items-baseline gap-2 flex-wrap">
+<span class="font-medium text-sm">/${ne}</span>
+<span class="text-xs text-stone-400">${escAttr(sourceLabel)}</span>
+${c.editable ? '' : `<span class="text-xs text-stone-400" data-i18n="readonly">${tr('readonly')}</span>`}
+</div>
+</div>
+<div class="flex items-center gap-2 shrink-0">${actions}</div>
+</div>`;
+    }).join('');
+  }catch(e){console.error(e);}
+}
+async function toggleCommand(name){
+  const j = await api('/api/toggle-command', {name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success) loadCommands();
+}
+async function editCommand(name, source){
+  try{
+    const r = await fetch('/api/command/' + encodeURIComponent(name) + '?source=' + encodeURIComponent(source));
+    if(!r.ok){banner('red', tr('command_not_found'));return;}
+    const d = await r.json();
+    document.getElementById('cmd-edit-name').textContent = '/' + d.name;
+    document.getElementById('cmd-edit-source').textContent = d.source==='user' ? tr('source_user') : d.source.replace(/^plugin:/, tr('source_plugin')+' ');
+    document.getElementById('cmd-edit-content').value = d.content || '';
+    document.getElementById('cmd-edit-content').readOnly = !d.editable;
+    document.getElementById('cmd-edit-save').classList.toggle('hidden', !d.editable);
+    document.getElementById('cmd-edit-name-input').value = d.name;
+    document.getElementById('cmd-edit-modal').classList.remove('hidden');
+  }catch(e){banner('red', tr('net_error') + e);}
+}
+function closeCmdEdit(){document.getElementById('cmd-edit-modal').classList.add('hidden');}
+async function saveCommand(){
+  const name = document.getElementById('cmd-edit-name-input').value.trim();
+  const content = document.getElementById('cmd-edit-content').value;
+  if(!name){banner('red', tr('banner_name_required'));return;}
+  const j = await api('/api/save-command', {name:name, content:content});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){closeCmdEdit();loadCommands();}
 }
 async function loadPresets(){
   try{
@@ -1688,7 +1901,7 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-applyLang(CURRENT_LANG);loadState();loadPresets();loadPlugins();checkUpdate();setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(checkUpdate,3600000);
+applyLang(CURRENT_LANG);loadState();loadPresets();loadPlugins();loadCommands();checkUpdate();setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
 
@@ -1731,6 +1944,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             lang = (qs.get("lang", ["fr"])[0] or "fr").lower()
             if lang not in ("fr", "en"): lang = "fr"
             self._json(read_mcp_error(name, lang))
+        elif path == "/api/commands":
+            self._json({"commands": list_commands()})
+        elif path.startswith("/api/command/"):
+            qs = parse_qs(urlparse(self.path).query)
+            source = qs.get("source", ["user"])[0]
+            name = unquote(path[len("/api/command/"):])
+            ok, payload = get_command(name, source)
+            if ok:
+                self._json(payload)
+            else:
+                self._json({"error": payload}, status=404)
         else:
             self.send_response(404); self.end_headers()
 
@@ -1771,6 +1995,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/plugin-cleanup": lambda: cleanup_plugin_orphan(data.get("name", ""), data.get("version", "")),
             "/api/mcp-test": lambda: test_mcp(data.get("name", ""), data.get("lang", "fr")),
             "/api/mcp-set-env": lambda: set_mcp_env(data.get("name", ""), data.get("var", ""), data.get("value", "")),
+            "/api/toggle-command": lambda: toggle_command(data.get("name", "")),
+            "/api/save-command": lambda: save_command(data.get("name", ""), data.get("content", "")),
         }
         if path in routes:
             try:
