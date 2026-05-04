@@ -1005,9 +1005,13 @@ def _watchdog_loop():
                 else:
                     pids = _mcp_pids(target)
                     if not pids:
-                        if cfg["auto_restart_on_crash"] and not _claude_pids():
-                            _watchdog_event("start", f"MCP '{target}' down + Claude Desktop down, launching Claude")
-                            subprocess.run(["open", "-a", "Claude"], check=False)
+                        if cfg["auto_restart_on_crash"]:
+                            _watchdog_event("crash_detected", f"MCP '{target}' down, restarting")
+                            try:
+                                ok, msg = restart_mcp(target)
+                                _watchdog_event("restart_mcp_result", msg if ok else f"failed: {msg}")
+                            except Exception as e:
+                                _watchdog_event("restart_mcp_error", str(e))
                     elif cfg["freeze_detection"]:
                         window = max(60, interval * 2)
                         if _mcp_log_says_frozen(target, within_seconds=window):
