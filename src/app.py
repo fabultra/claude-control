@@ -77,9 +77,37 @@ def get_running_mcps():
     return running
 
 
+_AUTO_CAT_RULES = [
+    ("Git / GitHub",   ("github", "gitlab", "git ", "pull request", "pull-request", " pr ", "commit", "branch", "repo")),
+    ("Claude API",     ("anthropic", "claude api", "claude-api", "claude code", "claude.ai", "sdk", " caching", "agent sdk")),
+    ("API integration", ("rest", " http ", "endpoint", "webhook", "fetch", " api ", " apis ")),
+    ("Communication",  ("slack", "discord", "email", "gmail", "messenger", "send a message")),
+    ("Marketing",      ("mailchimp", "campaign", "newsletter", "subscriber", "audience")),
+    ("Database",       ("database", "mongo", "postgres", "mysql", "sql", "query")),
+    ("Files / Docs",   ("file system", "drive", "dropbox", "notion", "document")),
+    ("Build / Deploy", ("vercel", "deploy", "ci/cd", " ci ", " cd ", "docker", "build", "release", "package")),
+    ("Debug / Test",   ("debug", "test", "lint", "review", "audit", "troubleshoot", "fix bug")),
+    ("Web / UI",       ("frontend", "html", "css", "react", "vue", "tailwind", "webpage")),
+    ("Hooks",          ("session start", "stop hook", "hook", "settings.json")),
+    ("Workflow",       ("loop", "schedule", "task", "babysit", "monitor", "recurring")),
+    ("Permissions",    ("permission", "allow", "settings.json")),
+    ("Config",         ("config", "configure", "preferences")),
+]
+
+
+def _auto_category(description, name=""):
+    if not description:
+        return None
+    text = (description + " " + name).lower()
+    for cat, kws in _AUTO_CAT_RULES:
+        if any(k in text for k in kws):
+            return cat
+    return None
+
+
 def read_skill_meta(skill_dir):
-    """Lit le frontmatter YAML d'un SKILL.md et retourne {category, description}."""
-    meta = {"category": None, "description": None}
+    """Lit le frontmatter YAML d'un SKILL.md et retourne {category, description, tags}."""
+    meta = {"category": None, "description": None, "tags": []}
     md = skill_dir / "SKILL.md"
     if not md.exists():
         return meta
@@ -98,7 +126,42 @@ def read_skill_meta(skill_dir):
             if m:
                 v = m.group(1).strip().strip('"').strip("'")
                 meta[key] = v or None
+        m = re.match(r'^\s*tags\s*:\s*\[([^\]]*)\]\s*$', line)
+        if m:
+            meta["tags"] = [t.strip().strip('"').strip("'") for t in m.group(1).split(",") if t.strip()]
     return meta
+
+
+def _list_plugin_skills():
+    """Retourne la liste des skills fournis par chaque plugin actif sous forme de
+    dicts identiques aux skills utilisateur (mais source != 'user', editable=False)."""
+    items = []
+    try:
+        installed = _load_installed_plugins()
+    except Exception:
+        return items
+    settings = _load_settings()
+    enabled_map = settings.get("enabledPlugins", {}) if isinstance(settings, dict) else {}
+    for full_name, entries in installed.items():
+        if not enabled_map.get(full_name, True):
+            continue
+        if not isinstance(entries, list) or not entries:
+            continue
+        entry = entries[0]
+        if not isinstance(entry, dict):
+            continue
+        ip = Path(entry.get("installPath", ""))
+        for sk_dir in (ip / "skills", ip / ".claude-plugin/skills"):
+            if not sk_dir.is_dir():
+                continue
+            for d in sorted(sk_dir.iterdir()):
+                if not d.is_dir() or d.name.startswith("."):
+                    continue
+                if not (d / "SKILL.md").exists():
+                    continue
+                meta = read_skill_meta(d)
+                items.append({"name": d.name, "_dir": d, "_source": f"plugin:{full_name}", "meta": meta})
+    return items
 
 
 def get_state():
@@ -112,14 +175,37 @@ def get_state():
                             if d.is_dir() and (d / "SKILL.md").exists() and not d.name.startswith(".")])
     disabled_skills = sorted([d.name for d in SKILLS_DISABLED_DIR.iterdir()
                               if d.is_dir() and not d.name.startswith(".")])
-    def _skill_entry(name, base, active):
+    def _skill_entry(name, base, active, source):
         meta = read_skill_meta(base / name)
-        return {"name": name, "active": active, "category": meta["category"], "description": meta["description"]}
+        return {
+            "name": name, "active": active,
+            "category": meta["category"],
+            "auto_category": _auto_category(meta["description"], name) if not meta["category"] else None,
+            "description": meta["description"],
+            "tags": meta["tags"],
+            "source": source,
+            "editable": source == "user",
+        }
+    skills = [_skill_entry(n, SKILLS_DIR, True, "user") for n in active_skills]
+    skills += [_skill_entry(n, SKILLS_DISABLED_DIR, False, "user") for n in disabled_skills]
+    user_names = {s["name"] for s in skills}
+    for it in _list_plugin_skills():
+        if it["name"] in user_names:
+            continue  # the user version takes precedence in the listing; duplicate is reported in overview
+        meta = it["meta"]
+        skills.append({
+            "name": it["name"], "active": True,
+            "category": meta["category"],
+            "auto_category": _auto_category(meta["description"], it["name"]) if not meta["category"] else None,
+            "description": meta["description"],
+            "tags": meta["tags"],
+            "source": it["_source"],
+            "editable": False,
+        })
     return {
         "mcps": [{"name": n, "active": True, "running": n in running} for n in sorted(active.keys())]
               + [{"name": n, "active": False, "running": False} for n in sorted(disabled.keys())],
-        "skills": [_skill_entry(n, SKILLS_DIR, True) for n in active_skills]
-                + [_skill_entry(n, SKILLS_DISABLED_DIR, False) for n in disabled_skills],
+        "skills": skills,
     }
 
 
@@ -432,6 +518,154 @@ def toggle_command(name):
     return False, f"Command '{name}' introuvable"
 
 
+PROJECTS_LOGS_DIR = HOME / ".claude/projects"
+
+
+def get_skill_usage(days=30):
+    """Parcourt ~/.claude/projects/*/*.jsonl et compte les invocations du tool
+    `Skill`. Tolerant aux changements de schema : ignore silencieusement chaque
+    ligne malformee. Retourne un classement et de la metadata pour le fallback."""
+    counts = {}
+    sessions_seen = set()
+    files_scanned = 0
+    lines_scanned = 0
+    parse_errors = 0
+    cutoff = None
+    if days and days > 0:
+        cutoff = datetime.now().timestamp() - days * 86400
+    if not PROJECTS_LOGS_DIR.exists():
+        return {"counts": {}, "ranked": [], "files_scanned": 0, "lines_scanned": 0,
+                "parse_errors": 0, "sessions": 0, "ok": False,
+                "reason": "projects_dir_missing",
+                "projects_path": str(PROJECTS_LOGS_DIR)}
+    for jsonl in PROJECTS_LOGS_DIR.rglob("*.jsonl"):
+        try:
+            mtime = jsonl.stat().st_mtime
+        except Exception:
+            continue
+        if cutoff is not None and mtime < cutoff:
+            continue
+        files_scanned += 1
+        try:
+            f = jsonl.open("r", errors="replace")
+        except Exception:
+            continue
+        with f:
+            for line in f:
+                lines_scanned += 1
+                line = line.strip()
+                if not line or line[0] != "{":
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    parse_errors += 1
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                sid = obj.get("sessionId")
+                if sid:
+                    sessions_seen.add(sid)
+                if obj.get("type") != "assistant":
+                    continue
+                msg = obj.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_use":
+                        continue
+                    name = block.get("name", "")
+                    if name != "Skill":
+                        continue
+                    inp = block.get("input", {})
+                    if not isinstance(inp, dict):
+                        continue
+                    skill = inp.get("skill") or inp.get("name")
+                    if not skill:
+                        continue
+                    counts[str(skill)] = counts.get(str(skill), 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return {
+        "counts": counts,
+        "ranked": [{"name": k, "count": v} for k, v in ranked],
+        "files_scanned": files_scanned,
+        "lines_scanned": lines_scanned,
+        "parse_errors": parse_errors,
+        "sessions": len(sessions_seen),
+        "days_window": days,
+        "ok": True,
+    }
+
+
+def skill_optimization_suggestions():
+    """Suggestions basees sur usage + heuristiques. Si l'usage tracking ne ramene
+    rien (jamais utilise, format change, etc.), bascule sur les heuristiques pures."""
+    state = get_state()
+    skills = state["skills"]
+    usage = get_skill_usage(days=30)
+    counts = usage.get("counts", {})
+    suggestions = []
+    user_active_skills = [s for s in skills if s["source"] == "user" and s["active"]]
+    if usage.get("ok") and counts:
+        unused_active = [s for s in user_active_skills if counts.get(s["name"], 0) == 0]
+        if unused_active:
+            suggestions.append({
+                "kind": "unused",
+                "severity": "info",
+                "items": sorted(s["name"] for s in unused_active)[:20],
+                "message_fr": "Skills actifs mais jamais activés ces 30 derniers jours — désactiver pour réduire le bruit dans le contexte.",
+                "message_en": "Skills enabled but never invoked in the last 30 days — disable to reduce noise in the model's context.",
+            })
+        top_used = sorted(counts.items(), key=lambda kv: -kv[1])[:3]
+        if top_used:
+            suggestions.append({
+                "kind": "top",
+                "severity": "info",
+                "items": [f"{name} ({n})" for name, n in top_used],
+                "message_fr": "Top 3 skills les plus utilisés ces 30 jours — vérifier qu'ils sont activés et que leur description est précise pour faciliter l'auto-déclenchement.",
+                "message_en": "Top 3 skills used in the last 30 days — make sure they're enabled and their description is precise to help auto-triggering.",
+            })
+    no_desc = [s for s in skills if not (s.get("description") or "").strip()]
+    if no_desc:
+        suggestions.append({
+            "kind": "no_description",
+            "severity": "warn",
+            "items": sorted(s["name"] for s in no_desc)[:20],
+            "message_fr": "Skills sans `description:` dans leur frontmatter — ils ne se déclencheront jamais automatiquement. Ajoute une description.",
+            "message_en": "Skills without a `description:` in their frontmatter — they will never auto-trigger. Add one.",
+        })
+    short_desc = [s for s in skills if (s.get("description") or "").strip() and len(s["description"]) < 30]
+    if short_desc:
+        suggestions.append({
+            "kind": "short_description",
+            "severity": "info",
+            "items": sorted(s["name"] for s in short_desc)[:20],
+            "message_fr": "Descriptions très courtes (<30 caractères) — peu de chance que Claude les déclenche correctement, enrichis-les.",
+            "message_en": "Very short descriptions (<30 chars) — Claude is unlikely to auto-trigger them; enrich them.",
+        })
+    user_names = {s["name"] for s in skills if s["source"] == "user"}
+    plugin_names = {s["name"] for s in skills if s["source"] != "user"}
+    duplicates = sorted(user_names & plugin_names)
+    if duplicates:
+        suggestions.append({
+            "kind": "duplicate",
+            "severity": "warn",
+            "items": duplicates,
+            "message_fr": "Skills dupliqués entre version utilisateur et plugin — la version utilisateur prend le dessus, supprime celle d'un côté ou de l'autre.",
+            "message_en": "Skills duplicated between user version and plugin version — the user version wins; delete one side or the other.",
+        })
+    return {
+        "usage": usage,
+        "suggestions": suggestions,
+        "fallback": not usage.get("ok") or not usage.get("counts"),
+    }
+
+
 def get_overview():
     """Vue agregee : stats + health checks (orphans, MCPs en erreur, doublons,
     skills sans frontmatter, preset actif si applicable)."""
@@ -472,6 +706,11 @@ def get_overview():
     mcps_running = [m for m in mcps_active if m["running"]]
     mcps_failing = [m["name"] for m in mcps_active if not m["running"]]
     plugins_enabled = sum(1 for p in plugins if p.get("enabled"))
+    try:
+        usage = get_skill_usage(days=30)
+    except Exception:
+        usage = {"ok": False, "counts": {}, "ranked": []}
+    top_skills = (usage.get("ranked") or [])[:5]
     return {
         "stats": {
             "mcps_total": len(state["mcps"]),
@@ -487,6 +726,13 @@ def get_overview():
         },
         "active_preset": active_preset,
         "presets_count": len(presets),
+        "top_skills": top_skills,
+        "usage_meta": {
+            "ok": usage.get("ok", False),
+            "files_scanned": usage.get("files_scanned", 0),
+            "sessions": usage.get("sessions", 0),
+            "days_window": usage.get("days_window", 30),
+        },
         "health": {
             "plugin_orphans": plugin_orphans,
             "mcps_failing": mcps_failing,
@@ -1496,6 +1742,8 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <span id="overview-preset" class="text-xs text-stone-500"></span>
 </div>
 <div id="overview-stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4"></div>
+<div id="overview-top-skills" class="mb-3"></div>
+<div id="overview-suggestions" class="mb-3"></div>
 <div id="overview-health"></div>
 </section>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -1821,6 +2069,16 @@ fr: {
   confirm_delete_mcp: "Supprimer le MCP « {name} » de ta config ?\\n\\nLa config Claude Desktop est sauvegardée automatiquement avant écriture.",
   confirm_delete_plugin: "Supprimer le plugin « {name} » ET ses fichiers cache ?\\n\\nUn backup ZIP du dossier sera créé. Annule ici si tu veux garder les fichiers.",
   confirm_delete_plugin_metadata_only: "Supprimer seulement l'enregistrement du plugin « {name} » dans installed_plugins.json (les fichiers cache restent intacts) ?",
+  source_user_skills: "Skills utilisateur",
+  general_category: "Général",
+  auto_cat_hint: "(catégorie auto)",
+  top_skills_30d: "Top skills (30 derniers jours)",
+  sessions: "sessions",
+  files: "fichiers",
+  no_skill_usage_yet: "Aucune activation de skill détectée dans tes logs ({n} fichier(s) scanné(s)). Une fois que Claude Code commence à utiliser tes skills, le classement apparaîtra ici.",
+  used_x_times: "Utilisé {n} fois ces 30 derniers jours",
+  skill_suggestions: "Suggestions d'optimisation",
+  fallback_no_usage: "heuristiques uniquement (pas de données d'usage)",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -1957,6 +2215,16 @@ en: {
   confirm_delete_mcp: 'Delete MCP "{name}" from your config?\\n\\nThe Claude Desktop config is backed up automatically before writing.',
   confirm_delete_plugin: 'Delete plugin "{name}" AND its cache files?\\n\\nA ZIP backup of the folder will be created. Cancel here if you want to keep the files.',
   confirm_delete_plugin_metadata_only: 'Delete only the plugin "{name}" entry from installed_plugins.json (cache files remain intact)?',
+  source_user_skills: "User skills",
+  general_category: "General",
+  auto_cat_hint: "(auto-category)",
+  top_skills_30d: "Top skills (last 30 days)",
+  sessions: "sessions",
+  files: "files",
+  no_skill_usage_yet: "No skill activations detected in your logs ({n} file(s) scanned). Once Claude Code starts using your skills, the ranking will appear here.",
+  used_x_times: "Used {n} times in the last 30 days",
+  skill_suggestions: "Optimization suggestions",
+  fallback_no_usage: "heuristics only (no usage data)",
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -1990,19 +2258,50 @@ async function loadState(){
   filterSkills();
 }
 function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');}
+let SKILL_USAGE = {};
 function renderSkills(skills){
   if(!skills || skills.length===0) return `<p class="text-stone-400 text-sm">${tr('no_skill')}</p>`;
-  const groups = {};
-  skills.forEach(sk=>{const cat = sk.category || 'Uncategorized'; (groups[cat] = groups[cat] || []).push(sk);});
-  const cats = Object.keys(groups).sort((a,b)=>{if(a==='Uncategorized')return 1; if(b==='Uncategorized')return -1; return a.localeCompare(b);});
-  return cats.map(cat=>{
-    const items = groups[cat].map(sk=>{
-      const desc = sk.description || '';
-      const search = (sk.name + ' ' + desc).toLowerCase();
-      const descHtml = desc ? `<span class="text-xs text-stone-500 truncate">${escAttr(desc)}</span>` : '';
-      return `<label data-skill data-search="${escAttr(search)}" class="group flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}"><input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><div class="flex flex-col min-w-0 flex-1"><span class="font-medium text-sm truncate">${escAttr(sk.name)}</span>${descHtml}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteSkill('${sk.name}')" title="${tr('btn_delete')}" class="text-stone-300 hover:text-red-600 text-sm leading-none px-2 opacity-0 group-hover:opacity-100 transition-opacity">&times;</button></label>`;
+  // Source-first grouping: User first, then each plugin (alpha)
+  const bySource = {};
+  skills.forEach(sk=>{const src = sk.source || 'user'; (bySource[src] = bySource[src] || []).push(sk);});
+  const sources = Object.keys(bySource).sort((a,b)=>{
+    if(a==='user') return -1; if(b==='user') return 1;
+    return a.localeCompare(b);
+  });
+  return sources.map(src=>{
+    const sourceLabel = src==='user' ? tr('source_user_skills') : src.replace(/^plugin:/, tr('source_plugin')+' ');
+    const itemsBySrc = bySource[src];
+    // Sub-group by category (frontmatter > auto > "General")
+    const subGroups = {};
+    itemsBySrc.forEach(sk=>{
+      const cat = sk.category || sk.auto_category || tr('general_category');
+      (subGroups[cat] = subGroups[cat] || []).push(sk);
+    });
+    const cats = Object.keys(subGroups).sort((a,b)=>{
+      if(a===tr('general_category')) return 1; if(b===tr('general_category')) return -1;
+      return a.localeCompare(b);
+    });
+    const subBlocks = cats.map(cat=>{
+      const items = subGroups[cat].map(sk=>{
+        const desc = sk.description || '';
+        const search = (sk.name + ' ' + desc).toLowerCase();
+        const descHtml = desc ? `<span class="text-xs text-stone-500 truncate">${escAttr(desc)}</span>` : '';
+        const tagHtml = (sk.tags||[]).slice(0,4).map(t=>`<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded">${escAttr(t)}</span>`).join('');
+        const autoHint = (!sk.category && sk.auto_category) ? `<span class="text-[10px] text-stone-400 italic">${tr('auto_cat_hint')}</span>` : '';
+        const usageCount = SKILL_USAGE[sk.name] || 0;
+        const usageBadge = usageCount > 0 ? `<span class="text-[10px] text-stone-500 bg-stone-100 px-1.5 py-0.5 rounded font-mono" title="${tr('used_x_times').split('{n}').join(usageCount)}">${usageCount}×</span>` : '';
+        const editable = sk.editable !== false;
+        const checkbox = editable
+          ? `<input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0">`
+          : `<span class="w-5 h-5 inline-flex items-center justify-center text-stone-300 shrink-0" title="${tr('readonly')}">&#128274;</span>`;
+        const deleteBtn = editable
+          ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteSkill('${sk.name}')" title="${tr('btn_delete')}" class="text-stone-300 hover:text-red-600 text-sm leading-none px-2 opacity-0 group-hover:opacity-100 transition-opacity">&times;</button>`
+          : '';
+        return `<label data-skill data-search="${escAttr(search)}" class="group flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}">${checkbox}<div class="flex flex-col min-w-0 flex-1"><div class="flex items-baseline gap-2 flex-wrap"><span class="font-medium text-sm truncate">${escAttr(sk.name)}</span>${usageBadge}${tagHtml}${autoHint}</div>${descHtml}</div>${deleteBtn}</label>`;
+      }).join('');
+      return `<details data-skill-cat="${escAttr(cat)}" open class="mb-2 ml-3"><summary class="cursor-pointer text-[11px] font-medium tracking-wide text-stone-500 mb-1 px-1 select-none hover:text-stone-800">${escAttr(cat)} <span class="text-stone-400 font-normal" data-cat-count>(${subGroups[cat].length})</span></summary><div class="space-y-1.5 mt-1.5">${items}</div></details>`;
     }).join('');
-    return `<details data-skill-cat="${escAttr(cat)}" open class="mb-2"><summary class="cursor-pointer text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1.5 px-1 select-none hover:text-stone-900">${escAttr(cat)} <span class="text-stone-400 font-normal normal-case" data-cat-count>(${groups[cat].length})</span></summary><div class="space-y-1.5 mt-1.5">${items}</div></details>`;
+    return `<details data-skill-cat="src:${escAttr(src)}" open class="mb-3"><summary class="cursor-pointer text-xs font-semibold uppercase tracking-wide text-stone-700 mb-2 px-1 select-none hover:text-stone-900">${escAttr(sourceLabel)} <span class="text-stone-400 font-normal normal-case">(${itemsBySrc.length})</span></summary>${subBlocks}</details>`;
   }).join('');
 }
 function filterSkills(){
@@ -2123,6 +2422,25 @@ async function cleanupOrphan(fn, version){
 function statBox(value, label, color){
   return `<div class="p-3 rounded-lg border ${color}"><div class="text-2xl font-semibold leading-none mb-1">${value}</div><div class="text-xs text-stone-500">${label}</div></div>`;
 }
+async function loadSkillSuggestions(){
+  try{
+    const r = await fetch('/api/skill-suggestions');
+    if(!r.ok) return;
+    const d = await r.json();
+    const el = document.getElementById('overview-suggestions');
+    if(!el) return;
+    const sugs = d.suggestions || [];
+    if(sugs.length===0){el.innerHTML = '';return;}
+    const msgKey = CURRENT_LANG === 'en' ? 'message_en' : 'message_fr';
+    el.innerHTML = `<div class="text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1">${tr('skill_suggestions')}${d.fallback ? ' <span class="text-stone-400 font-normal normal-case">&middot; '+tr('fallback_no_usage')+'</span>' : ''}</div><div class="space-y-1.5">` +
+      sugs.map(s=>{
+        const color = s.severity === 'warn' ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-stone-50 border-stone-200 text-stone-700';
+        const icon = s.severity === 'warn' ? '&#9888;' : '&#8505;';
+        const items = (s.items || []).slice(0,8).map(n=>`<span class="text-[10px] font-mono bg-white px-1.5 py-0.5 rounded border border-stone-200">${escAttr(n)}</span>`).join(' ');
+        return `<div class="text-xs p-2 rounded border ${color}"><div class="flex gap-2 items-start"><span class="shrink-0">${icon}</span><div class="flex-1"><div>${escAttr(s[msgKey] || '')}</div>${items ? '<div class="mt-1 flex flex-wrap gap-1">'+items+'</div>' : ''}</div></div></div>`;
+      }).join('') + '</div>';
+  }catch(e){console.error(e);}
+}
 async function loadOverview(){
   try{
     const r = await fetch('/api/overview');
@@ -2130,6 +2448,8 @@ async function loadOverview(){
     const o = await r.json();
     const s = o.stats || {};
     const h = o.health || {};
+    SKILL_USAGE = {};
+    (o.top_skills || []).forEach(t=>{SKILL_USAGE[t.name] = t.count;});
     const stats = document.getElementById('overview-stats');
     if(stats){
       stats.innerHTML =
@@ -2140,6 +2460,20 @@ async function loadOverview(){
     }
     const presetEl = document.getElementById('overview-preset');
     if(presetEl){presetEl.textContent = o.active_preset ? `${tr('active_preset')} : ${o.active_preset}` : (o.presets_count>0 ? `${o.presets_count} ${tr('presets_label')}` : '');}
+    const topEl = document.getElementById('overview-top-skills');
+    if(topEl){
+      const top = o.top_skills || [];
+      const meta = o.usage_meta || {};
+      if(top.length){
+        const items = top.map(t=>`<button onclick="document.getElementById('skills-search').value='${escAttr(t.name)}';filterSkills();document.getElementById('skills').scrollIntoView({behavior:'smooth'});" class="text-xs px-2 py-0.5 rounded-full bg-green-50 text-green-800 border border-green-200 hover:bg-green-100 font-mono">${escAttr(t.name)} <span class="text-green-700 font-semibold">${t.count}×</span></button>`).join(' ');
+        topEl.innerHTML = `<div class="text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1">${tr('top_skills_30d')} <span class="text-stone-400 font-normal normal-case">&middot; ${meta.sessions||0} ${tr('sessions')} / ${meta.files_scanned||0} ${tr('files')}</span></div><div class="flex flex-wrap gap-1.5">${items}</div>`;
+      }else if(meta.ok){
+        topEl.innerHTML = `<div class="text-xs text-stone-400">${tr('no_skill_usage_yet').split('{n}').join(meta.files_scanned||0)}</div>`;
+      }else{
+        topEl.innerHTML = '';
+      }
+    }
+    loadSkillSuggestions();
     const healthEl = document.getElementById('overview-health');
     if(healthEl){
       const issues = [];
@@ -2478,6 +2812,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(read_settings_raw())
         elif path == "/api/overview":
             self._json(get_overview())
+        elif path == "/api/skill-suggestions":
+            self._json(skill_optimization_suggestions())
         elif path.startswith("/api/command/"):
             qs = parse_qs(urlparse(self.path).query)
             source = qs.get("source", ["user"])[0]
