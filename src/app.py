@@ -20,6 +20,7 @@ PLUGINS_DIR = HOME / ".claude/plugins"
 INSTALLED_PLUGINS_FILE = PLUGINS_DIR / "installed_plugins.json"
 KNOWN_MARKETPLACES_FILE = PLUGINS_DIR / "known_marketplaces.json"
 SETTINGS_FILE = HOME / ".claude/settings.json"
+ORPHAN_BACKUP_DIR = BACKUP_DIR / "orphan-plugins"
 
 VERSION_FILE = HOME / "dev/claude-control/version.txt"
 GITHUB_REPO_FILE = HOME / "dev/claude-control/.github-repo"
@@ -496,10 +497,41 @@ def _load_installed_plugins():
         return {}
 
 
+def _find_orphan_versions(install_path, all_install_paths):
+    p = Path(install_path)
+    parts = p.parts
+    version_idx = None
+    for i, part in enumerate(parts):
+        if re.match(r'^\d+\.\d+\.\d+', part):
+            version_idx = i
+    if version_idx is None:
+        return []
+    version_dir = Path(*parts[: version_idx + 1])
+    parent = version_dir.parent
+    if not parent.exists():
+        return []
+    siblings = [d for d in parent.iterdir() if d.is_dir() and re.match(r'^\d+\.\d+\.\d+', d.name)]
+    referenced = set()
+    parent_str = str(parent)
+    for ip in all_install_paths:
+        ip_path = Path(ip)
+        if str(ip_path).startswith(parent_str + "/") or str(ip_path) == parent_str:
+            for part in ip_path.parts:
+                if re.match(r'^\d+\.\d+\.\d+', part):
+                    referenced.add(part)
+    return sorted(s.name for s in siblings if s.name not in referenced)
+
+
 def list_plugins():
     installed = _load_installed_plugins()
     settings = _load_settings()
     enabled_map = settings.get("enabledPlugins", {}) if isinstance(settings, dict) else {}
+    all_install_paths = []
+    for entries in installed.values():
+        if isinstance(entries, list):
+            for e in entries:
+                if isinstance(e, dict) and e.get("installPath"):
+                    all_install_paths.append(e["installPath"])
     plugins = []
     for full_name, entries in installed.items():
         if not isinstance(entries, list) or not entries:
@@ -521,9 +553,46 @@ def list_plugins():
             "lastUpdated": entry.get("lastUpdated", ""),
             "scope": entry.get("scope", ""),
             "contents": contents,
+            "extra_versions": _find_orphan_versions(install_path, all_install_paths),
         })
     plugins.sort(key=lambda x: (x["marketplace"], x["name"]))
     return plugins
+
+
+def cleanup_plugin_orphan(full_name, version):
+    if not full_name or not version:
+        return False, "Nom et version requis"
+    if not re.match(r'^\d+\.\d+\.\d+[a-zA-Z0-9._\-]*$', version):
+        return False, "Version invalide"
+    installed = _load_installed_plugins()
+    if full_name not in installed:
+        return False, f"Plugin '{full_name}' introuvable"
+    entry = installed[full_name][0]
+    if version == entry.get("version", ""):
+        return False, "Refus : cette version est la version installee"
+    install_path = entry.get("installPath", "")
+    p = Path(install_path)
+    parts = p.parts
+    version_idx = None
+    for i, part in enumerate(parts):
+        if re.match(r'^\d+\.\d+\.\d+', part):
+            version_idx = i
+    if version_idx is None:
+        return False, "Impossible de localiser la version dans installPath"
+    version_dir_parent = Path(*parts[:version_idx])
+    orphan_dir = version_dir_parent / version
+    if not orphan_dir.exists() or not orphan_dir.is_dir():
+        return False, f"Dossier orphelin '{orphan_dir}' introuvable"
+    ORPHAN_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', full_name)
+    backup_path = ORPHAN_BACKUP_DIR / f"{safe_name}-{version}-{ts}.zip"
+    with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in orphan_dir.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(orphan_dir))
+    shutil.rmtree(orphan_dir)
+    return True, f"Version orpheline {version} de '{full_name}' supprimee (backup : {backup_path.name})"
 
 
 def toggle_plugin(full_name):
@@ -794,6 +863,7 @@ async function loadPlugins(){
     list.innerHTML = plugins.map(p=>{
       const fn = escAttr(p.full_name);
       const opacity = p.enabled ? '' : 'opacity-60';
+      const orphans = (p.extra_versions||[]).map(v=>`<button onclick="event.stopPropagation();cleanupOrphan('${fn}','${escAttr(v)}')" class="text-xs px-2 py-0.5 rounded-full font-medium update-badge text-white" title="Cliquer pour supprimer ce dossier orphelin">&#9888; orphan: v${escAttr(v)}</button>`).join(' ');
       return `<div class="border ${p.enabled?'border-stone-200':'border-stone-100'} rounded-lg p-3 ${opacity}">
 <div class="flex items-center gap-3">
 <input type="checkbox" ${p.enabled?'checked':''} onchange="togglePlugin('${fn}')" class="w-5 h-5 rounded accent-green-700 shrink-0">
@@ -802,6 +872,7 @@ async function loadPlugins(){
 <span class="font-medium">${escAttr(p.name)}</span>
 <span class="text-xs text-stone-400 font-mono">v${escAttr(p.version||'?')}</span>
 <span class="text-xs text-stone-500">${escAttr(p.marketplace||'')}</span>
+${orphans}
 </div>
 <div class="text-xs text-stone-500 mt-0.5">${pluginContentBadge(p.contents||{})}</div>
 </button>
@@ -819,6 +890,12 @@ async function togglePlugin(fn){
   const j = await api('/api/toggle-plugin',{name:fn});
   banner(j.success?'green':'red',j.message);
   loadPlugins();
+}
+async function cleanupOrphan(fn, version){
+  if(!confirm(`Supprimer la version orpheline ${version} de "${fn}" ?\n\nUn backup ZIP sera cree dans ~/.claude/backups/claude-control/orphan-plugins/`))return;
+  const j = await api('/api/plugin-cleanup',{name:fn, version:version});
+  banner(j.success?'green':'red',j.message);
+  if(j.success){loadPlugins();}
 }
 async function loadPresets(){
   try{
@@ -984,6 +1061,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/preset-apply": lambda: apply_preset(data.get("name", "")),
             "/api/preset-delete": lambda: delete_preset(data.get("name", "")),
             "/api/toggle-plugin": lambda: toggle_plugin(data.get("name", "")),
+            "/api/plugin-cleanup": lambda: cleanup_plugin_orphan(data.get("name", ""), data.get("version", "")),
         }
         if path in routes:
             try:
