@@ -656,6 +656,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <div id="mcps" class="space-y-2"></div></section>
 <section class="card p-6"><h2 class="text-lg font-semibold mb-1">Skills</h2>
 <p class="text-xs text-stone-500 mb-4">Coche = disponible pour Claude</p>
+<input id="skills-search" type="search" oninput="filterSkills()" placeholder="Rechercher un skill (nom ou description)..." class="w-full mb-3 p-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:border-stone-400"/>
 <div id="skills" class="space-y-2 max-h-[500px] overflow-y-auto"></div></section>
 </div>
 <section class="card p-6 mt-6">
@@ -732,6 +733,7 @@ async function loadState(){
   CURRENT_STATE = s;
   document.getElementById('mcps').innerHTML = s.mcps.length===0 ? '<p class="text-stone-400 text-sm">Aucun MCP</p>' : s.mcps.map(m=>`<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium">${m.name}</span>${m.running?'<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">running</span>':(m.active?'<span class="text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full">pas demarre</span>':'')}</div></label>`).join('');
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
+  filterSkills();
 }
 function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');}
 function renderSkills(skills){
@@ -740,9 +742,32 @@ function renderSkills(skills){
   skills.forEach(sk=>{const cat = sk.category || 'Uncategorized'; (groups[cat] = groups[cat] || []).push(sk);});
   const cats = Object.keys(groups).sort((a,b)=>{if(a==='Uncategorized')return 1; if(b==='Uncategorized')return -1; return a.localeCompare(b);});
   return cats.map(cat=>{
-    const items = groups[cat].map(sk=>`<label class="flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}"><input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium text-sm">${sk.name}</span></label>`).join('');
-    return `<details open class="mb-2"><summary class="cursor-pointer text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1.5 px-1 select-none hover:text-stone-900">${escAttr(cat)} <span class="text-stone-400 font-normal normal-case">(${groups[cat].length})</span></summary><div class="space-y-1.5 mt-1.5">${items}</div></details>`;
+    const items = groups[cat].map(sk=>{
+      const desc = sk.description || '';
+      const search = (sk.name + ' ' + desc).toLowerCase();
+      const descHtml = desc ? `<span class="text-xs text-stone-500 truncate">${escAttr(desc)}</span>` : '';
+      return `<label data-skill data-search="${escAttr(search)}" class="flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}"><input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><div class="flex flex-col min-w-0 flex-1"><span class="font-medium text-sm truncate">${escAttr(sk.name)}</span>${descHtml}</div></label>`;
+    }).join('');
+    return `<details data-skill-cat="${escAttr(cat)}" open class="mb-2"><summary class="cursor-pointer text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1.5 px-1 select-none hover:text-stone-900">${escAttr(cat)} <span class="text-stone-400 font-normal normal-case" data-cat-count>(${groups[cat].length})</span></summary><div class="space-y-1.5 mt-1.5">${items}</div></details>`;
   }).join('');
+}
+function filterSkills(){
+  const q = (document.getElementById('skills-search').value || '').trim().toLowerCase();
+  const root = document.getElementById('skills');
+  root.querySelectorAll('[data-skill]').forEach(el=>{
+    const match = !q || (el.getAttribute('data-search')||'').includes(q);
+    el.classList.toggle('hidden', !match);
+  });
+  root.querySelectorAll('[data-skill-cat]').forEach(d=>{
+    const visible = d.querySelectorAll('[data-skill]:not(.hidden)').length;
+    d.classList.toggle('hidden', visible===0);
+    if(q && visible>0) d.setAttribute('open','');
+    const counter = d.querySelector('[data-cat-count]');
+    if(counter){
+      const total = d.querySelectorAll('[data-skill]').length;
+      counter.textContent = q ? `(${visible}/${total})` : `(${total})`;
+    }
+  });
 }
 function pluginContentBadge(c){
   const parts = [];
