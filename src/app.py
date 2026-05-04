@@ -774,13 +774,21 @@ def skill_optimization_suggestions():
     user_names = {s["name"] for s in skills if s["source"] == "user"}
     plugin_names = {s["name"] for s in skills if s["source"] != "user"}
     duplicates = sorted(user_names & plugin_names)
-    if duplicates:
+    if 0 < len(duplicates) <= 5:
         suggestions.append({
             "kind": "duplicate",
             "severity": "warn",
             "items": duplicates,
             "message_fr": "Skills dupliqués entre version utilisateur et plugin — la version utilisateur prend le dessus, supprime celle d'un côté ou de l'autre.",
             "message_en": "Skills duplicated between user version and plugin version — the user version wins; delete one side or the other.",
+        })
+    elif len(duplicates) > 5:
+        suggestions.append({
+            "kind": "duplicate_many",
+            "severity": "info",
+            "items": duplicates[:8],
+            "message_fr": f"{len(duplicates)} skills ont le même nom dans tes skills utilisateur et dans des plugins. Probablement un overlap massif — envisage de supprimer en masse les copies utilisateur si tu veux laisser les plugins faire foi.",
+            "message_en": f"{len(duplicates)} skills share names between your user skills and plugins. Likely a massive overlap — consider bulk-deleting the user copies if you want plugins to be the source of truth.",
         })
     return {
         "usage": usage,
@@ -1859,19 +1867,30 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <span>&#x21bb;</span><span data-i18n="restart_claude">Redémarrer Claude</span></button>
 </div></header>
 <div id="banner" class="hidden mb-4 p-3 rounded-lg text-sm border"></div>
+<div id="watchdog-widget" class="mb-4"></div>
+<nav id="main-tabs" class="flex gap-1 mb-6 bg-stone-100 p-1 rounded-lg overflow-x-auto">
+<button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="overview" onclick="setMainTab('overview')" data-i18n="tab_overview">Vue d'ensemble</button>
+<button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="mcps" onclick="setMainTab('mcps')" data-i18n="mcp_section">Serveurs MCP</button>
+<button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="skills" onclick="setMainTab('skills')" data-i18n="skills">Skills</button>
+<button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="plugins" onclick="setMainTab('plugins')" data-i18n="plugins">Plugins</button>
+<button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="commands" onclick="setMainTab('commands')" data-i18n="commands">Commands</button>
+<button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="advanced" onclick="setMainTab('advanced')" data-i18n="tab_advanced">Avancé</button>
+</nav>
+<div data-main-tab="overview">
 <section class="card p-6 mb-6">
 <div class="flex items-baseline justify-between mb-3">
 <h2 class="text-lg font-semibold" data-i18n="overview">Vue d'ensemble</h2>
 <span id="overview-preset" class="text-xs text-stone-500"></span>
 </div>
 <div id="overview-stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4"></div>
-<div id="watchdog-widget" class="mb-3"></div>
 <div id="overview-top-skills" class="mb-3"></div>
 <div id="overview-suggestions" class="mb-3"></div>
 <div id="overview-health"></div>
 </section>
-<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-<section class="card p-6"><h2 class="text-lg font-semibold mb-1" data-i18n="mcp_section">Serveurs MCP</h2>
+</div>
+<div data-main-tab="mcps" class="hidden">
+<section class="card p-6">
+<h2 class="text-lg font-semibold mb-1" data-i18n="mcp_section">Serveurs MCP</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="mcp_help">Coché = chargé au démarrage de Claude Desktop</p>
 <div class="mb-4 p-3 bg-stone-50 rounded-lg border border-stone-200">
 <div class="flex items-center justify-between mb-2">
@@ -1880,20 +1899,28 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </div>
 <div id="presets-list" class="space-y-1.5"></div>
 </div>
-<div id="mcps" class="space-y-2"></div></section>
-<section class="card p-6"><h2 class="text-lg font-semibold mb-1" data-i18n="skills">Skills</h2>
+<div id="mcps" class="space-y-2"></div>
+</section>
+</div>
+<div data-main-tab="skills" class="hidden">
+<section class="card p-6">
+<h2 class="text-lg font-semibold mb-1" data-i18n="skills">Skills</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="skills_help">Coché = disponible pour Claude</p>
 <input id="skills-search" type="search" oninput="filterSkills()" data-i18n-placeholder="skills_search_placeholder" placeholder="Rechercher un skill (nom ou description)..." class="w-full mb-3 p-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:border-stone-400"/>
-<div id="skills" class="space-y-2 max-h-[500px] overflow-y-auto"></div></section>
+<div id="skills" class="space-y-2 max-h-[600px] overflow-y-auto"></div>
+</section>
 </div>
-<section class="card p-6 mt-6">
+<div data-main-tab="plugins" class="hidden">
+<section class="card p-6">
 <div class="flex items-baseline justify-between mb-1">
 <h2 class="text-lg font-semibold" data-i18n="plugins">Plugins</h2>
 <button onclick="openAddPlugin()" class="text-xs text-stone-700 hover:text-stone-900 font-medium" data-i18n="plugin_add_btn">+ Ajouter un plugin (Git)</button>
 </div>
-<p class="text-xs text-stone-500 mb-4" data-i18n="plugins_help">Plugins Claude Code installés via marketplace</p>
-<div id="plugins" class="space-y-2"></div>
+<p class="text-xs text-stone-500 mb-3" data-i18n="plugins_help">Plugins Claude Code installés via marketplace</p>
+<input id="plugins-search" type="search" oninput="filterPlugins()" data-i18n-placeholder="plugins_search_placeholder" placeholder="Rechercher un plugin..." class="w-full mb-3 p-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:border-stone-400"/>
+<div id="plugins" class="space-y-2 max-h-[700px] overflow-y-auto"></div>
 </section>
+</div>
 <div id="add-plugin-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
 <div class="card p-6 w-[480px] max-w-[92vw]">
 <h3 class="text-lg font-semibold mb-1" data-i18n="plugin_add_modal_title">Ajouter un plugin via Git</h3>
@@ -1905,12 +1932,16 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </div>
 </div>
 </div>
-<section class="card p-6 mt-6">
+<div data-main-tab="commands" class="hidden">
+<section class="card p-6">
 <h2 class="text-lg font-semibold mb-1" data-i18n="commands">Commands</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="commands_help">Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs</p>
-<div id="commands" class="space-y-2 max-h-[500px] overflow-y-auto"></div>
+<div id="commands" class="space-y-2 max-h-[700px] overflow-y-auto"></div>
 </section>
-<section class="card p-6 mt-6">
+</div>
+<div data-main-tab="advanced" class="hidden">
+<div class="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800"><strong>&#9888; <span data-i18n="advanced_warning_title">Section avancée</span></strong> &middot; <span data-i18n="advanced_warning_text">éditer ces fichiers peut casser Claude Code. Backups horodatés créés à chaque sauvegarde.</span></div>
+<section class="card p-6">
 <div class="flex items-baseline justify-between mb-1">
 <h2 class="text-lg font-semibold"><span class="font-mono">CLAUDE.md</span></h2>
 <span class="text-xs text-stone-400" data-i18n="claudemd_meta">Lu à chaque session Claude Code</span>
@@ -1978,6 +2009,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <textarea id="sk-md-content" class="w-full p-3 border border-stone-200 rounded-lg font-mono text-xs h-24" placeholder="---&#10;name: mon-skill&#10;description: ...&#10;---"></textarea>
 <button onclick="addSkillMd()" class="mt-2 w-full bg-stone-900 hover:bg-stone-800 text-white py-2 rounded-lg text-sm font-medium" data-i18n="btn_create">Créer</button></div>
 </section>
+</div>
 </div>
 <p class="text-xs text-stone-400 mt-8 text-center" data-i18n="footer_apply">Après modifications, clique sur « Redémarrer Claude » pour appliquer.</p>
 </div>
@@ -2211,6 +2243,11 @@ fr: {
   watchdog_freeze: "Détecter freeze + redémarrer",
   claude_running: "Claude tourne",
   claude_stopped: "Claude arrêté",
+  tab_overview: "Vue d'ensemble",
+  tab_advanced: "Avancé",
+  plugins_search_placeholder: "Rechercher un plugin...",
+  advanced_warning_title: "Section avancée",
+  advanced_warning_text: "éditer ces fichiers peut casser Claude Code. Backups horodatés créés à chaque sauvegarde.",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -2365,6 +2402,11 @@ en: {
   watchdog_freeze: "Detect freeze + restart",
   claude_running: "Claude running",
   claude_stopped: "Claude stopped",
+  tab_overview: "Overview",
+  tab_advanced: "Advanced",
+  plugins_search_placeholder: "Search a plugin...",
+  advanced_warning_title: "Advanced section",
+  advanced_warning_text: "editing these files can break Claude Code. Timestamped backups are created on every save.",
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -2389,11 +2431,38 @@ function applyLang(lang){
   if(typeof loadOverview==='function') loadOverview();
 }
 function setLang(lang){applyLang(lang);}
+let CURRENT_MAIN_TAB = (localStorage.getItem('cc-main-tab') || 'overview');
+function setMainTab(tab){
+  if(!tab) tab = 'overview';
+  CURRENT_MAIN_TAB = tab;
+  localStorage.setItem('cc-main-tab', tab);
+  document.querySelectorAll('[data-main-tab]').forEach(el=>{
+    if(el.tagName === 'BUTTON'){
+      const active = el.getAttribute('data-main-tab') === tab;
+      el.classList.toggle('bg-white', active);
+      el.classList.toggle('shadow-sm', active);
+      el.classList.toggle('text-stone-900', active);
+      el.classList.toggle('text-stone-600', !active);
+    } else {
+      el.classList.toggle('hidden', el.getAttribute('data-main-tab') !== tab);
+    }
+  });
+  // Trigger any tab-specific reload that needs fresh data
+  if(tab === 'commands' && typeof loadCommands === 'function') loadCommands();
+  if(tab === 'advanced' && typeof loadClaudeMd === 'function'){loadClaudeMd();loadSettings();}
+}
+function filterPlugins(){
+  const q = (document.getElementById('plugins-search')?.value || '').trim().toLowerCase();
+  document.querySelectorAll('#plugins [data-plugin-name]').forEach(el=>{
+    const n = (el.getAttribute('data-plugin-name')||'').toLowerCase();
+    el.classList.toggle('hidden', q && !n.includes(q));
+  });
+}
 let CURRENT_STATE = {mcps:[], skills:[]};
 async function loadState(){
   const s = await (await fetch('/api/state')).json();
   CURRENT_STATE = s;
-  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>`<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" title="${tr('btn_delete')}" class="text-stone-300 hover:text-red-600 text-sm leading-none px-2 opacity-0 group-hover:opacity-100 transition-opacity">&times;</button></label>`).join('');
+  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>`<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" title="${tr('btn_delete')}" class="text-stone-400 hover:text-red-600 hover:bg-red-50 rounded px-2 py-1 text-base leading-none shrink-0">&times;</button></label>`).join('');
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
 }
@@ -2435,7 +2504,7 @@ function renderSkills(skills){
           ? `<input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0">`
           : `<span class="w-5 h-5 inline-flex items-center justify-center text-stone-300 shrink-0" title="${tr('readonly')}">&#128274;</span>`;
         const deleteBtn = editable
-          ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteSkill('${sk.name}')" title="${tr('btn_delete')}" class="text-stone-300 hover:text-red-600 text-sm leading-none px-2 opacity-0 group-hover:opacity-100 transition-opacity">&times;</button>`
+          ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteSkill('${sk.name}')" title="${tr('btn_delete')}" class="text-stone-400 hover:text-red-600 hover:bg-red-50 rounded px-2 py-1 text-base leading-none shrink-0">&times;</button>`
           : '';
         return `<label data-skill data-search="${escAttr(search)}" class="group flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}">${checkbox}<div class="flex flex-col min-w-0 flex-1"><div class="flex items-baseline gap-2 flex-wrap"><span class="font-medium text-sm truncate">${escAttr(sk.name)}</span>${usageBadge}${tagHtml}${autoHint}</div>${descHtml}</div>${deleteBtn}</label>`;
       }).join('');
@@ -2488,7 +2557,7 @@ async function loadPlugins(){
       const fn = escAttr(p.full_name);
       const opacity = p.enabled ? '' : 'opacity-60';
       const orphans = (p.extra_versions||[]).map(v=>`<button onclick="event.stopPropagation();cleanupOrphan('${fn}','${escAttr(v)}')" class="text-xs px-2 py-0.5 rounded-full font-medium update-badge text-white" title="Cliquer pour supprimer ce dossier orphelin">&#9888; orphan: v${escAttr(v)}</button>`).join(' ');
-      return `<div class="group border ${p.enabled?'border-stone-200':'border-stone-100'} rounded-lg p-3 ${opacity}">
+      return `<div data-plugin-name="${escAttr(p.name)} ${escAttr(p.marketplace||'')} ${escAttr(p.full_name)}" class="group border ${p.enabled?'border-stone-200':'border-stone-100'} rounded-lg p-3 ${opacity}">
 <div class="flex items-center gap-3">
 <input type="checkbox" ${p.enabled?'checked':''} onchange="togglePlugin('${fn}')" class="w-5 h-5 rounded accent-green-700 shrink-0">
 <button onclick="togglePluginDetail('${fn}')" class="flex-1 text-left min-w-0">
@@ -2500,7 +2569,7 @@ ${orphans}
 </div>
 <div class="text-xs text-stone-500 mt-0.5">${pluginContentBadge(p.contents||{})}</div>
 </button>
-<button type="button" onclick="event.stopPropagation();deletePlugin('${fn}')" title="${tr('btn_delete')}" class="text-stone-300 hover:text-red-600 text-base leading-none px-2 opacity-0 group-hover:opacity-100 transition-opacity">&times;</button>
+<button type="button" onclick="event.stopPropagation();deletePlugin('${fn}')" title="${tr('btn_delete')}" class="text-stone-400 hover:text-red-600 hover:bg-red-50 rounded px-2 py-1 text-base leading-none shrink-0">&times;</button>
 </div>
 <div id="pl-detail-${fn}" class="hidden">${pluginDetailHtml(p.contents||{})}</div>
 </div>`;
@@ -2936,7 +3005,7 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-applyLang(CURRENT_LANG);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(loadWatchdog,10000);setInterval(checkUpdate,3600000);
+applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(loadWatchdog,10000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
 
