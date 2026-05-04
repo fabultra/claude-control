@@ -21,6 +21,7 @@ INSTALLED_PLUGINS_FILE = PLUGINS_DIR / "installed_plugins.json"
 KNOWN_MARKETPLACES_FILE = PLUGINS_DIR / "known_marketplaces.json"
 SETTINGS_FILE = HOME / ".claude/settings.json"
 ORPHAN_BACKUP_DIR = BACKUP_DIR / "orphan-plugins"
+CLAUDE_LOGS_DIR = HOME / "Library/Logs/Claude"
 
 VERSION_FILE = HOME / "dev/claude-control/version.txt"
 GITHUB_REPO_FILE = HOME / "dev/claude-control/.github-repo"
@@ -160,6 +161,88 @@ def restart_claude():
     time.sleep(2.5)
     subprocess.run(["open", "-a", "Claude"], check=False)
     return True, "Claude Desktop redemarre"
+
+
+def _suggest_mcp_fix(error_text):
+    e = (error_text or "").lower()
+    rules = [
+        (("401", "403", "unauthorized", "forbidden", "invalid api key", "invalid_api_key", "authentication failed", "auth failed"),
+         "Authentification : la cle API est invalide ou expiree. Verifie / regenere la dans la config MCP."),
+        (("modulenotfounderror", "cannot find module", "importerror"),
+         "Dependance manquante. `npm install` ou `pip install` dans le dossier du MCP."),
+        (("enoent", "no such file", "command not found", "cannot find"),
+         "Binaire introuvable : verifie le chemin de 'command' dans la config MCP."),
+        (("eaddrinuse", "address already in use"),
+         "Port deja utilise. Un autre process tient ce port."),
+        (("permission denied", "eacces"),
+         "Permission refusee : `chmod +x` sur le binaire ou verifie les droits."),
+        (("econnreset", "etimedout", "getaddrinfo", "enotfound", "network error"),
+         "Reseau : verifie ta connexion ou la dispo du service distant."),
+        (("rate limit", "429", "quota"),
+         "Rate limit atteint sur l'API. Attends ou augmente ton quota."),
+        (("ssl", "certificate", "cert"),
+         "Probleme certificat SSL/TLS. Verifie l'horloge systeme et les CA."),
+        (("syntaxerror", "unexpected token"),
+         "Erreur de syntaxe dans le code MCP. Le binaire est probablement corrompu."),
+    ]
+    for keywords, suggestion in rules:
+        if any(k in e for k in keywords):
+            return suggestion
+    return "Cause non reconnue. Lis le log complet ou redemarre Claude Desktop."
+
+
+def _scan_log_for_error(content, name=None):
+    lines = content.splitlines()
+    if name:
+        lines = [l for l in lines if name.lower() in l.lower()]
+    recent = lines[-300:]
+    keywords = ("error", "exception", "failed", "fatal", "traceback")
+    for i in range(len(recent) - 1, -1, -1):
+        if any(k in recent[i].lower() for k in keywords):
+            start = max(0, i - 1)
+            end = min(len(recent), i + 6)
+            return "\n".join(recent[start:end])
+    return None
+
+
+def read_mcp_error(name):
+    """Trouve le dernier message d'erreur du MCP <name> dans les logs Claude
+    Desktop et propose une suggestion de fix selon le pattern."""
+    if not name:
+        return {"name": name, "error": None, "suggestion": "Nom MCP requis", "log_path": None}
+    if not CLAUDE_LOGS_DIR.exists():
+        return {"name": name, "error": None,
+                "suggestion": f"Dossier {CLAUDE_LOGS_DIR} introuvable. Claude Desktop n'a probablement jamais demarre.",
+                "log_path": None}
+    candidates = sorted(CLAUDE_LOGS_DIR.glob(f"mcp-server-{name}*.log"))
+    candidates += sorted(CLAUDE_LOGS_DIR.glob(f"*{name}*.log"))
+    candidates += [CLAUDE_LOGS_DIR / "mcp.log", CLAUDE_LOGS_DIR / "main.log"]
+    seen = set()
+    for log_file in candidates:
+        if not log_file.exists() or log_file in seen:
+            continue
+        seen.add(log_file)
+        try:
+            content = log_file.read_text(errors="replace")
+        except Exception:
+            continue
+        filter_name = name if log_file.name in ("mcp.log", "main.log") else None
+        excerpt = _scan_log_for_error(content, filter_name)
+        if excerpt:
+            return {
+                "name": name,
+                "error": excerpt,
+                "suggestion": _suggest_mcp_fix(excerpt),
+                "log_path": str(log_file),
+                "log_file": log_file.name,
+            }
+    return {
+        "name": name,
+        "error": None,
+        "suggestion": "Aucun log d'erreur trouve. Redemarre Claude Desktop pour que ce MCP tente un demarrage et genere un log.",
+        "log_path": str(CLAUDE_LOGS_DIR),
+        "log_file": None,
+    }
 
 
 # === IMPORTS ===
@@ -819,6 +902,25 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </div>
 <p class="text-xs text-stone-400 mt-8 text-center">Apres modifications, clique sur "Redemarrer Claude" pour appliquer.</p>
 </div>
+<div id="mcp-error-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
+<div class="card p-6 w-[640px] max-w-[92vw] max-h-[85vh] overflow-y-auto">
+<div class="flex items-baseline justify-between mb-2">
+<h3 class="text-lg font-semibold">MCP <span id="mcp-err-name" class="font-mono"></span> ne demarre pas</h3>
+<button onclick="closeMcpError()" class="text-stone-400 hover:text-stone-700 text-xl leading-none px-2">&times;</button>
+</div>
+<div id="mcp-err-suggestion-wrap" class="hidden mb-4 p-3 rounded-lg" style="background:linear-gradient(135deg,#fef3e2,#fde7d3);border:1px solid #f5c084">
+<div class="text-xs font-semibold uppercase tracking-wide text-amber-800 mb-1">Suggestion de fix</div>
+<div id="mcp-err-suggestion" class="text-sm text-stone-800"></div>
+</div>
+<div class="text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1">Extrait du log</div>
+<pre id="mcp-err-content" class="text-xs bg-stone-50 border border-stone-200 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap font-mono text-stone-800 max-h-64">Chargement...</pre>
+<p class="text-xs text-stone-400 mt-2">Fichier : <span id="mcp-err-log-path" class="font-mono"></span></p>
+<div class="flex gap-2 justify-end mt-4">
+<button onclick="restartClaude()" class="px-4 py-2 text-sm rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 font-medium">Redemarrer Claude</button>
+<button onclick="closeMcpError()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50">Fermer</button>
+</div>
+</div>
+</div>
 <div id="preset-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
 <div class="card p-6 w-96 max-w-[90vw]">
 <h3 class="text-lg font-semibold mb-1">Sauvegarder un preset</h3>
@@ -836,7 +938,7 @@ let CURRENT_STATE = {mcps:[], skills:[]};
 async function loadState(){
   const s = await (await fetch('/api/state')).json();
   CURRENT_STATE = s;
-  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? '<p class="text-stone-400 text-sm">Aucun MCP</p>' : s.mcps.map(m=>`<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium">${m.name}</span>${m.running?'<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">running</span>':(m.active?'<span class="text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full">pas demarre</span>':'')}</div></label>`).join('');
+  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? '<p class="text-stone-400 text-sm">Aucun MCP</p>' : s.mcps.map(m=>`<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium">${m.name}</span>${m.running?'<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">running</span>':(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="Voir l'erreur">pas demarre &middot; pourquoi&nbsp;?</button>`:'')}</div></label>`).join('');
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
 }
@@ -970,6 +1072,26 @@ async function api(path, body){
   return r.json();
 }
 async function toggleMcp(n){const j=await api('/api/toggle-mcp',{name:n});banner(j.success?'green':'red',j.message);loadState();}
+async function showMcpError(name){
+  document.getElementById('mcp-err-name').textContent = name;
+  document.getElementById('mcp-err-content').textContent = 'Chargement...';
+  document.getElementById('mcp-err-suggestion-wrap').classList.add('hidden');
+  document.getElementById('mcp-err-log-path').textContent = '';
+  document.getElementById('mcp-error-modal').classList.remove('hidden');
+  try{
+    const r = await fetch('/api/mcp-error/' + encodeURIComponent(name));
+    const d = await r.json();
+    document.getElementById('mcp-err-content').textContent = d.error || '(aucune erreur trouvee dans les logs Claude Desktop)';
+    document.getElementById('mcp-err-log-path').textContent = d.log_path || '';
+    if(d.suggestion){
+      document.getElementById('mcp-err-suggestion').textContent = d.suggestion;
+      document.getElementById('mcp-err-suggestion-wrap').classList.remove('hidden');
+    }
+  }catch(e){
+    document.getElementById('mcp-err-content').textContent = 'Erreur reseau : '+e;
+  }
+}
+function closeMcpError(){document.getElementById('mcp-error-modal').classList.add('hidden');}
 async function toggleSkill(n){const j=await api('/api/toggle-skill',{name:n});banner(j.success?'green':'red',j.message);loadState();}
 async function restartClaude(){if(!confirm('Redemarrer Claude Desktop ?'))return;banner('blue','Redemarrage...');const j=await api('/api/restart-claude');banner(j.success?'green':'red',j.message);setTimeout(loadState,4000);}
 async function restartSelf(){if(!confirm('Redemarrer le serveur Claude Control ?'))return;banner('blue','Redemarrage...');try{await api('/api/restart-self');}catch(e){}setTimeout(()=>{banner('green','Reconnexion...');location.reload();}, 1500);}
@@ -1021,7 +1143,7 @@ async function deletePreset(name){
   if(j.success){loadPresets();}
 }
 document.addEventListener('keydown', e=>{
-  if(e.key==='Escape') closeSavePreset();
+  if(e.key==='Escape'){closeSavePreset();closeMcpError();}
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
@@ -1062,6 +1184,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(payload)
             else:
                 self._json({"error": payload}, status=404)
+        elif path.startswith("/api/mcp-error/"):
+            name = unquote(path[len("/api/mcp-error/"):])
+            self._json(read_mcp_error(name))
         else:
             self.send_response(404); self.end_headers()
 
