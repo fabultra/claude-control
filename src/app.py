@@ -267,6 +267,126 @@ def read_mcp_error(name):
     }
 
 
+_ENV_VAR_PATTERNS = [
+    re.compile(r"\b([A-Z][A-Z0-9_]{2,})\s+(?:[Ee]nvironment\s+variable|env\s*var)\s+(?:is\s+)?(?:[Rr]equired|not\s+set|[Mm]issing|undefined|not\s+provided|must\s+be\s+set|not\s+defined)"),
+    re.compile(r"(?:[Ee]nvironment\s+variable|env\s*var)\s+(?:not\s+(?:set|provided|defined)\s*)?:?\s*['\"`]?([A-Z][A-Z0-9_]{2,})['\"`]?\b"),
+    re.compile(r"(?:[Mm]issing|[Uu]ndefined)\s+(?:required\s+)?(?:[Ee]nvironment\s+variable\s+)?['\"`]?([A-Z][A-Z0-9_]{2,})['\"`]?\b"),
+    re.compile(r"(?:[Pp]lease\s+)?[Ss]et\s+(?:the\s+)?['\"`]?([A-Z][A-Z0-9_]{2,})['\"`]?\s+(?:[Ee]nvironment\s+variable|env\s*var)"),
+    re.compile(r"\b([A-Z][A-Z0-9_]{2,})\s+(?:is\s+)?(?:not\s+set|not\s+defined|[Rr]equired|must\s+be\s+set|not\s+provided)\b"),
+]
+_ENV_VAR_BLACKLIST = {"DEBUG", "ERROR", "WARN", "INFO", "PATH", "HOME", "USER", "TMPDIR",
+                     "PWD", "SHELL", "TERM", "LOG", "FATAL", "ENV", "API", "MCP", "VAR",
+                     "VARIABLE", "URL", "URI", "ID", "KEY", "TOKEN"}
+
+
+def _detect_missing_env_var(text):
+    if not text:
+        return None
+    for pat in _ENV_VAR_PATTERNS:
+        for m in pat.finditer(text):
+            v = m.group(1).strip()
+            if v in _ENV_VAR_BLACKLIST:
+                continue
+            if "_" in v or (len(v) >= 6 and v.isupper()):
+                return v
+    return None
+
+
+def test_mcp(name):
+    """Lance la 'command' du MCP avec ses 'env' depuis claude_desktop_config.json,
+    capture stdout/stderr pendant 5s max, classifie le resultat."""
+    if not name:
+        return False, {"error": "Nom MCP requis"}
+    config = load_config()
+    mcp = config.get("mcpServers", {}).get(name) or config.get("_disabledMcps", {}).get(name)
+    if not mcp:
+        return False, {"error": f"MCP '{name}' introuvable dans la config"}
+    if not isinstance(mcp, dict) or not mcp.get("command"):
+        return False, {"error": "Config MCP invalide (manque 'command')"}
+    command = mcp["command"]
+    args = mcp.get("args", [])
+    if not isinstance(args, list):
+        args = []
+    env_extra = mcp.get("env", {}) or {}
+    env = os.environ.copy()
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "")
+    if isinstance(env_extra, dict):
+        for k, v in env_extra.items():
+            env[str(k)] = "" if v is None else str(v)
+    timed_out = False
+    stdout = ""
+    stderr = ""
+    exit_code = None
+    try:
+        proc = subprocess.run(
+            [command, *args],
+            capture_output=True, text=True, env=env,
+            stdin=subprocess.DEVNULL, timeout=5,
+        )
+        exit_code = proc.returncode
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+    except subprocess.TimeoutExpired as e:
+        timed_out = True
+        stdout = (e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
+        stderr = (e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or ""))
+    except FileNotFoundError:
+        return True, {
+            "name": name, "exited": True, "exit_code": 127, "stdout": "", "stderr": f"command introuvable : {command}",
+            "suggestion": f"Le binaire '{command}' n'existe pas. Verifie le chemin dans la config MCP.",
+            "kind": "binary", "missing_env_var": None, "configured_env_keys": list((env_extra or {}).keys()),
+        }
+    except Exception as e:
+        return True, {
+            "name": name, "exited": True, "exit_code": -1, "stdout": "", "stderr": str(e),
+            "suggestion": f"Erreur execution : {e}", "kind": None, "missing_env_var": None,
+            "configured_env_keys": list((env_extra or {}).keys()),
+        }
+    combined = stderr + "\n" + stdout
+    suggestion, kind = _suggest_mcp_fix(combined)
+    missing_var = _detect_missing_env_var(combined)
+    if not suggestion:
+        if timed_out:
+            suggestion = "Le MCP demarre et reste actif au-dela de 5s sans crasher. Le probleme vient probablement de la communication avec Claude Desktop, pas du process lui-meme."
+            kind = "timeout_ok"
+        elif exit_code != 0:
+            suggestion = f"Le MCP a quitte avec code {exit_code}. Lis stderr ci-dessus."
+            kind = "nonzero_exit"
+        else:
+            suggestion = "Code de sortie 0 mais quitte immediatement. Le MCP n'est probablement pas conforme au protocole MCP."
+            kind = "exit_zero"
+    return True, {
+        "name": name,
+        "exited": not timed_out,
+        "exit_code": exit_code,
+        "stdout": (stdout or "")[-3000:],
+        "stderr": (stderr or "")[-3000:],
+        "suggestion": suggestion,
+        "kind": kind,
+        "missing_env_var": missing_var,
+        "configured_env_keys": list((env_extra or {}).keys()),
+    }
+
+
+def set_mcp_env(name, var, value):
+    """Patch la config Claude Desktop pour ajouter/maj une env var sur un MCP."""
+    if not name or not var:
+        return False, "Nom MCP et variable requis"
+    if not re.match(r'^[A-Z_][A-Z0-9_]*$', var):
+        return False, "Nom de variable invalide (A-Z, 0-9, _)"
+    config = load_config()
+    target = None
+    for bucket in ("mcpServers", "_disabledMcps"):
+        if name in config.get(bucket, {}):
+            target = config[bucket][name]
+            break
+    if not isinstance(target, dict):
+        return False, f"MCP '{name}' introuvable"
+    target.setdefault("env", {})[var] = value
+    save_config(config)
+    return True, f"Variable '{var}' enregistree pour MCP '{name}'"
+
+
 # === IMPORTS ===
 
 def import_mcp_json(json_str):
@@ -947,9 +1067,28 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <pre id="mcp-err-content" class="text-xs bg-stone-900 text-stone-100 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap font-mono max-h-72"></pre>
 <p class="text-xs text-stone-400 mt-2">Fichier : <span id="mcp-err-log-path" class="font-mono"></span></p>
 </div>
-<div class="flex gap-2 justify-end mt-4">
+<div id="mcp-err-test-section" class="hidden mt-4">
+<div class="text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1">Resultat du test live</div>
+<div id="mcp-err-test-summary" class="text-sm mb-2 p-2 rounded-lg"></div>
+<details class="text-xs"><summary class="cursor-pointer text-stone-600 hover:text-stone-900 select-none">stdout / stderr captures</summary>
+<div class="mt-2"><div class="text-stone-400 text-xs">stderr</div>
+<pre id="mcp-err-test-stderr" class="text-xs bg-stone-900 text-stone-100 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap font-mono max-h-48 mt-1"></pre>
+<div class="text-stone-400 text-xs mt-2">stdout</div>
+<pre id="mcp-err-test-stdout" class="text-xs bg-stone-900 text-stone-100 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap font-mono max-h-48 mt-1"></pre>
+</div></details>
+</div>
+<div id="mcp-err-envfix" class="hidden mt-4 p-3 rounded-lg" style="background:linear-gradient(135deg,#eaf4ec,#d8eadd);border:1px solid #87b89b">
+<div class="text-xs font-semibold uppercase tracking-wide text-green-800 mb-1">&#9989; Fix automatique disponible</div>
+<div class="text-sm text-stone-800 mb-2">Variable d'environnement <span id="mcp-envfix-var" class="font-mono font-semibold"></span> manquante. Renseigne sa valeur ci-dessous, je l'ajouterai a la config Claude Desktop (avec backup).</div>
+<input id="mcp-envfix-value" type="text" class="w-full p-2 border border-stone-300 rounded-md text-sm mb-2 font-mono" placeholder="Valeur de la variable..." autocomplete="off"/>
+<button onclick="applyEnvFix()" class="px-4 py-2 text-sm rounded-lg bg-green-700 hover:bg-green-800 text-white font-medium">Enregistrer et re-tester</button>
+</div>
+<div class="flex gap-2 justify-between mt-4 items-center">
+<button id="mcp-err-test-btn" onclick="runMcpTest()" class="px-4 py-2 text-sm rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-medium">Tester ce MCP maintenant</button>
+<div class="flex gap-2">
 <button onclick="restartClaude()" class="px-4 py-2 text-sm rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 font-medium">Redemarrer Claude</button>
 <button onclick="closeMcpError()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50">Fermer</button>
+</div>
 </div>
 </div>
 </div>
@@ -1104,9 +1243,13 @@ async function api(path, body){
   return r.json();
 }
 async function toggleMcp(n){const j=await api('/api/toggle-mcp',{name:n});banner(j.success?'green':'red',j.message);loadState();}
+let CURRENT_MCP_ERR = null;
 async function showMcpError(name){
+  CURRENT_MCP_ERR = name;
   document.getElementById('mcp-err-name').textContent = name;
-  ['mcp-err-known-wrap','mcp-err-unknown-wrap','mcp-err-nolog-wrap','mcp-err-log-section'].forEach(id=>document.getElementById(id).classList.add('hidden'));
+  ['mcp-err-known-wrap','mcp-err-unknown-wrap','mcp-err-nolog-wrap','mcp-err-log-section','mcp-err-test-section','mcp-err-envfix'].forEach(id=>document.getElementById(id).classList.add('hidden'));
+  document.getElementById('mcp-err-test-btn').disabled = false;
+  document.getElementById('mcp-err-test-btn').textContent = 'Tester ce MCP maintenant';
   document.getElementById('mcp-error-modal').classList.remove('hidden');
   try{
     const r = await fetch('/api/mcp-error/' + encodeURIComponent(name));
@@ -1129,7 +1272,48 @@ async function showMcpError(name){
     document.getElementById('mcp-err-log-section').classList.remove('hidden');
   }
 }
-function closeMcpError(){document.getElementById('mcp-error-modal').classList.add('hidden');}
+function closeMcpError(){document.getElementById('mcp-error-modal').classList.add('hidden');CURRENT_MCP_ERR=null;}
+async function runMcpTest(){
+  if(!CURRENT_MCP_ERR) return;
+  const btn = document.getElementById('mcp-err-test-btn');
+  btn.disabled = true; btn.textContent = 'Test en cours (5s max)...';
+  document.getElementById('mcp-err-envfix').classList.add('hidden');
+  try{
+    const r = await fetch('/api/mcp-test', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: CURRENT_MCP_ERR})});
+    const d = await r.json();
+    if(!d.success){banner('red', d.message || 'Echec du test');return;}
+    const summary = document.getElementById('mcp-err-test-summary');
+    let badge, color;
+    if(d.kind === 'timeout_ok'){badge='OK'; color='bg-green-50 text-green-800 border border-green-200';}
+    else if(d.exited && d.exit_code === 0){badge='Quitte sans erreur (exit 0)'; color='bg-amber-50 text-amber-800 border border-amber-200';}
+    else if(d.exited){badge=`Quitte avec code ${d.exit_code}`; color='bg-red-50 text-red-800 border border-red-200';}
+    else {badge='Toujours actif'; color='bg-blue-50 text-blue-800 border border-blue-200';}
+    summary.className = 'text-sm mb-2 p-2 rounded-lg ' + color;
+    summary.innerHTML = `<div class="font-semibold mb-1">${badge}</div><div>${escAttr(d.suggestion||'')}</div>`;
+    document.getElementById('mcp-err-test-stderr').textContent = d.stderr || '(vide)';
+    document.getElementById('mcp-err-test-stdout').textContent = d.stdout || '(vide)';
+    document.getElementById('mcp-err-test-section').classList.remove('hidden');
+    if(d.missing_env_var){
+      document.getElementById('mcp-envfix-var').textContent = d.missing_env_var;
+      document.getElementById('mcp-envfix-value').value = '';
+      document.getElementById('mcp-err-envfix').classList.remove('hidden');
+      setTimeout(()=>document.getElementById('mcp-envfix-value').focus(), 50);
+    }
+  }catch(e){banner('red','Echec : '+e);}
+  finally{btn.disabled=false; btn.textContent='Re-tester';}
+}
+async function applyEnvFix(){
+  if(!CURRENT_MCP_ERR) return;
+  const v = document.getElementById('mcp-envfix-var').textContent;
+  const val = document.getElementById('mcp-envfix-value').value;
+  if(!val){banner('red','Valeur requise');return;}
+  const j = await api('/api/mcp-set-env', {name: CURRENT_MCP_ERR, var: v, value: val});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){
+    document.getElementById('mcp-err-envfix').classList.add('hidden');
+    runMcpTest();
+  }
+}
 async function toggleSkill(n){const j=await api('/api/toggle-skill',{name:n});banner(j.success?'green':'red',j.message);loadState();}
 async function restartClaude(){if(!confirm('Redemarrer Claude Desktop ?'))return;banner('blue','Redemarrage...');const j=await api('/api/restart-claude');banner(j.success?'green':'red',j.message);setTimeout(loadState,4000);}
 async function restartSelf(){if(!confirm('Redemarrer le serveur Claude Control ?'))return;banner('blue','Redemarrage...');try{await api('/api/restart-self');}catch(e){}setTimeout(()=>{banner('green','Reconnexion...');location.reload();}, 1500);}
@@ -1263,13 +1447,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/preset-delete": lambda: delete_preset(data.get("name", "")),
             "/api/toggle-plugin": lambda: toggle_plugin(data.get("name", "")),
             "/api/plugin-cleanup": lambda: cleanup_plugin_orphan(data.get("name", ""), data.get("version", "")),
+            "/api/mcp-test": lambda: test_mcp(data.get("name", "")),
+            "/api/mcp-set-env": lambda: set_mcp_env(data.get("name", ""), data.get("var", ""), data.get("value", "")),
         }
         if path in routes:
             try:
                 ok, msg = routes[path]()
             except Exception as e:
                 ok, msg = False, f"Erreur serveur : {e}"
-            self._json({"success": ok, "message": msg})
+            if isinstance(msg, dict):
+                self._json({"success": ok, **msg})
+            else:
+                self._json({"success": ok, "message": msg})
         else:
             self.send_response(404); self.end_headers()
 
