@@ -164,31 +164,50 @@ def restart_claude():
 
 
 def _suggest_mcp_fix(error_text):
+    """Retourne (suggestion, kind) ou (None, None) si pas de pattern reconnu.
+    kind: 'auth' | 'deps' | 'binary' | 'port' | 'perm' | 'net' | 'rate' | 'ssl' | 'syntax' | 'exit_early'
+    """
     e = (error_text or "").lower()
     rules = [
-        (("401", "403", "unauthorized", "forbidden", "invalid api key", "invalid_api_key", "authentication failed", "auth failed"),
+        ("auth",
+         ("401", "403", "unauthorized", "forbidden", "invalid api key", "invalid_api_key", "authentication failed", "auth failed"),
          "Authentification : la cle API est invalide ou expiree. Verifie / regenere la dans la config MCP."),
-        (("modulenotfounderror", "cannot find module", "importerror"),
+        ("deps",
+         ("modulenotfounderror", "cannot find module", "importerror"),
          "Dependance manquante. `npm install` ou `pip install` dans le dossier du MCP."),
-        (("enoent", "no such file", "command not found", "cannot find"),
+        ("binary",
+         ("enoent", "no such file", "command not found", "cannot find"),
          "Binaire introuvable : verifie le chemin de 'command' dans la config MCP."),
-        (("eaddrinuse", "address already in use"),
+        ("port",
+         ("eaddrinuse", "address already in use"),
          "Port deja utilise. Un autre process tient ce port."),
-        (("permission denied", "eacces"),
+        ("perm",
+         ("permission denied", "eacces"),
          "Permission refusee : `chmod +x` sur le binaire ou verifie les droits."),
-        (("econnreset", "etimedout", "getaddrinfo", "enotfound", "network error"),
+        ("net",
+         ("econnreset", "etimedout", "getaddrinfo", "enotfound", "network error"),
          "Reseau : verifie ta connexion ou la dispo du service distant."),
-        (("rate limit", "429", "quota"),
+        ("rate",
+         ("rate limit", "429", "quota"),
          "Rate limit atteint sur l'API. Attends ou augmente ton quota."),
-        (("ssl", "certificate", "cert"),
+        ("ssl",
+         ("ssl", "certificate", "cert"),
          "Probleme certificat SSL/TLS. Verifie l'horloge systeme et les CA."),
-        (("syntaxerror", "unexpected token"),
+        ("syntax",
+         ("syntaxerror", "unexpected token"),
          "Erreur de syntaxe dans le code MCP. Le binaire est probablement corrompu."),
+        ("exit_early",
+         ("transport closed unexpectedly", "process exiting early", "process exited early", "server disconnected", "client transport closed"),
+         "Le MCP a quitte immediatement apres son lancement, sans rien ecrire sur stderr. "
+         "Causes les plus frequentes : variable d'env manquante (cle 'env' dans claude_desktop_config.json), "
+         "binaire au mauvais chemin, mauvaise version de Node/Python attendue, ou un import/require "
+         "qui plante au chargement. Pour voir l'erreur reelle : ouvre Terminal et lance manuellement "
+         "la 'command' du MCP avec ses variables 'env' depuis ta config."),
     ]
-    for keywords, suggestion in rules:
+    for kind, keywords, suggestion in rules:
         if any(k in e for k in keywords):
-            return suggestion
-    return "Cause non reconnue. Lis le log complet ou redemarre Claude Desktop."
+            return suggestion, kind
+    return None, None
 
 
 def _scan_log_for_error(content, name=None):
@@ -229,17 +248,20 @@ def read_mcp_error(name):
         filter_name = name if log_file.name in ("mcp.log", "main.log") else None
         excerpt = _scan_log_for_error(content, filter_name)
         if excerpt:
+            suggestion, kind = _suggest_mcp_fix(excerpt)
             return {
                 "name": name,
                 "error": excerpt,
-                "suggestion": _suggest_mcp_fix(excerpt),
+                "suggestion": suggestion,
+                "kind": kind,
                 "log_path": str(log_file),
                 "log_file": log_file.name,
             }
     return {
         "name": name,
         "error": None,
-        "suggestion": "Aucun log d'erreur trouve. Redemarre Claude Desktop pour que ce MCP tente un demarrage et genere un log.",
+        "suggestion": None,
+        "kind": "no_log",
         "log_path": str(CLAUDE_LOGS_DIR),
         "log_file": None,
     }
@@ -903,18 +925,28 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <p class="text-xs text-stone-400 mt-8 text-center">Apres modifications, clique sur "Redemarrer Claude" pour appliquer.</p>
 </div>
 <div id="mcp-error-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
-<div class="card p-6 w-[640px] max-w-[92vw] max-h-[85vh] overflow-y-auto">
-<div class="flex items-baseline justify-between mb-2">
+<div class="card p-6 w-[680px] max-w-[92vw] max-h-[85vh] overflow-y-auto">
+<div class="flex items-baseline justify-between mb-3">
 <h3 class="text-lg font-semibold">MCP <span id="mcp-err-name" class="font-mono"></span> ne demarre pas</h3>
 <button onclick="closeMcpError()" class="text-stone-400 hover:text-stone-700 text-xl leading-none px-2">&times;</button>
 </div>
-<div id="mcp-err-suggestion-wrap" class="hidden mb-4 p-3 rounded-lg" style="background:linear-gradient(135deg,#fef3e2,#fde7d3);border:1px solid #f5c084">
-<div class="text-xs font-semibold uppercase tracking-wide text-amber-800 mb-1">Suggestion de fix</div>
-<div id="mcp-err-suggestion" class="text-sm text-stone-800"></div>
+<div id="mcp-err-known-wrap" class="hidden mb-4 p-3 rounded-lg" style="background:linear-gradient(135deg,#fef3e2,#fde7d3);border:1px solid #f5c084">
+<div class="text-xs font-semibold uppercase tracking-wide text-amber-800 mb-1">&#9888; Cause probable</div>
+<div id="mcp-err-known" class="text-sm text-stone-800 leading-relaxed"></div>
 </div>
+<div id="mcp-err-unknown-wrap" class="hidden mb-4 p-3 rounded-lg bg-stone-50 border border-stone-200">
+<div class="text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1">Pas de cause specifique detectee</div>
+<div class="text-sm text-stone-700 leading-relaxed">Le log ci-dessous est l'extrait le plus recent. Pour voir l'erreur reelle quand la cause n'apparait pas dans les logs Claude Desktop : ouvre Terminal et lance la <span class="font-mono text-xs">command</span> du MCP (avec ses variables <span class="font-mono text-xs">env</span>) depuis <span class="font-mono text-xs">claude_desktop_config.json</span>.</div>
+</div>
+<div id="mcp-err-nolog-wrap" class="hidden mb-4 p-3 rounded-lg bg-stone-50 border border-stone-200">
+<div class="text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1">Aucun log</div>
+<div class="text-sm text-stone-700 leading-relaxed">Aucun log d'erreur trouve dans <span class="font-mono text-xs">~/Library/Logs/Claude/</span>. Redemarre Claude Desktop pour declencher un demarrage du MCP — son log apparaitra ici si ca echoue.</div>
+</div>
+<div id="mcp-err-log-section" class="hidden">
 <div class="text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1">Extrait du log</div>
-<pre id="mcp-err-content" class="text-xs bg-stone-50 border border-stone-200 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap font-mono text-stone-800 max-h-64">Chargement...</pre>
+<pre id="mcp-err-content" class="text-xs bg-stone-900 text-stone-100 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap font-mono max-h-72"></pre>
 <p class="text-xs text-stone-400 mt-2">Fichier : <span id="mcp-err-log-path" class="font-mono"></span></p>
+</div>
 <div class="flex gap-2 justify-end mt-4">
 <button onclick="restartClaude()" class="px-4 py-2 text-sm rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 font-medium">Redemarrer Claude</button>
 <button onclick="closeMcpError()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50">Fermer</button>
@@ -1074,21 +1106,27 @@ async function api(path, body){
 async function toggleMcp(n){const j=await api('/api/toggle-mcp',{name:n});banner(j.success?'green':'red',j.message);loadState();}
 async function showMcpError(name){
   document.getElementById('mcp-err-name').textContent = name;
-  document.getElementById('mcp-err-content').textContent = 'Chargement...';
-  document.getElementById('mcp-err-suggestion-wrap').classList.add('hidden');
-  document.getElementById('mcp-err-log-path').textContent = '';
+  ['mcp-err-known-wrap','mcp-err-unknown-wrap','mcp-err-nolog-wrap','mcp-err-log-section'].forEach(id=>document.getElementById(id).classList.add('hidden'));
   document.getElementById('mcp-error-modal').classList.remove('hidden');
   try{
     const r = await fetch('/api/mcp-error/' + encodeURIComponent(name));
     const d = await r.json();
-    document.getElementById('mcp-err-content').textContent = d.error || '(aucune erreur trouvee dans les logs Claude Desktop)';
-    document.getElementById('mcp-err-log-path').textContent = d.log_path || '';
+    if(d.error){
+      document.getElementById('mcp-err-content').textContent = d.error;
+      document.getElementById('mcp-err-log-path').textContent = d.log_path || '';
+      document.getElementById('mcp-err-log-section').classList.remove('hidden');
+    }
     if(d.suggestion){
-      document.getElementById('mcp-err-suggestion').textContent = d.suggestion;
-      document.getElementById('mcp-err-suggestion-wrap').classList.remove('hidden');
+      document.getElementById('mcp-err-known').textContent = d.suggestion;
+      document.getElementById('mcp-err-known-wrap').classList.remove('hidden');
+    }else if(d.error){
+      document.getElementById('mcp-err-unknown-wrap').classList.remove('hidden');
+    }else{
+      document.getElementById('mcp-err-nolog-wrap').classList.remove('hidden');
     }
   }catch(e){
     document.getElementById('mcp-err-content').textContent = 'Erreur reseau : '+e;
+    document.getElementById('mcp-err-log-section').classList.remove('hidden');
   }
 }
 function closeMcpError(){document.getElementById('mcp-error-modal').classList.add('hidden');}
