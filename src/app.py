@@ -519,6 +519,129 @@ def toggle_command(name):
 
 
 PROJECTS_LOGS_DIR = HOME / ".claude/projects"
+WATCHDOG_FILE = HOME / ".claude/claude-control-watchdog.json"
+_WATCHDOG_EVENTS = []
+_WATCHDOG_EVENTS_LOCK = threading.Lock()
+_WATCHDOG_MAX_EVENTS = 30
+
+
+def _watchdog_event(action, detail=""):
+    ev = {"ts": datetime.now().isoformat(timespec="seconds"), "action": action, "detail": detail}
+    with _WATCHDOG_EVENTS_LOCK:
+        _WATCHDOG_EVENTS.append(ev)
+        if len(_WATCHDOG_EVENTS) > _WATCHDOG_MAX_EVENTS:
+            del _WATCHDOG_EVENTS[:-_WATCHDOG_MAX_EVENTS]
+    _log(f"watchdog: {action} {detail}")
+
+
+_DEFAULT_WATCHDOG = {
+    "enabled": False,
+    "auto_restart_on_crash": True,
+    "freeze_detection": False,
+    "interval_seconds": 30,
+    "freeze_timeout": 5,
+}
+
+
+def load_watchdog_config():
+    cfg = dict(_DEFAULT_WATCHDOG)
+    if WATCHDOG_FILE.exists():
+        try:
+            with open(WATCHDOG_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                cfg.update({k: data[k] for k in _DEFAULT_WATCHDOG if k in data})
+        except Exception:
+            pass
+    return cfg
+
+
+def save_watchdog_config(updates):
+    cfg = load_watchdog_config()
+    if isinstance(updates, dict):
+        for k in _DEFAULT_WATCHDOG:
+            if k in updates:
+                cfg[k] = updates[k]
+    cfg["interval_seconds"] = max(5, int(cfg.get("interval_seconds", 30) or 30))
+    cfg["freeze_timeout"] = max(1, int(cfg.get("freeze_timeout", 5) or 5))
+    cfg["enabled"] = bool(cfg["enabled"])
+    cfg["auto_restart_on_crash"] = bool(cfg["auto_restart_on_crash"])
+    cfg["freeze_detection"] = bool(cfg["freeze_detection"])
+    WATCHDOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(WATCHDOG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return True, cfg
+
+
+def _claude_pids():
+    try:
+        r = subprocess.run(["pgrep", "-f", "Claude.app/Contents/MacOS/Claude"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode != 0:
+            return []
+        return [int(p) for p in r.stdout.split() if p.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def _claude_responsive(timeout=5):
+    """Renvoie True si Claude répond au ping AppleScript dans le délai."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", 'tell application "Claude" to return name'],
+            capture_output=True, timeout=timeout,
+        )
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return True
+
+
+def get_watchdog_status():
+    cfg = load_watchdog_config()
+    pids = _claude_pids()
+    with _WATCHDOG_EVENTS_LOCK:
+        events = list(_WATCHDOG_EVENTS[-10:][::-1])
+    return {
+        "config": cfg,
+        "claude_running": len(pids) > 0,
+        "claude_pids": pids,
+        "events": events,
+    }
+
+
+def _watchdog_loop():
+    while True:
+        try:
+            cfg = load_watchdog_config()
+            interval = cfg["interval_seconds"]
+            if cfg["enabled"]:
+                pids = _claude_pids()
+                if not pids:
+                    if cfg["auto_restart_on_crash"]:
+                        _watchdog_event("start", "Claude not running, launching")
+                        subprocess.run(["open", "-a", "Claude"], check=False)
+                elif cfg["freeze_detection"]:
+                    if not _claude_responsive(timeout=cfg["freeze_timeout"]):
+                        _watchdog_event("restart", f"Claude unresponsive >{cfg['freeze_timeout']}s, restarting")
+                        subprocess.run(["pkill", "-9", "-f", "Claude"], check=False)
+                        time.sleep(2)
+                        subprocess.run(["open", "-a", "Claude"], check=False)
+        except Exception as e:
+            _log(f"watchdog loop error: {e}")
+            interval = 30
+        time.sleep(max(5, int(interval)))
+
+
+def start_watchdog():
+    t = threading.Thread(target=_watchdog_loop, name="claude-watchdog", daemon=True)
+    t.start()
+
+
+
 
 
 def get_skill_usage(days=30):
@@ -1742,6 +1865,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <span id="overview-preset" class="text-xs text-stone-500"></span>
 </div>
 <div id="overview-stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4"></div>
+<div id="watchdog-widget" class="mb-3"></div>
 <div id="overview-top-skills" class="mb-3"></div>
 <div id="overview-suggestions" class="mb-3"></div>
 <div id="overview-health"></div>
@@ -2079,6 +2203,14 @@ fr: {
   used_x_times: "Utilisé {n} fois ces 30 derniers jours",
   skill_suggestions: "Suggestions d'optimisation",
   fallback_no_usage: "heuristiques uniquement (pas de données d'usage)",
+  watchdog_label: "Surveillance",
+  watchdog_active: "Active &middot; vérification toutes les {n}s",
+  watchdog_inactive: "Désactivée",
+  watchdog_enable: "Surveiller Claude Desktop",
+  watchdog_crash: "Redémarrer si crash",
+  watchdog_freeze: "Détecter freeze + redémarrer",
+  claude_running: "Claude tourne",
+  claude_stopped: "Claude arrêté",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -2225,6 +2357,14 @@ en: {
   used_x_times: "Used {n} times in the last 30 days",
   skill_suggestions: "Optimization suggestions",
   fallback_no_usage: "heuristics only (no usage data)",
+  watchdog_label: "Watchdog",
+  watchdog_active: "On &middot; checking every {n}s",
+  watchdog_inactive: "Off",
+  watchdog_enable: "Watch Claude Desktop",
+  watchdog_crash: "Restart on crash",
+  watchdog_freeze: "Detect freeze + restart",
+  claude_running: "Claude running",
+  claude_stopped: "Claude stopped",
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -2421,6 +2561,41 @@ async function cleanupOrphan(fn, version){
 }
 function statBox(value, label, color){
   return `<div class="p-3 rounded-lg border ${color}"><div class="text-2xl font-semibold leading-none mb-1">${value}</div><div class="text-xs text-stone-500">${label}</div></div>`;
+}
+async function loadWatchdog(){
+  try{
+    const r = await fetch('/api/watchdog');
+    if(!r.ok) return;
+    const d = await r.json();
+    const el = document.getElementById('watchdog-widget');
+    if(!el) return;
+    const cfg = d.config || {};
+    const running = !!d.claude_running;
+    const statusBadge = running
+      ? `<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('claude_running')}</span>`
+      : `<span class="text-xs text-stone-700 bg-stone-100 px-2 py-0.5 rounded-full">${tr('claude_stopped')}</span>`;
+    const events = (d.events || []).slice(0,3).map(ev=>`<div class="text-[10px] text-stone-500"><span class="font-mono">${escAttr(ev.ts.slice(11,19))}</span> &middot; ${escAttr(ev.action)} &middot; ${escAttr(ev.detail||'')}</div>`).join('');
+    el.innerHTML = `<div class="p-3 rounded-lg border border-stone-200 bg-stone-50">
+<div class="flex items-baseline justify-between mb-2">
+<div class="flex items-center gap-2">
+<span class="text-xs font-semibold uppercase tracking-wide text-stone-600">${tr('watchdog_label')}</span>
+${statusBadge}
+</div>
+<span class="text-xs text-stone-400">${cfg.enabled ? tr('watchdog_active').split('{n}').join(cfg.interval_seconds) : tr('watchdog_inactive')}</span>
+</div>
+<div class="flex flex-wrap items-center gap-3 text-xs">
+<label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" ${cfg.enabled?'checked':''} onchange="updateWatchdog({enabled:this.checked})" class="w-4 h-4 rounded accent-green-700"><span>${tr('watchdog_enable')}</span></label>
+<label class="flex items-center gap-2 cursor-pointer ${cfg.enabled?'':'opacity-50'}"><input type="checkbox" ${cfg.auto_restart_on_crash?'checked':''} ${cfg.enabled?'':'disabled'} onchange="updateWatchdog({auto_restart_on_crash:this.checked})" class="w-4 h-4 rounded accent-green-700"><span>${tr('watchdog_crash')}</span></label>
+<label class="flex items-center gap-2 cursor-pointer ${cfg.enabled?'':'opacity-50'}"><input type="checkbox" ${cfg.freeze_detection?'checked':''} ${cfg.enabled?'':'disabled'} onchange="updateWatchdog({freeze_detection:this.checked})" class="w-4 h-4 rounded accent-green-700"><span>${tr('watchdog_freeze')}</span></label>
+</div>
+${events ? `<div class="mt-2 pt-2 border-t border-stone-200 space-y-0.5">${events}</div>` : ''}
+</div>`;
+  }catch(e){console.error(e);}
+}
+async function updateWatchdog(updates){
+  const j = await api('/api/watchdog-config', updates);
+  if(!j.success){banner('red', j.message || 'erreur');return;}
+  loadWatchdog();
 }
 async function loadSkillSuggestions(){
   try{
@@ -2761,7 +2936,7 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-applyLang(CURRENT_LANG);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(checkUpdate,3600000);
+applyLang(CURRENT_LANG);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(loadWatchdog,10000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
 
@@ -2814,6 +2989,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(get_overview())
         elif path == "/api/skill-suggestions":
             self._json(skill_optimization_suggestions())
+        elif path == "/api/watchdog":
+            self._json(get_watchdog_status())
         elif path.startswith("/api/command/"):
             qs = parse_qs(urlparse(self.path).query)
             source = qs.get("source", ["user"])[0]
@@ -2871,6 +3048,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
+            "/api/watchdog-config": lambda: save_watchdog_config(data),
         }
         if path in routes:
             try:
@@ -2913,6 +3091,7 @@ def _stay_alive_for_app():
 def main():
     SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    start_watchdog()
     print(f"\n  Claude Control v{get_local_version()} - http://localhost:{PORT}")
     print(f"  Cmd+C pour arreter\n")
     socketserver.TCPServer.allow_reuse_address = True
