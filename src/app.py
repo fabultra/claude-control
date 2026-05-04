@@ -55,6 +55,27 @@ def get_running_mcps():
     return running
 
 
+def read_skill_category(skill_dir):
+    md = skill_dir / "SKILL.md"
+    if not md.exists():
+        return None
+    try:
+        content = md.read_text(errors="replace")
+    except Exception:
+        return None
+    if not content.startswith("---"):
+        return None
+    end = content.find("\n---", 3)
+    if end == -1:
+        return None
+    for line in content[3:end].splitlines():
+        m = re.match(r'^\s*category\s*:\s*(.+?)\s*$', line)
+        if m:
+            cat = m.group(1).strip().strip('"').strip("'")
+            return cat or None
+    return None
+
+
 def get_state():
     config = load_config()
     active = config.get("mcpServers", {})
@@ -69,8 +90,8 @@ def get_state():
     return {
         "mcps": [{"name": n, "active": True, "running": n in running} for n in sorted(active.keys())]
               + [{"name": n, "active": False, "running": False} for n in sorted(disabled.keys())],
-        "skills": [{"name": n, "active": True} for n in active_skills]
-                + [{"name": n, "active": False} for n in disabled_skills],
+        "skills": [{"name": n, "active": True, "category": read_skill_category(SKILLS_DIR / n)} for n in active_skills]
+                + [{"name": n, "active": False, "category": read_skill_category(SKILLS_DISABLED_DIR / n)} for n in disabled_skills],
     }
 
 
@@ -458,9 +479,19 @@ async function loadState(){
   const s = await (await fetch('/api/state')).json();
   CURRENT_STATE = s;
   document.getElementById('mcps').innerHTML = s.mcps.length===0 ? '<p class="text-stone-400 text-sm">Aucun MCP</p>' : s.mcps.map(m=>`<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium">${m.name}</span>${m.running?'<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">running</span>':(m.active?'<span class="text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full">pas demarre</span>':'')}</div></label>`).join('');
-  document.getElementById('skills').innerHTML = s.skills.length===0 ? '<p class="text-stone-400 text-sm">Aucun skill</p>' : s.skills.map(sk=>`<label class="flex items-center gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}"><input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium text-sm">${sk.name}</span></label>`).join('');
+  document.getElementById('skills').innerHTML = renderSkills(s.skills);
 }
 function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');}
+function renderSkills(skills){
+  if(!skills || skills.length===0) return '<p class="text-stone-400 text-sm">Aucun skill</p>';
+  const groups = {};
+  skills.forEach(sk=>{const cat = sk.category || 'Uncategorized'; (groups[cat] = groups[cat] || []).push(sk);});
+  const cats = Object.keys(groups).sort((a,b)=>{if(a==='Uncategorized')return 1; if(b==='Uncategorized')return -1; return a.localeCompare(b);});
+  return cats.map(cat=>{
+    const items = groups[cat].map(sk=>`<label class="flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}"><input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium text-sm">${sk.name}</span></label>`).join('');
+    return `<details open class="mb-2"><summary class="cursor-pointer text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1.5 px-1 select-none hover:text-stone-900">${escAttr(cat)} <span class="text-stone-400 font-normal normal-case">(${groups[cat].length})</span></summary><div class="space-y-1.5 mt-1.5">${items}</div></details>`;
+  }).join('');
+}
 async function loadPresets(){
   try{
     const j = await (await fetch('/api/presets')).json();
