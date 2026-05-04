@@ -159,6 +159,189 @@ def toggle_skill(name):
     return False, f"Skill '{name}' introuvable"
 
 
+def _zip_dir(folder, zip_path):
+    """Zippe un dossier vers zip_path (helper backup)."""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in Path(folder).rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(folder))
+
+
+def delete_skill(name):
+    if not name or "/" in name or name.startswith(".") or name.startswith("_"):
+        return False, "Nom de skill invalide"
+    target = None
+    for base in (SKILLS_DIR, SKILLS_DISABLED_DIR):
+        candidate = base / name
+        if candidate.exists() and candidate.is_dir():
+            target = candidate
+            break
+    if not target:
+        return False, f"Skill '{name}' introuvable"
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = BACKUP_DIR / f"deleted-skill-{name}-{ts}.zip"
+    try:
+        _zip_dir(target, backup)
+    except Exception as e:
+        return False, f"Backup échoué : {e}"
+    shutil.rmtree(target)
+    return True, f"Skill '{name}' supprimé (backup : {backup.name})"
+
+
+def delete_mcp(name):
+    if not name:
+        return False, "Nom requis"
+    config = load_config()
+    found = False
+    for bucket in ("mcpServers", "_disabledMcps"):
+        if name in config.get(bucket, {}):
+            del config[bucket][name]
+            found = True
+    if not found:
+        return False, f"MCP '{name}' introuvable"
+    save_config(config)
+    return True, f"MCP '{name}' supprimé de la config (backup horodaté créé)"
+
+
+def delete_plugin(full_name, delete_files=False):
+    if not full_name:
+        return False, "Nom de plugin requis"
+    if not INSTALLED_PLUGINS_FILE.exists():
+        return False, "installed_plugins.json introuvable"
+    try:
+        with open(INSTALLED_PLUGINS_FILE) as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, f"installed_plugins.json invalide : {e}"
+    plugins_dict = data.get("plugins", {}) if isinstance(data, dict) else {}
+    if full_name not in plugins_dict:
+        return False, f"Plugin '{full_name}' introuvable"
+    entries = plugins_dict[full_name]
+    install_paths = []
+    if isinstance(entries, list):
+        for e in entries:
+            if isinstance(e, dict) and e.get("installPath"):
+                install_paths.append(e["installPath"])
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(INSTALLED_PLUGINS_FILE, BACKUP_DIR / f"installed_plugins.json.{ts}")
+    del plugins_dict[full_name]
+    data["plugins"] = plugins_dict
+    with open(INSTALLED_PLUGINS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    settings = _load_settings()
+    if isinstance(settings.get("enabledPlugins"), dict) and full_name in settings["enabledPlugins"]:
+        del settings["enabledPlugins"][full_name]
+        _save_settings(settings)
+    deleted_dirs = []
+    if delete_files:
+        cache_root = (HOME / ".claude/plugins/cache").resolve()
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', full_name)
+        for ip in install_paths:
+            try:
+                p = Path(ip).resolve()
+                p.relative_to(cache_root)
+            except (ValueError, OSError):
+                continue
+            walk = p
+            while walk.parent != cache_root and walk != cache_root and walk != Path("/"):
+                walk = walk.parent
+                if walk == cache_root:
+                    break
+            target = walk if walk.exists() and walk != cache_root else p
+            if target.exists() and target.is_dir():
+                ORPHAN_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+                backup_zip = ORPHAN_BACKUP_DIR / f"deleted-{safe_name}-{ts}.zip"
+                try:
+                    _zip_dir(target, backup_zip)
+                except Exception:
+                    pass
+                shutil.rmtree(target, ignore_errors=True)
+                deleted_dirs.append(str(target))
+    msg = f"Plugin '{full_name}' supprimé"
+    if delete_files:
+        msg += f" + {len(deleted_dirs)} dossier(s) du cache effacé(s)"
+    return True, msg
+
+
+def add_plugin_from_git(url):
+    url = (url or "").strip()
+    if not (url.startswith("https://") or url.startswith("http://") or url.startswith("git@")):
+        return False, "URL Git invalide (doit commencer par https:// ou git@)"
+    repo_name = re.sub(r'\.git$', '', url.rstrip('/').split('/')[-1])
+    if not repo_name or "/" in repo_name:
+        return False, "Impossible de déterminer le nom du repo depuis l'URL"
+    cache_dir = HOME / ".claude/plugins/cache/manual" / repo_name
+    if cache_dir.exists():
+        return False, f"Un plugin existe déjà dans {cache_dir}. Supprime-le d'abord."
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        r = subprocess.run(["git", "clone", "--depth", "1", url, str(cache_dir)],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return False, f"git clone : {r.stderr[:200]}"
+    except subprocess.TimeoutExpired:
+        return False, "Timeout git clone (120s)"
+    except FileNotFoundError:
+        return False, "git n'est pas installé"
+    candidates = list(cache_dir.rglob("plugin.json"))
+    if not candidates:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        return False, "Aucun plugin.json trouvé dans le repo"
+    plugin_json = candidates[0]
+    install_path = plugin_json.parent
+    if install_path.name == ".claude-plugin":
+        install_path = install_path.parent
+    try:
+        meta = json.loads(plugin_json.read_text(errors="replace"))
+    except Exception as e:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        return False, f"plugin.json invalide : {e}"
+    if not isinstance(meta, dict):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        return False, "plugin.json doit être un objet JSON"
+    name = meta.get("name") or repo_name
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', name):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        return False, f"Nom de plugin invalide : '{name}'"
+    version = str(meta.get("version") or "1.0.0")
+    full_name = f"{name}@manual"
+    if INSTALLED_PLUGINS_FILE.exists():
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(INSTALLED_PLUGINS_FILE, BACKUP_DIR / f"installed_plugins.json.{ts}")
+        try:
+            with open(INSTALLED_PLUGINS_FILE) as f:
+                data = json.load(f)
+        except Exception:
+            data = {"version": 2, "plugins": {}}
+    else:
+        data = {"version": 2, "plugins": {}}
+    if not isinstance(data.get("plugins"), dict):
+        data["plugins"] = {}
+    if full_name in data["plugins"]:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        return False, f"Plugin '{full_name}' déjà enregistré. Supprime-le d'abord."
+    now_iso = datetime.now().isoformat() + "Z"
+    data["plugins"][full_name] = [{
+        "scope": "user",
+        "installPath": str(install_path),
+        "version": version,
+        "installedAt": now_iso,
+        "lastUpdated": now_iso,
+        "gitCommitSha": "",
+    }]
+    INSTALLED_PLUGINS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(INSTALLED_PLUGINS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    settings = _load_settings()
+    settings.setdefault("enabledPlugins", {})[full_name] = True
+    _save_settings(settings)
+    return True, f"Plugin '{full_name}' v{version} ajouté et activé"
+
+
 def _read_command_preview(path, max_chars=400):
     try:
         text = path.read_text(errors="replace")
@@ -1334,11 +1517,22 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <section class="card p-6 mt-6">
 <div class="flex items-baseline justify-between mb-1">
 <h2 class="text-lg font-semibold" data-i18n="plugins">Plugins</h2>
-<span class="text-xs text-stone-400" data-i18n="plugins_meta">Lecture seule &middot; toggle persistant dans settings.json</span>
+<button onclick="openAddPlugin()" class="text-xs text-stone-700 hover:text-stone-900 font-medium" data-i18n="plugin_add_btn">+ Ajouter un plugin (Git)</button>
 </div>
 <p class="text-xs text-stone-500 mb-4" data-i18n="plugins_help">Plugins Claude Code installés via marketplace</p>
 <div id="plugins" class="space-y-2"></div>
 </section>
+<div id="add-plugin-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
+<div class="card p-6 w-[480px] max-w-[92vw]">
+<h3 class="text-lg font-semibold mb-1" data-i18n="plugin_add_modal_title">Ajouter un plugin via Git</h3>
+<p class="text-xs text-stone-500 mb-4" data-i18n="plugin_add_modal_help">Le repo sera cloné dans ~/.claude/plugins/cache/manual/, plugin.json sera lu pour le nom et la version, puis enregistré comme &lt;name&gt;@manual et activé.</p>
+<input id="add-plugin-url" type="text" class="w-full p-3 border border-stone-200 rounded-lg text-sm mb-3" placeholder="https://github.com/.../mon-plugin.git" autocomplete="off"/>
+<div class="flex gap-2 justify-end">
+<button onclick="closeAddPlugin()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50" data-i18n="btn_cancel">Annuler</button>
+<button onclick="confirmAddPlugin()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium" data-i18n="btn_clone_install">Cloner et installer</button>
+</div>
+</div>
+</div>
 <section class="card p-6 mt-6">
 <h2 class="text-lg font-semibold mb-1" data-i18n="commands">Commands</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="commands_help">Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs</p>
@@ -1617,6 +1811,16 @@ fr: {
   issue_duplicates: "doublon(s) skill / plugin",
   issue_skill_no_frontmatter: "skill(s) sans frontmatter",
   health_all_good: "Tout est en ordre.",
+  btn_delete: "Supprimer",
+  btn_clone_install: "Cloner et installer",
+  banner_url_required: "URL requise",
+  plugin_add_btn: "+ Ajouter un plugin (Git)",
+  plugin_add_modal_title: "Ajouter un plugin via Git",
+  plugin_add_modal_help: "Le repo sera cloné dans ~/.claude/plugins/cache/manual/, plugin.json sera lu pour le nom et la version, puis enregistré comme <name>@manual et activé.",
+  confirm_delete_skill: "Supprimer le skill « {name} » ?\\n\\nUn backup ZIP sera créé dans ~/.claude/backups/claude-control/.",
+  confirm_delete_mcp: "Supprimer le MCP « {name} » de ta config ?\\n\\nLa config Claude Desktop est sauvegardée automatiquement avant écriture.",
+  confirm_delete_plugin: "Supprimer le plugin « {name} » ET ses fichiers cache ?\\n\\nUn backup ZIP du dossier sera créé. Annule ici si tu veux garder les fichiers.",
+  confirm_delete_plugin_metadata_only: "Supprimer seulement l'enregistrement du plugin « {name} » dans installed_plugins.json (les fichiers cache restent intacts) ?",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -1743,6 +1947,16 @@ en: {
   issue_duplicates: "skill / plugin duplicate(s)",
   issue_skill_no_frontmatter: "skill(s) without frontmatter",
   health_all_good: "All clear.",
+  btn_delete: "Delete",
+  btn_clone_install: "Clone and install",
+  banner_url_required: "URL required",
+  plugin_add_btn: "+ Add plugin (Git)",
+  plugin_add_modal_title: "Add a plugin via Git",
+  plugin_add_modal_help: "The repo will be cloned into ~/.claude/plugins/cache/manual/, plugin.json will be read for name and version, then registered as <name>@manual and enabled.",
+  confirm_delete_skill: 'Delete skill "{name}"?\\n\\nA ZIP backup will be created in ~/.claude/backups/claude-control/.',
+  confirm_delete_mcp: 'Delete MCP "{name}" from your config?\\n\\nThe Claude Desktop config is backed up automatically before writing.',
+  confirm_delete_plugin: 'Delete plugin "{name}" AND its cache files?\\n\\nA ZIP backup of the folder will be created. Cancel here if you want to keep the files.',
+  confirm_delete_plugin_metadata_only: 'Delete only the plugin "{name}" entry from installed_plugins.json (cache files remain intact)?',
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -1771,7 +1985,7 @@ let CURRENT_STATE = {mcps:[], skills:[]};
 async function loadState(){
   const s = await (await fetch('/api/state')).json();
   CURRENT_STATE = s;
-  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>`<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium">${m.name}</span>${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div></label>`).join('');
+  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>`<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" title="${tr('btn_delete')}" class="text-stone-300 hover:text-red-600 text-sm leading-none px-2 opacity-0 group-hover:opacity-100 transition-opacity">&times;</button></label>`).join('');
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
 }
@@ -1786,7 +2000,7 @@ function renderSkills(skills){
       const desc = sk.description || '';
       const search = (sk.name + ' ' + desc).toLowerCase();
       const descHtml = desc ? `<span class="text-xs text-stone-500 truncate">${escAttr(desc)}</span>` : '';
-      return `<label data-skill data-search="${escAttr(search)}" class="flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}"><input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><div class="flex flex-col min-w-0 flex-1"><span class="font-medium text-sm truncate">${escAttr(sk.name)}</span>${descHtml}</div></label>`;
+      return `<label data-skill data-search="${escAttr(search)}" class="group flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}"><input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><div class="flex flex-col min-w-0 flex-1"><span class="font-medium text-sm truncate">${escAttr(sk.name)}</span>${descHtml}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteSkill('${sk.name}')" title="${tr('btn_delete')}" class="text-stone-300 hover:text-red-600 text-sm leading-none px-2 opacity-0 group-hover:opacity-100 transition-opacity">&times;</button></label>`;
     }).join('');
     return `<details data-skill-cat="${escAttr(cat)}" open class="mb-2"><summary class="cursor-pointer text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1.5 px-1 select-none hover:text-stone-900">${escAttr(cat)} <span class="text-stone-400 font-normal normal-case" data-cat-count>(${groups[cat].length})</span></summary><div class="space-y-1.5 mt-1.5">${items}</div></details>`;
   }).join('');
@@ -1835,10 +2049,10 @@ async function loadPlugins(){
       const fn = escAttr(p.full_name);
       const opacity = p.enabled ? '' : 'opacity-60';
       const orphans = (p.extra_versions||[]).map(v=>`<button onclick="event.stopPropagation();cleanupOrphan('${fn}','${escAttr(v)}')" class="text-xs px-2 py-0.5 rounded-full font-medium update-badge text-white" title="Cliquer pour supprimer ce dossier orphelin">&#9888; orphan: v${escAttr(v)}</button>`).join(' ');
-      return `<div class="border ${p.enabled?'border-stone-200':'border-stone-100'} rounded-lg p-3 ${opacity}">
+      return `<div class="group border ${p.enabled?'border-stone-200':'border-stone-100'} rounded-lg p-3 ${opacity}">
 <div class="flex items-center gap-3">
 <input type="checkbox" ${p.enabled?'checked':''} onchange="togglePlugin('${fn}')" class="w-5 h-5 rounded accent-green-700 shrink-0">
-<button onclick="togglePluginDetail('${fn}')" class="flex-1 text-left">
+<button onclick="togglePluginDetail('${fn}')" class="flex-1 text-left min-w-0">
 <div class="flex items-baseline gap-2 flex-wrap">
 <span class="font-medium">${escAttr(p.name)}</span>
 <span class="text-xs text-stone-400 font-mono">v${escAttr(p.version||'?')}</span>
@@ -1847,6 +2061,7 @@ ${orphans}
 </div>
 <div class="text-xs text-stone-500 mt-0.5">${pluginContentBadge(p.contents||{})}</div>
 </button>
+<button type="button" onclick="event.stopPropagation();deletePlugin('${fn}')" title="${tr('btn_delete')}" class="text-stone-300 hover:text-red-600 text-base leading-none px-2 opacity-0 group-hover:opacity-100 transition-opacity">&times;</button>
 </div>
 <div id="pl-detail-${fn}" class="hidden">${pluginDetailHtml(p.contents||{})}</div>
 </div>`;
@@ -1861,6 +2076,40 @@ async function togglePlugin(fn){
   const j = await api('/api/toggle-plugin',{name:fn});
   banner(j.success?'green':'red',j.message);
   loadPlugins();
+}
+async function deleteSkill(name){
+  if(!confirm(tr('confirm_delete_skill').split('{name}').join(name)))return;
+  const j = await api('/api/delete-skill', {name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadState();loadOverview();}
+}
+async function deleteMcp(name){
+  if(!confirm(tr('confirm_delete_mcp').split('{name}').join(name)))return;
+  const j = await api('/api/delete-mcp', {name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadState();loadOverview();loadPresets();}
+}
+async function deletePlugin(fn){
+  const msg = tr('confirm_delete_plugin').split('{name}').join(fn);
+  const yesFiles = confirm(msg);
+  if(!yesFiles && !confirm(tr('confirm_delete_plugin_metadata_only').split('{name}').join(fn))) return;
+  const j = await api('/api/delete-plugin', {name:fn, delete_files: yesFiles});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadPlugins();loadOverview();loadCommands();}
+}
+function openAddPlugin(){
+  document.getElementById('add-plugin-url').value = '';
+  document.getElementById('add-plugin-modal').classList.remove('hidden');
+  setTimeout(()=>document.getElementById('add-plugin-url').focus(), 50);
+}
+function closeAddPlugin(){document.getElementById('add-plugin-modal').classList.add('hidden');}
+async function confirmAddPlugin(){
+  const url = document.getElementById('add-plugin-url').value.trim();
+  if(!url){banner('red', tr('banner_url_required'));return;}
+  banner('blue', tr('banner_cloning'));
+  const j = await api('/api/add-plugin-git', {url:url});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){closeAddPlugin();loadPlugins();loadOverview();loadCommands();}
 }
 async function cleanupOrphan(fn, version){
   const msg = CURRENT_LANG === 'en'
@@ -2174,7 +2423,7 @@ async function deletePreset(name){
   if(j.success){loadPresets();}
 }
 document.addEventListener('keydown', e=>{
-  if(e.key==='Escape'){closeSavePreset();closeMcpError();}
+  if(e.key==='Escape'){closeSavePreset();closeMcpError();closeAddPlugin();closeCmdEdit();}
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
@@ -2282,6 +2531,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/save-command": lambda: save_command(data.get("name", ""), data.get("content", "")),
             "/api/save-claude-md": lambda: save_claude_md(data.get("content", "")),
             "/api/save-settings": lambda: save_settings(data.get("content", "")),
+            "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
+            "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
+            "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
+            "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
         }
         if path in routes:
             try:
