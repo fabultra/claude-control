@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Claude Control - app locale pour gerer MCPs et Skills de Claude Desktop."""
-import http.server, json, re, shutil, socketserver, subprocess, time, webbrowser
+import http.server, io, json, re, shutil, socketserver, subprocess, tempfile, time, webbrowser, zipfile
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
+
+MAX_ZIP_SIZE = 50 * 1024 * 1024  # 50 Mo
 
 PORT = 8765
 HOME = Path.home()
@@ -247,6 +249,78 @@ def import_skill_markdown(name, content):
     return True, f"Skill '{name}' cree"
 
 
+def _safe_extract_zip(blob, dest):
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        for member in zf.namelist():
+            parts = Path(member).parts
+            if member.startswith('/') or '..' in parts or (parts and parts[0].startswith('/')):
+                raise ValueError(f"Entree non sure : {member}")
+        zf.extractall(dest)
+
+
+def _zip_name_from_filename(filename, fallback):
+    base = re.sub(r'\.zip$', '', Path(filename or "").name, flags=re.I)
+    return base or fallback
+
+
+def import_skill_zip(blob, filename):
+    if not blob:
+        return False, "Fichier vide"
+    if len(blob) > MAX_ZIP_SIZE:
+        return False, f"Trop volumineux (max {MAX_ZIP_SIZE // 1024 // 1024} Mo)"
+    name = _zip_name_from_filename(filename, "imported-skill")
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', name):
+        return False, "Nom de fichier invalide (a-z, A-Z, 0-9, - et _ uniquement)"
+    target = SKILLS_DIR / name
+    if target.exists():
+        return False, f"Skill '{name}' existe deja"
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        try:
+            _safe_extract_zip(blob, tmp_path)
+        except zipfile.BadZipFile:
+            return False, "Fichier ZIP invalide"
+        except Exception as e:
+            return False, f"Extraction : {e}"
+        candidates = list(tmp_path.rglob("SKILL.md"))
+        if not candidates:
+            return False, "Aucun SKILL.md trouve dans le ZIP"
+        skill_root = candidates[0].parent
+        shutil.copytree(skill_root, target)
+    return True, f"Skill '{name}' importe depuis ZIP"
+
+
+def import_mcp_zip(blob, filename):
+    if not blob:
+        return False, "Fichier vide"
+    if len(blob) > MAX_ZIP_SIZE:
+        return False, f"Trop volumineux (max {MAX_ZIP_SIZE // 1024 // 1024} Mo)"
+    name = _zip_name_from_filename(filename, "imported-mcp")
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', name):
+        return False, "Nom de fichier invalide"
+    IMPORTED_REPOS_DIR.mkdir(parents=True, exist_ok=True)
+    target_dir = IMPORTED_REPOS_DIR / name
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        try:
+            _safe_extract_zip(blob, tmp_path)
+        except zipfile.BadZipFile:
+            return False, "Fichier ZIP invalide"
+        except Exception as e:
+            return False, f"Extraction : {e}"
+        entries = [p for p in tmp_path.iterdir() if not p.name.startswith("__MACOSX")]
+        src = entries[0] if len(entries) == 1 and entries[0].is_dir() else tmp_path
+        shutil.copytree(src, target_dir)
+    candidates = list(target_dir.rglob("claude_desktop_config*.json")) + list(target_dir.rglob("mcp.json"))
+    if candidates:
+        ok, msg = import_mcp_file(str(candidates[0]))
+        return ok, f"ZIP extrait, {msg}"
+    return True, f"ZIP extrait dans {target_dir}. Aucun config MCP detecte, ajoute via JSON."
+
+
 # === PRESETS ===
 
 def load_presets():
@@ -427,9 +501,10 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <h2 class="text-lg font-semibold mb-1">+ Ajouter un MCP</h2>
 <p class="text-xs text-stone-500 mb-4">JSON, fichier local ou repo Git</p>
 <div class="flex gap-1 mb-4 bg-stone-100 p-1 rounded-lg">
-<button class="tab-btn active flex-1 px-3 py-1.5 text-xs rounded-md font-medium" data-tab="mcp-json" onclick="setTab('mcp','json')">JSON</button>
-<button class="tab-btn flex-1 px-3 py-1.5 text-xs rounded-md font-medium" data-tab="mcp-file" onclick="setTab('mcp','file')">Fichier</button>
-<button class="tab-btn flex-1 px-3 py-1.5 text-xs rounded-md font-medium" data-tab="mcp-git" onclick="setTab('mcp','git')">Git</button>
+<button class="tab-btn active flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="mcp-json" onclick="setTab('mcp','json')">JSON</button>
+<button class="tab-btn flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="mcp-file" onclick="setTab('mcp','file')">Fichier</button>
+<button class="tab-btn flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="mcp-zip" onclick="setTab('mcp','zip')">ZIP</button>
+<button class="tab-btn flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="mcp-git" onclick="setTab('mcp','git')">Git</button>
 </div>
 <div data-pane="mcp-json"><textarea id="mcp-json-in" class="w-full p-3 border border-stone-200 rounded-lg font-mono text-xs h-32 focus:outline-none focus:border-stone-400" placeholder='{"my-mcp": {"command": "node", "args": ["/path/server.js"]}}'></textarea>
 <button onclick="addMcpJson()" class="mt-2 w-full bg-stone-900 hover:bg-stone-800 text-white py-2 rounded-lg text-sm font-medium">Ajouter</button></div>
@@ -439,14 +514,18 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <div data-pane="mcp-git" class="hidden"><input id="mcp-git-in" type="text" class="w-full p-3 border border-stone-200 rounded-lg text-sm" placeholder="https://github.com/.../mcp.git"/>
 <p class="text-xs text-stone-500 mt-1">Sera clone dans ~/.claude/imported-mcps/</p>
 <button onclick="addMcpGit()" class="mt-2 w-full bg-stone-900 hover:bg-stone-800 text-white py-2 rounded-lg text-sm font-medium">Cloner et importer</button></div>
+<div data-pane="mcp-zip" class="hidden"><input id="mcp-zip-in" type="file" accept=".zip,application/zip" class="w-full text-xs file:mr-3 file:py-2 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-stone-100 file:text-stone-700 hover:file:bg-stone-200"/>
+<p class="text-xs text-stone-500 mt-1">ZIP contenant un repo MCP. Le nom du fichier devient le nom du dossier extrait.</p>
+<button onclick="addMcpZip()" class="mt-2 w-full bg-stone-900 hover:bg-stone-800 text-white py-2 rounded-lg text-sm font-medium">Importer le ZIP</button></div>
 </section>
 <section class="card p-6">
 <h2 class="text-lg font-semibold mb-1">+ Ajouter un Skill</h2>
 <p class="text-xs text-stone-500 mb-4">Dossier local, repo Git, ou markdown</p>
 <div class="flex gap-1 mb-4 bg-stone-100 p-1 rounded-lg">
-<button class="tab-btn active flex-1 px-3 py-1.5 text-xs rounded-md font-medium" data-tab="sk-folder" onclick="setTab('sk','folder')">Dossier</button>
-<button class="tab-btn flex-1 px-3 py-1.5 text-xs rounded-md font-medium" data-tab="sk-git" onclick="setTab('sk','git')">Git</button>
-<button class="tab-btn flex-1 px-3 py-1.5 text-xs rounded-md font-medium" data-tab="sk-md" onclick="setTab('sk','md')">Markdown</button>
+<button class="tab-btn active flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="sk-folder" onclick="setTab('sk','folder')">Dossier</button>
+<button class="tab-btn flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="sk-zip" onclick="setTab('sk','zip')">ZIP</button>
+<button class="tab-btn flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="sk-git" onclick="setTab('sk','git')">Git</button>
+<button class="tab-btn flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="sk-md" onclick="setTab('sk','md')">Markdown</button>
 </div>
 <div data-pane="sk-folder"><input id="sk-folder-in" type="text" class="w-full p-3 border border-stone-200 rounded-lg text-sm" placeholder="/Users/.../mon-skill/"/>
 <p class="text-xs text-stone-500 mt-1">Dossier doit contenir SKILL.md</p>
@@ -454,6 +533,9 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <div data-pane="sk-git" class="hidden"><input id="sk-git-in" type="text" class="w-full p-3 border border-stone-200 rounded-lg text-sm" placeholder="https://github.com/.../skill.git"/>
 <p class="text-xs text-stone-500 mt-1">Le repo doit contenir SKILL.md</p>
 <button onclick="addSkillGit()" class="mt-2 w-full bg-stone-900 hover:bg-stone-800 text-white py-2 rounded-lg text-sm font-medium">Cloner et importer</button></div>
+<div data-pane="sk-zip" class="hidden"><input id="sk-zip-in" type="file" accept=".zip,application/zip" class="w-full text-xs file:mr-3 file:py-2 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-stone-100 file:text-stone-700 hover:file:bg-stone-200"/>
+<p class="text-xs text-stone-500 mt-1">ZIP doit contenir SKILL.md (a la racine ou dans un sous-dossier).</p>
+<button onclick="addSkillZip()" class="mt-2 w-full bg-stone-900 hover:bg-stone-800 text-white py-2 rounded-lg text-sm font-medium">Importer le ZIP</button></div>
 <div data-pane="sk-md" class="hidden"><input id="sk-md-name" type="text" class="w-full p-2 mb-2 border border-stone-200 rounded-lg text-sm" placeholder="nom-du-skill"/>
 <textarea id="sk-md-content" class="w-full p-3 border border-stone-200 rounded-lg font-mono text-xs h-24" placeholder="---&#10;name: mon-skill&#10;description: ...&#10;---"></textarea>
 <button onclick="addSkillMd()" class="mt-2 w-full bg-stone-900 hover:bg-stone-800 text-white py-2 rounded-lg text-sm font-medium">Creer</button></div>
@@ -538,6 +620,18 @@ async function addMcpGit(){const v=document.getElementById('mcp-git-in').value.t
 async function addSkillFolder(){const v=document.getElementById('sk-folder-in').value.trim();if(!v)return;const j=await api('/api/import-skill-folder',{path:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-folder-in').value='';loadState();}}
 async function addSkillGit(){const v=document.getElementById('sk-git-in').value.trim();if(!v)return;banner('blue','Clonage...');const j=await api('/api/import-skill-git',{url:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-git-in').value='';loadState();}}
 async function addSkillMd(){const n=document.getElementById('sk-md-name').value.trim();const c=document.getElementById('sk-md-content').value;if(!n||!c)return;const j=await api('/api/import-skill-markdown',{name:n,content:c});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-md-name').value='';document.getElementById('sk-md-content').value='';loadState();}}
+async function uploadZip(path, inputId){
+  const inp = document.getElementById(inputId);
+  const f = inp.files && inp.files[0];
+  if(!f){banner('red','Choisis un fichier ZIP');return null;}
+  banner('blue','Upload du ZIP...');
+  try{
+    const r = await fetch(path, {method:'POST', headers:{'X-Filename': encodeURIComponent(f.name)}, body: f});
+    return await r.json();
+  }catch(e){return {success:false, message:'Echec upload : '+e};}
+}
+async function addMcpZip(){const j=await uploadZip('/api/import-mcp-zip','mcp-zip-in');if(!j)return;banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('mcp-zip-in').value='';loadState();}}
+async function addSkillZip(){const j=await uploadZip('/api/import-skill-zip','sk-zip-in');if(!j)return;banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-zip-in').value='';loadState();}}
 function openSavePreset(){
   const active = (CURRENT_STATE.mcps||[]).filter(m=>m.active).map(m=>m.name);
   document.getElementById('preset-modal-info').textContent = active.length===0 ? 'Aucun MCP actif a sauvegarder.' : `MCPs actifs (${active.length}) : ${active.join(', ')}`;
@@ -605,6 +699,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
+        if path in ("/api/import-skill-zip", "/api/import-mcp-zip"):
+            if length > MAX_ZIP_SIZE:
+                self._json({"success": False, "message": f"Trop volumineux (max {MAX_ZIP_SIZE // 1024 // 1024} Mo)"}); return
+            try:
+                blob = self.rfile.read(length) if length else b""
+                filename = unquote(self.headers.get("X-Filename", ""))
+                fn = import_skill_zip if path == "/api/import-skill-zip" else import_mcp_zip
+                ok, msg = fn(blob, filename)
+            except Exception as e:
+                ok, msg = False, f"Erreur serveur : {e}"
+            self._json({"success": ok, "message": msg}); return
         try:
             data = json.loads(self.rfile.read(length)) if length else {}
         except Exception:
