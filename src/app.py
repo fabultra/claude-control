@@ -580,6 +580,7 @@ _DEFAULT_WATCHDOG = {
     "interval_seconds": 30,
     "freeze_timeout": 5,
     "target": "claude_desktop",
+    "target_pattern": "",
 }
 
 
@@ -608,6 +609,7 @@ def save_watchdog_config(updates):
     cfg["auto_restart_on_crash"] = bool(cfg["auto_restart_on_crash"])
     cfg["freeze_detection"] = bool(cfg["freeze_detection"])
     cfg["target"] = (cfg.get("target") or "claude_desktop").strip()
+    cfg["target_pattern"] = (cfg.get("target_pattern") or "").strip()
     WATCHDOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(WATCHDOG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
@@ -699,12 +701,62 @@ def _list_known_mcps():
     return sorted(set(list(config.get("mcpServers", {}).keys()) + list(config.get("_disabledMcps", {}).keys())))
 
 
+def scan_processes(pattern):
+    """Recherche des process matchant un pattern via `pgrep -fla`. Retourne
+    une liste [{pid, cmd}] limitée et tronquée. Defensive."""
+    pattern = (pattern or "").strip()
+    if not pattern or len(pattern) < 2:
+        return {"matches": [], "pattern": pattern, "error": "Pattern trop court (>= 2 caractères)"}
+    try:
+        r = subprocess.run(["pgrep", "-fla", pattern], capture_output=True, text=True, timeout=4)
+    except FileNotFoundError:
+        return {"matches": [], "pattern": pattern, "error": "pgrep introuvable"}
+    except Exception as e:
+        return {"matches": [], "pattern": pattern, "error": str(e)[:80]}
+    matches = []
+    my_pid = os.getpid()
+    for line in (r.stdout or "").splitlines()[:30]:
+        line = line.strip()
+        if not line:
+            continue
+        sp = line.split(None, 1)
+        if len(sp) != 2:
+            continue
+        try:
+            pid = int(sp[0])
+        except Exception:
+            continue
+        if pid == my_pid:
+            continue
+        cmd = sp[1]
+        if cmd.startswith("/usr/bin/python3") and "src/app.py" in cmd:
+            continue
+        matches.append({"pid": pid, "cmd": cmd[:200]})
+    return {"matches": matches, "pattern": pattern, "count": len(matches)}
+
+
+def _custom_target_pids(pattern):
+    if not pattern or len(pattern) < 2:
+        return []
+    try:
+        r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=3)
+        if r.returncode != 0:
+            return []
+        my_pid = os.getpid()
+        return [int(p) for p in r.stdout.split() if p.strip().isdigit() and int(p) != my_pid]
+    except Exception:
+        return []
+
+
 def get_watchdog_status():
     cfg = load_watchdog_config()
     target = cfg.get("target", "claude_desktop")
     if target == "claude_desktop":
         pids = _claude_pids()
         target_label = "Claude Desktop"
+    elif target == "custom":
+        pids = _custom_target_pids(cfg.get("target_pattern", ""))
+        target_label = (cfg.get("target_pattern") or "?").strip() or "?"
     else:
         pids = _mcp_pids(target)
         target_label = target
@@ -715,7 +767,7 @@ def get_watchdog_status():
         "claude_running": len(pids) > 0,
         "claude_pids": pids,
         "target_label": target_label,
-        "available_targets": ["claude_desktop"] + _list_known_mcps(),
+        "available_targets": ["claude_desktop"] + _list_known_mcps() + ["custom"],
         "events": events,
     }
 
@@ -739,19 +791,32 @@ def _watchdog_loop():
                             subprocess.run(["pkill", "-9", "-f", "Claude"], check=False)
                             time.sleep(2)
                             subprocess.run(["open", "-a", "Claude"], check=False)
+                elif target == "custom":
+                    pattern = cfg.get("target_pattern", "")
+                    if not pattern or len(pattern) < 2:
+                        pass  # no-op, user hasn't set the pattern
+                    else:
+                        pids = _custom_target_pids(pattern)
+                        if not pids:
+                            if cfg["auto_restart_on_crash"]:
+                                _watchdog_event("custom_down", f"Process matching '{pattern}' not found")
+                        elif cfg["freeze_detection"]:
+                            # No log path for arbitrary process — kill any zombie/uninterruptible PIDs.
+                            # Pragmatic: just kill all matching PIDs to force them to be respawned by
+                            # whoever launched them (Claude Desktop usually).
+                            _watchdog_event("kill_custom", f"Pattern '{pattern}' freeze detection -> killing {len(pids)} pid(s)")
+                            for pid in pids:
+                                try:
+                                    os.kill(pid, 9)
+                                except Exception:
+                                    pass
                 else:
                     pids = _mcp_pids(target)
                     if not pids:
-                        # MCP not running. Claude Desktop should respawn it on launch.
-                        # If Claude Desktop is also down, start it; otherwise nothing to do
-                        # (the MCP is presumably failing; user can use the diagnose modal).
                         if cfg["auto_restart_on_crash"] and not _claude_pids():
                             _watchdog_event("start", f"MCP '{target}' down + Claude Desktop down, launching Claude")
                             subprocess.run(["open", "-a", "Claude"], check=False)
                     elif cfg["freeze_detection"]:
-                        # Freeze detection for an MCP: scan its log for recent
-                        # "transport closed" / "exiting early" markers within
-                        # the last 2 * interval seconds.
                         window = max(60, interval * 2)
                         if _mcp_log_says_frozen(target, within_seconds=window):
                             _watchdog_event("restart_mcp", f"MCP '{target}' shows freeze markers, restarting")
@@ -2372,6 +2437,13 @@ fr: {
   watchdog_crash: "Redémarrer si crash",
   watchdog_freeze: "Détecter freeze + redémarrer",
   watchdog_target_label: "Cible",
+  watchdog_custom_target: "Pattern personnalisé",
+  watchdog_pattern_placeholder: "ex : desktop-commander, /chemin/vers/binaire, package-name",
+  btn_scan: "Scanner",
+  scanning: "Scan en cours...",
+  scan_no_match: "Aucun process ne contient « {p} » dans son ligne de commande.",
+  scan_n_matches: "{n} process trouvé(s) qui contiennent « {p} » :",
+  banner_pattern_too_short: "Pattern trop court (>= 2 caractères)",
   btn_restart_mcp: "Redémarrer ce MCP (sans toucher à Claude)",
   skill_filter_mine: "Mes skills",
   skill_filter_plugins: "Plugins",
@@ -2541,6 +2613,13 @@ en: {
   watchdog_crash: "Restart on crash",
   watchdog_freeze: "Detect freeze + restart",
   watchdog_target_label: "Target",
+  watchdog_custom_target: "Custom pattern",
+  watchdog_pattern_placeholder: "e.g.: desktop-commander, /path/to/binary, package-name",
+  btn_scan: "Scan",
+  scanning: "Scanning...",
+  scan_no_match: 'No process matches "{p}" in its command line.',
+  scan_n_matches: '{n} process(es) match "{p}":',
+  banner_pattern_too_short: "Pattern too short (>= 2 characters)",
   btn_restart_mcp: "Restart this MCP (without touching Claude)",
   skill_filter_mine: "My skills",
   skill_filter_plugins: "Plugins",
@@ -2825,9 +2904,15 @@ async function loadWatchdog(){
     const events = (d.events || []).slice(0,3).map(ev=>`<div class="text-[10px] text-stone-500"><span class="font-mono">${escAttr(ev.ts.slice(11,19))}</span> &middot; ${escAttr(ev.action)} &middot; ${escAttr(ev.detail||'')}</div>`).join('');
     const targets = (d.available_targets || ['claude_desktop']);
     const targetOptions = targets.map(t=>{
-      const label = t === 'claude_desktop' ? 'Claude Desktop' : t;
+      const label = t === 'claude_desktop' ? 'Claude Desktop' : (t === 'custom' ? tr('watchdog_custom_target') : t);
       return `<option value="${escAttr(t)}" ${cfg.target===t?'selected':''}>${escAttr(label)}</option>`;
     }).join('');
+    const isCustom = cfg.target === 'custom';
+    const customRow = isCustom ? `<div class="mt-2 flex flex-wrap items-center gap-2 text-xs">
+<input id="watchdog-pattern" type="text" value="${escAttr(cfg.target_pattern||'')}" placeholder="${tr('watchdog_pattern_placeholder')}" class="flex-1 min-w-[200px] px-2 py-1 border border-stone-200 rounded bg-white"/>
+<button onclick="saveWatchdogPattern()" class="px-3 py-1 rounded bg-stone-900 hover:bg-stone-800 text-white font-medium">${tr('btn_save')}</button>
+<button onclick="testWatchdogPattern()" class="px-3 py-1 rounded border border-stone-200 hover:bg-white font-medium">${tr('btn_scan')}</button>
+</div><div id="watchdog-scan-result" class="mt-2 text-xs"></div>` : '';
     el.innerHTML = `<div class="p-3 rounded-lg border border-stone-200 bg-stone-50">
 <div class="flex items-baseline justify-between mb-2 flex-wrap gap-2">
 <div class="flex items-center gap-2">
@@ -2844,6 +2929,7 @@ ${statusBadge}
 <label class="flex items-center gap-2 cursor-pointer ${cfg.enabled?'':'opacity-50'}"><input type="checkbox" ${cfg.auto_restart_on_crash?'checked':''} ${cfg.enabled?'':'disabled'} onchange="updateWatchdog({auto_restart_on_crash:this.checked})" class="w-4 h-4 rounded accent-green-700"><span>${tr('watchdog_crash')}</span></label>
 <label class="flex items-center gap-2 cursor-pointer ${cfg.enabled?'':'opacity-50'}"><input type="checkbox" ${cfg.freeze_detection?'checked':''} ${cfg.enabled?'':'disabled'} onchange="updateWatchdog({freeze_detection:this.checked})" class="w-4 h-4 rounded accent-green-700"><span>${tr('watchdog_freeze')}</span></label>
 </div>
+${customRow}
 ${events ? `<div class="mt-2 pt-2 border-t border-stone-200 space-y-0.5">${events}</div>` : ''}
 </div>`;
   }catch(e){console.error(e);}
@@ -2852,6 +2938,24 @@ async function updateWatchdog(updates){
   const j = await api('/api/watchdog-config', updates);
   if(!j.success){banner('red', j.message || 'erreur');return;}
   loadWatchdog();
+}
+async function saveWatchdogPattern(){
+  const p = document.getElementById('watchdog-pattern').value.trim();
+  await updateWatchdog({target_pattern: p});
+}
+async function testWatchdogPattern(){
+  const p = document.getElementById('watchdog-pattern').value.trim();
+  const out = document.getElementById('watchdog-scan-result');
+  if(!p || p.length < 2){out.innerHTML = `<span class="text-red-700">${tr('banner_pattern_too_short')}</span>`;return;}
+  out.innerHTML = `<span class="text-stone-500">${tr('scanning')}</span>`;
+  const j = await api('/api/scan-process', {pattern:p});
+  if(j.error){out.innerHTML = `<span class="text-red-700">${escAttr(j.error)}</span>`;return;}
+  if(!j.matches || j.matches.length===0){
+    out.innerHTML = `<div class="text-stone-600 italic">${tr('scan_no_match').split('{p}').join(escAttr(p))}</div>`;
+    return;
+  }
+  out.innerHTML = `<div class="mb-1 text-stone-700">${tr('scan_n_matches').split('{n}').join(j.matches.length).split('{p}').join(escAttr(p))}</div>` +
+    j.matches.slice(0,8).map(m=>`<div class="font-mono text-[11px] text-stone-500 truncate" title="${escAttr(m.cmd)}"><span class="text-stone-700 font-semibold mr-2">${m.pid}</span>${escAttr(m.cmd.substring(0,180))}</div>`).join('');
 }
 async function loadSkillSuggestions(){
   try{
@@ -3306,6 +3410,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
             "/api/watchdog-config": lambda: save_watchdog_config(data),
+            "/api/scan-process": lambda: (True, scan_processes(data.get("pattern", ""))),
         }
         if path in routes:
             try:
