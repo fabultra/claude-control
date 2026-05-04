@@ -21,8 +21,22 @@ cyan "  Claude Control - installation"
 cyan "  ============================="
 cyan ""
 
-command -v git >/dev/null || { red "git non installe. Installe avec: xcode-select --install"; exit 1; }
-command -v python3 >/dev/null || { red "python3 non installe."; exit 1; }
+if [ "$(uname -s)" != "Darwin" ]; then
+    red "  Claude Control est macOS-only (detecte : $(uname -s))."
+    exit 1
+fi
+
+command -v git >/dev/null || {
+    red "  git n'est pas installe."
+    cyan "  -> xcode-select --install"
+    exit 1
+}
+command -v python3 >/dev/null || {
+    red "  python3 n'est pas installe."
+    cyan "  -> brew install python3   (recommande)"
+    cyan "  -> ou telecharge python3 sur python.org"
+    exit 1
+}
 command -v uv >/dev/null || cyan "  Note: uv recommande pour la generation d'icone (sinon ignore)."
 
 # Nettoyage d'un .app existant cote Bureau (souvent synchronise iCloud, source
