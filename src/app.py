@@ -249,6 +249,32 @@ def toggle_command(name):
     return False, f"Command '{name}' introuvable"
 
 
+def read_claude_md():
+    if not CLAUDE_MD_FILE.exists():
+        return {"content": "", "exists": False, "size": 0, "path": str(CLAUDE_MD_FILE)}
+    try:
+        text = CLAUDE_MD_FILE.read_text(errors="replace")
+    except Exception as e:
+        return {"content": "", "exists": True, "size": 0, "path": str(CLAUDE_MD_FILE), "error": str(e)}
+    return {"content": text, "exists": True, "size": len(text), "path": str(CLAUDE_MD_FILE)}
+
+
+def save_claude_md(content):
+    if not isinstance(content, str):
+        return False, "Contenu invalide"
+    if CLAUDE_MD_FILE.exists():
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = BACKUP_DIR / f"CLAUDE.md.{ts}"
+        try:
+            shutil.copy2(CLAUDE_MD_FILE, backup)
+        except Exception:
+            pass
+    CLAUDE_MD_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CLAUDE_MD_FILE.write_text(content)
+    return True, f"CLAUDE.md enregistré ({len(content)} caractères)"
+
+
 def save_command(name, content):
     """Sauvegarde une command utilisateur (avec backup si elle existait)."""
     if not name or not re.match(r'^[a-zA-Z0-9_\-]+$', name):
@@ -1214,6 +1240,18 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <p class="text-xs text-stone-500 mb-4" data-i18n="commands_help">Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs</p>
 <div id="commands" class="space-y-2 max-h-[500px] overflow-y-auto"></div>
 </section>
+<section class="card p-6 mt-6">
+<div class="flex items-baseline justify-between mb-1">
+<h2 class="text-lg font-semibold"><span class="font-mono">CLAUDE.md</span></h2>
+<span class="text-xs text-stone-400" data-i18n="claudemd_meta">Lu à chaque session Claude Code</span>
+</div>
+<p class="text-xs text-stone-500 mb-3" data-i18n="claudemd_help">Préférences globales injectées dans chaque conversation Claude Code (~/.claude/CLAUDE.md)</p>
+<textarea id="claudemd-textarea" class="w-full p-3 border border-stone-200 rounded-lg font-mono text-xs h-64 focus:outline-none focus:border-stone-400" spellcheck="false" data-i18n-placeholder="claudemd_placeholder" placeholder="# Mes préférences globales pour Claude Code..."></textarea>
+<div class="flex items-center justify-between mt-2">
+<span class="text-xs text-stone-400"><span id="claudemd-count">0</span> <span data-i18n="characters">caractères</span></span>
+<button onclick="saveClaudeMd()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium" data-i18n="btn_save">Sauvegarder</button>
+</div>
+</section>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
 <section class="card p-6">
 <h2 class="text-lg font-semibold mb-1" data-i18n="add_mcp">+ Ajouter un MCP</h2>
@@ -1443,6 +1481,10 @@ fr: {
   btn_view: "Voir",
   readonly: "lecture seule",
   command_not_found: "Command introuvable",
+  claudemd_meta: "Lu à chaque session Claude Code",
+  claudemd_help: "Préférences globales injectées dans chaque conversation Claude Code (~/.claude/CLAUDE.md)",
+  claudemd_placeholder: "# Mes préférences globales pour Claude Code...",
+  characters: "caractères",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -1549,6 +1591,10 @@ en: {
   btn_view: "View",
   readonly: "read-only",
   command_not_found: "Command not found",
+  claudemd_meta: "Read at each Claude Code session",
+  claudemd_help: "Global preferences injected into every Claude Code conversation (~/.claude/CLAUDE.md)",
+  claudemd_placeholder: "# My global preferences for Claude Code...",
+  characters: "characters",
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -1675,6 +1721,23 @@ async function cleanupOrphan(fn, version){
   const j = await api('/api/plugin-cleanup',{name:fn, version:version});
   banner(j.success?'green':'red',j.message);
   if(j.success){loadPlugins();}
+}
+async function loadClaudeMd(){
+  try{
+    const r = await fetch('/api/claude-md');
+    if(!r.ok) return;
+    const d = await r.json();
+    const ta = document.getElementById('claudemd-textarea');
+    if(!ta) return;
+    ta.value = d.content || '';
+    document.getElementById('claudemd-count').textContent = (d.content || '').length;
+    ta.oninput = ()=>{document.getElementById('claudemd-count').textContent = ta.value.length;};
+  }catch(e){console.error(e);}
+}
+async function saveClaudeMd(){
+  const ta = document.getElementById('claudemd-textarea');
+  const j = await api('/api/save-claude-md', {content: ta.value});
+  banner(j.success?'green':'red', j.message);
 }
 async function loadCommands(){
   try{
@@ -1901,7 +1964,7 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-applyLang(CURRENT_LANG);loadState();loadPresets();loadPlugins();loadCommands();checkUpdate();setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(checkUpdate,3600000);
+applyLang(CURRENT_LANG);loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();checkUpdate();setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
 
@@ -1946,6 +2009,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(read_mcp_error(name, lang))
         elif path == "/api/commands":
             self._json({"commands": list_commands()})
+        elif path == "/api/claude-md":
+            self._json(read_claude_md())
         elif path.startswith("/api/command/"):
             qs = parse_qs(urlparse(self.path).query)
             source = qs.get("source", ["user"])[0]
@@ -1997,6 +2062,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/mcp-set-env": lambda: set_mcp_env(data.get("name", ""), data.get("var", ""), data.get("value", "")),
             "/api/toggle-command": lambda: toggle_command(data.get("name", "")),
             "/api/save-command": lambda: save_command(data.get("name", ""), data.get("content", "")),
+            "/api/save-claude-md": lambda: save_claude_md(data.get("content", "")),
         }
         if path in routes:
             try:
