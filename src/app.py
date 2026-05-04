@@ -12,6 +12,9 @@ HOME = Path.home()
 CONFIG_PATH = HOME / "Library/Application Support/Claude/claude_desktop_config.json"
 SKILLS_DIR = HOME / ".claude/skills"
 SKILLS_DISABLED_DIR = HOME / ".claude/skills-disabled"
+COMMANDS_DIR = HOME / ".claude/commands"
+COMMANDS_DISABLED_DIR = HOME / ".claude/commands-disabled"
+CLAUDE_MD_FILE = HOME / ".claude/CLAUDE.md"
 BACKUP_DIR = HOME / ".claude/backups/claude-control"
 IMPORTED_REPOS_DIR = HOME / ".claude/imported-mcps"
 PRESETS_FILE = HOME / ".claude/claude-control-presets.json"
@@ -154,6 +157,240 @@ def toggle_skill(name):
         src_d.rename(target)
         return True, f"Skill '{name}' active"
     return False, f"Skill '{name}' introuvable"
+
+
+def _read_command_preview(path, max_chars=400):
+    try:
+        text = path.read_text(errors="replace")
+    except Exception:
+        return ""
+    return text if len(text) <= max_chars else text[:max_chars] + "\n..."
+
+
+def list_commands():
+    """Liste les commands utilisateur (~/.claude/commands/) + celles fournies par
+    chaque plugin actif. Les commands plugin sont en lecture seule."""
+    commands = []
+    COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+    COMMANDS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
+    for f in sorted(COMMANDS_DIR.glob("*.md")):
+        commands.append({"name": f.stem, "source": "user", "active": True,
+                         "path": str(f), "editable": True})
+    for f in sorted(COMMANDS_DISABLED_DIR.glob("*.md")):
+        commands.append({"name": f.stem, "source": "user", "active": False,
+                         "path": str(f), "editable": True})
+    try:
+        installed = _load_installed_plugins()
+    except Exception:
+        installed = {}
+    settings = _load_settings()
+    enabled_map = settings.get("enabledPlugins", {}) if isinstance(settings, dict) else {}
+    for full_name, entries in installed.items():
+        if not enabled_map.get(full_name, True):
+            continue
+        if not isinstance(entries, list) or not entries:
+            continue
+        entry = entries[0]
+        if not isinstance(entry, dict):
+            continue
+        install_path = Path(entry.get("installPath", ""))
+        cmd_dir = install_path / "commands"
+        if not cmd_dir.is_dir():
+            continue
+        for f in sorted(cmd_dir.glob("*.md")):
+            commands.append({"name": f.stem, "source": f"plugin:{full_name}",
+                             "active": True, "path": str(f), "editable": False})
+    return commands
+
+
+def get_command(name, source):
+    if source == "user":
+        for base in (COMMANDS_DIR, COMMANDS_DISABLED_DIR):
+            p = base / f"{name}.md"
+            if p.exists():
+                return True, {"name": name, "source": "user", "content": p.read_text(errors="replace"),
+                              "path": str(p), "active": (base == COMMANDS_DIR), "editable": True}
+        return False, "Command introuvable"
+    if source.startswith("plugin:"):
+        full_name = source[len("plugin:"):]
+        installed = _load_installed_plugins()
+        if full_name not in installed:
+            return False, "Plugin introuvable"
+        entry = installed[full_name][0]
+        cmd_path = Path(entry.get("installPath", "")) / "commands" / f"{name}.md"
+        if not cmd_path.is_file():
+            return False, "Command introuvable dans le plugin"
+        return True, {"name": name, "source": source, "content": cmd_path.read_text(errors="replace"),
+                      "path": str(cmd_path), "active": True, "editable": False}
+    return False, "Source invalide"
+
+
+def toggle_command(name):
+    """Toggle une command utilisateur entre commands/ et commands-disabled/."""
+    if not name or "/" in name or name.startswith("."):
+        return False, "Nom de command invalide"
+    COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+    COMMANDS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
+    fname = f"{name}.md"
+    src_a = COMMANDS_DIR / fname
+    src_d = COMMANDS_DISABLED_DIR / fname
+    if src_a.exists():
+        target = COMMANDS_DISABLED_DIR / fname
+        if target.exists():
+            return False, f"Conflit : {target} existe déjà"
+        src_a.rename(target)
+        return True, f"Command '{name}' désactivée"
+    if src_d.exists():
+        target = COMMANDS_DIR / fname
+        if target.exists():
+            return False, f"Conflit : {target} existe déjà"
+        src_d.rename(target)
+        return True, f"Command '{name}' activée"
+    return False, f"Command '{name}' introuvable"
+
+
+def get_overview():
+    """Vue agregee : stats + health checks (orphans, MCPs en erreur, doublons,
+    skills sans frontmatter, preset actif si applicable)."""
+    state = get_state()
+    plugins = []
+    try:
+        plugins = list_plugins()
+    except Exception:
+        pass
+    commands = []
+    try:
+        commands = list_commands()
+    except Exception:
+        pass
+    presets = list_presets()
+    active_preset = None
+    if isinstance(presets, dict):
+        active_mcp_names = sorted(m["name"] for m in state["mcps"] if m["active"])
+        for pname, pmcps in presets.items():
+            if sorted(pmcps) == active_mcp_names:
+                active_preset = pname
+                break
+    plugin_orphans = []
+    for p in plugins:
+        for v in p.get("extra_versions", []):
+            plugin_orphans.append({"plugin": p["full_name"], "version": v})
+    skill_issues = []
+    for sk in state["skills"]:
+        if not sk.get("description") and not sk.get("category"):
+            skill_issues.append({"name": sk["name"], "reason": "sans frontmatter"})
+    skill_names = {sk["name"] for sk in state["skills"]}
+    plugin_skill_names = set()
+    for p in plugins:
+        for s in (p.get("contents", {}).get("skills") or []):
+            plugin_skill_names.add(s)
+    duplicates = sorted(skill_names & plugin_skill_names)
+    mcps_active = [m for m in state["mcps"] if m["active"]]
+    mcps_running = [m for m in mcps_active if m["running"]]
+    mcps_failing = [m["name"] for m in mcps_active if not m["running"]]
+    plugins_enabled = sum(1 for p in plugins if p.get("enabled"))
+    return {
+        "stats": {
+            "mcps_total": len(state["mcps"]),
+            "mcps_active": len(mcps_active),
+            "mcps_running": len(mcps_running),
+            "mcps_failing": len(mcps_failing),
+            "skills_total": len(state["skills"]),
+            "skills_active": sum(1 for s in state["skills"] if s["active"]),
+            "plugins_total": len(plugins),
+            "plugins_enabled": plugins_enabled,
+            "commands_total": len(commands),
+            "commands_user": sum(1 for c in commands if c["source"] == "user"),
+        },
+        "active_preset": active_preset,
+        "presets_count": len(presets),
+        "health": {
+            "plugin_orphans": plugin_orphans,
+            "mcps_failing": mcps_failing,
+            "skill_issues": skill_issues,
+            "duplicate_names": duplicates,
+        },
+    }
+
+
+def read_settings_raw():
+    if not SETTINGS_FILE.exists():
+        return {"content": "{}", "exists": False, "size": 2, "path": str(SETTINGS_FILE)}
+    try:
+        text = SETTINGS_FILE.read_text(errors="replace")
+    except Exception as e:
+        return {"content": "", "exists": True, "size": 0, "path": str(SETTINGS_FILE), "error": str(e)}
+    return {"content": text, "exists": True, "size": len(text), "path": str(SETTINGS_FILE)}
+
+
+def save_settings(content):
+    if not isinstance(content, str):
+        return False, "Contenu invalide"
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        return False, f"JSON invalide : {e.msg} (ligne {e.lineno})"
+    if not isinstance(parsed, dict):
+        return False, "settings.json doit être un objet JSON"
+    if SETTINGS_FILE.exists():
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = BACKUP_DIR / f"settings.json.{ts}"
+        try:
+            shutil.copy2(SETTINGS_FILE, backup)
+        except Exception:
+            pass
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(content)
+    return True, f"settings.json enregistré ({len(content)} caractères)"
+
+
+def read_claude_md():
+    if not CLAUDE_MD_FILE.exists():
+        return {"content": "", "exists": False, "size": 0, "path": str(CLAUDE_MD_FILE)}
+    try:
+        text = CLAUDE_MD_FILE.read_text(errors="replace")
+    except Exception as e:
+        return {"content": "", "exists": True, "size": 0, "path": str(CLAUDE_MD_FILE), "error": str(e)}
+    return {"content": text, "exists": True, "size": len(text), "path": str(CLAUDE_MD_FILE)}
+
+
+def save_claude_md(content):
+    if not isinstance(content, str):
+        return False, "Contenu invalide"
+    if CLAUDE_MD_FILE.exists():
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = BACKUP_DIR / f"CLAUDE.md.{ts}"
+        try:
+            shutil.copy2(CLAUDE_MD_FILE, backup)
+        except Exception:
+            pass
+    CLAUDE_MD_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CLAUDE_MD_FILE.write_text(content)
+    return True, f"CLAUDE.md enregistré ({len(content)} caractères)"
+
+
+def save_command(name, content):
+    """Sauvegarde une command utilisateur (avec backup si elle existait)."""
+    if not name or not re.match(r'^[a-zA-Z0-9_\-]+$', name):
+        return False, "Nom invalide (a-z, A-Z, 0-9, - et _ uniquement)"
+    if not isinstance(content, str):
+        return False, "Contenu invalide"
+    COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+    target_active = COMMANDS_DIR / f"{name}.md"
+    target_disabled = COMMANDS_DISABLED_DIR / f"{name}.md"
+    target = target_active if target_active.exists() or not target_disabled.exists() else target_disabled
+    if target.exists():
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = BACKUP_DIR / f"command-{name}.{ts}.md"
+        try:
+            shutil.copy2(target, backup)
+        except Exception:
+            pass
+    target.write_text(content)
+    return True, f"Command '{name}' enregistrée"
 
 
 def restart_claude():
@@ -1070,6 +1307,14 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <span>&#x21bb;</span><span data-i18n="restart_claude">Redémarrer Claude</span></button>
 </div></header>
 <div id="banner" class="hidden mb-4 p-3 rounded-lg text-sm border"></div>
+<section class="card p-6 mb-6">
+<div class="flex items-baseline justify-between mb-3">
+<h2 class="text-lg font-semibold" data-i18n="overview">Vue d'ensemble</h2>
+<span id="overview-preset" class="text-xs text-stone-500"></span>
+</div>
+<div id="overview-stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4"></div>
+<div id="overview-health"></div>
+</section>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
 <section class="card p-6"><h2 class="text-lg font-semibold mb-1" data-i18n="mcp_section">Serveurs MCP</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="mcp_help">Coché = chargé au démarrage de Claude Desktop</p>
@@ -1093,6 +1338,35 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </div>
 <p class="text-xs text-stone-500 mb-4" data-i18n="plugins_help">Plugins Claude Code installés via marketplace</p>
 <div id="plugins" class="space-y-2"></div>
+</section>
+<section class="card p-6 mt-6">
+<h2 class="text-lg font-semibold mb-1" data-i18n="commands">Commands</h2>
+<p class="text-xs text-stone-500 mb-4" data-i18n="commands_help">Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs</p>
+<div id="commands" class="space-y-2 max-h-[500px] overflow-y-auto"></div>
+</section>
+<section class="card p-6 mt-6">
+<div class="flex items-baseline justify-between mb-1">
+<h2 class="text-lg font-semibold"><span class="font-mono">CLAUDE.md</span></h2>
+<span class="text-xs text-stone-400" data-i18n="claudemd_meta">Lu à chaque session Claude Code</span>
+</div>
+<p class="text-xs text-stone-500 mb-3" data-i18n="claudemd_help">Préférences globales injectées dans chaque conversation Claude Code (~/.claude/CLAUDE.md)</p>
+<textarea id="claudemd-textarea" class="w-full p-3 border border-stone-200 rounded-lg font-mono text-xs h-64 focus:outline-none focus:border-stone-400" spellcheck="false" data-i18n-placeholder="claudemd_placeholder" placeholder="# Mes préférences globales pour Claude Code..."></textarea>
+<div class="flex items-center justify-between mt-2">
+<span class="text-xs text-stone-400"><span id="claudemd-count">0</span> <span data-i18n="characters">caractères</span></span>
+<button onclick="saveClaudeMd()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium" data-i18n="btn_save">Sauvegarder</button>
+</div>
+</section>
+<section class="card p-6 mt-6">
+<div class="flex items-baseline justify-between mb-1">
+<h2 class="text-lg font-semibold"><span class="font-mono">settings.json</span></h2>
+<span class="text-xs text-stone-400" data-i18n="settings_meta">Configuration globale Claude Code (~/.claude/settings.json)</span>
+</div>
+<p class="text-xs text-stone-500 mb-3" data-i18n="settings_help">Le JSON est validé avant sauvegarde, et un backup horodaté est créé.</p>
+<textarea id="settings-textarea" class="w-full p-3 border border-stone-200 rounded-lg font-mono text-xs h-72 focus:outline-none focus:border-stone-400" spellcheck="false" oninput="validateSettingsLive()"></textarea>
+<div class="flex items-center justify-between mt-2">
+<span id="settings-status" class="text-xs"></span>
+<button onclick="saveSettings()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium" data-i18n="btn_save">Sauvegarder</button>
+</div>
 </section>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
 <section class="card p-6">
@@ -1186,6 +1460,21 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <button onclick="restartClaude()" class="px-4 py-2 text-sm rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 font-medium" data-i18n="restart_claude">Redémarrer Claude</button>
 <button onclick="closeMcpError()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50" data-i18n="btn_close">Fermer</button>
 </div>
+</div>
+</div>
+</div>
+<div id="cmd-edit-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
+<div class="card p-6 w-[720px] max-w-[92vw] max-h-[85vh] overflow-y-auto">
+<div class="flex items-baseline justify-between mb-3">
+<h3 class="text-lg font-semibold"><span id="cmd-edit-name" class="font-mono"></span></h3>
+<button onclick="closeCmdEdit()" class="text-stone-400 hover:text-stone-700 text-xl leading-none px-2">&times;</button>
+</div>
+<p class="text-xs text-stone-500 mb-3"><span data-i18n="source_label">Source</span> : <span id="cmd-edit-source" class="font-mono"></span></p>
+<input id="cmd-edit-name-input" type="hidden" />
+<textarea id="cmd-edit-content" class="w-full p-3 border border-stone-200 rounded-lg font-mono text-xs h-72 focus:outline-none focus:border-stone-400" spellcheck="false"></textarea>
+<div class="flex gap-2 justify-end mt-3">
+<button onclick="closeCmdEdit()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50" data-i18n="btn_close">Fermer</button>
+<button id="cmd-edit-save" onclick="saveCommand()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium" data-i18n="btn_save">Sauvegarder</button>
 </div>
 </div>
 </div>
@@ -1297,6 +1586,37 @@ fr: {
   plugin_empty: "vide",
   plugin_no_content: "Aucun contenu détecté.",
   empty_capture: "(vide)",
+  commands: "Commands",
+  commands_help: "Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs",
+  commands_empty: "Aucune command. Crée-en une avec « + » ou installe un plugin qui en fournit.",
+  source_label: "Source",
+  source_user: "Utilisateur",
+  source_plugin: "Plugin",
+  toggle_command_title: "Activer / désactiver",
+  btn_edit: "Modifier",
+  btn_view: "Voir",
+  readonly: "lecture seule",
+  command_not_found: "Command introuvable",
+  claudemd_meta: "Lu à chaque session Claude Code",
+  claudemd_help: "Préférences globales injectées dans chaque conversation Claude Code (~/.claude/CLAUDE.md)",
+  claudemd_placeholder: "# Mes préférences globales pour Claude Code...",
+  characters: "caractères",
+  settings_meta: "Configuration globale Claude Code (~/.claude/settings.json)",
+  settings_help: "Le JSON est validé avant sauvegarde, et un backup horodaté est créé.",
+  json_valid: "JSON valide",
+  json_invalid: "JSON invalide",
+  overview: "Vue d'ensemble",
+  active_preset: "Preset actif",
+  presets_label: "preset(s)",
+  stat_mcps_running: "MCPs running",
+  stat_skills: "Skills actifs",
+  stat_plugins: "Plugins actifs",
+  stat_commands: "Commands user + plugin",
+  issue_mcps_not_running: "MCP(s) actifs mais non démarrés",
+  issue_orphans: "version(s) orpheline(s) de plugin",
+  issue_duplicates: "doublon(s) skill / plugin",
+  issue_skill_no_frontmatter: "skill(s) sans frontmatter",
+  health_all_good: "Tout est en ordre.",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -1392,6 +1712,37 @@ en: {
   plugin_empty: "empty",
   plugin_no_content: "No content detected.",
   empty_capture: "(empty)",
+  commands: "Commands",
+  commands_help: "User commands (~/.claude/commands/) and those provided by active plugins",
+  commands_empty: 'No command. Create one with "+" or install a plugin that ships them.',
+  source_label: "Source",
+  source_user: "User",
+  source_plugin: "Plugin",
+  toggle_command_title: "Enable / disable",
+  btn_edit: "Edit",
+  btn_view: "View",
+  readonly: "read-only",
+  command_not_found: "Command not found",
+  claudemd_meta: "Read at each Claude Code session",
+  claudemd_help: "Global preferences injected into every Claude Code conversation (~/.claude/CLAUDE.md)",
+  claudemd_placeholder: "# My global preferences for Claude Code...",
+  characters: "characters",
+  settings_meta: "Global Claude Code config (~/.claude/settings.json)",
+  settings_help: "JSON is validated before saving, and a timestamped backup is created.",
+  json_valid: "Valid JSON",
+  json_invalid: "Invalid JSON",
+  overview: "Overview",
+  active_preset: "Active preset",
+  presets_label: "preset(s)",
+  stat_mcps_running: "MCPs running",
+  stat_skills: "Active skills",
+  stat_plugins: "Active plugins",
+  stat_commands: "Commands user + plugin",
+  issue_mcps_not_running: "active MCP(s) not running",
+  issue_orphans: "orphan plugin version(s)",
+  issue_duplicates: "skill / plugin duplicate(s)",
+  issue_skill_no_frontmatter: "skill(s) without frontmatter",
+  health_all_good: "All clear.",
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -1412,6 +1763,8 @@ function applyLang(lang){
   if(typeof loadState==='function') loadState();
   if(typeof loadPlugins==='function') loadPlugins();
   if(typeof loadPresets==='function') loadPresets();
+  if(typeof loadCommands==='function') loadCommands();
+  if(typeof loadOverview==='function') loadOverview();
 }
 function setLang(lang){applyLang(lang);}
 let CURRENT_STATE = {mcps:[], skills:[]};
@@ -1517,6 +1870,143 @@ async function cleanupOrphan(fn, version){
   const j = await api('/api/plugin-cleanup',{name:fn, version:version});
   banner(j.success?'green':'red',j.message);
   if(j.success){loadPlugins();}
+}
+function statBox(value, label, color){
+  return `<div class="p-3 rounded-lg border ${color}"><div class="text-2xl font-semibold leading-none mb-1">${value}</div><div class="text-xs text-stone-500">${label}</div></div>`;
+}
+async function loadOverview(){
+  try{
+    const r = await fetch('/api/overview');
+    if(!r.ok) return;
+    const o = await r.json();
+    const s = o.stats || {};
+    const h = o.health || {};
+    const stats = document.getElementById('overview-stats');
+    if(stats){
+      stats.innerHTML =
+        statBox(`${s.mcps_running}/${s.mcps_active}`, tr('stat_mcps_running'), s.mcps_failing>0?'border-amber-200 bg-amber-50':'border-green-200 bg-green-50') +
+        statBox(`${s.skills_active}/${s.skills_total}`, tr('stat_skills'), 'border-stone-200 bg-stone-50') +
+        statBox(`${s.plugins_enabled}/${s.plugins_total}`, tr('stat_plugins'), 'border-stone-200 bg-stone-50') +
+        statBox(`${s.commands_user}+${s.commands_total - s.commands_user}`, tr('stat_commands'), 'border-stone-200 bg-stone-50');
+    }
+    const presetEl = document.getElementById('overview-preset');
+    if(presetEl){presetEl.textContent = o.active_preset ? `${tr('active_preset')} : ${o.active_preset}` : (o.presets_count>0 ? `${o.presets_count} ${tr('presets_label')}` : '');}
+    const healthEl = document.getElementById('overview-health');
+    if(healthEl){
+      const issues = [];
+      if(h.mcps_failing && h.mcps_failing.length){
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-amber-50 border border-amber-200 text-amber-800"><span>&#9888;</span><span><strong>${h.mcps_failing.length}</strong> ${tr('issue_mcps_not_running')} : ${h.mcps_failing.map(n=>`<button onclick="showMcpError('${escAttr(n)}')" class="underline hover:no-underline font-mono">${escAttr(n)}</button>`).join(', ')}</span></div>`);
+      }
+      if(h.plugin_orphans && h.plugin_orphans.length){
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded text-white" style="background:linear-gradient(135deg,#D97757,#C15F3C)"><span>&#9888;</span><span><strong>${h.plugin_orphans.length}</strong> ${tr('issue_orphans')} : ${h.plugin_orphans.map(o=>`${escAttr(o.plugin)} v${escAttr(o.version)}`).join(', ')}</span></div>`);
+      }
+      if(h.duplicate_names && h.duplicate_names.length){
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-stone-100 border border-stone-200 text-stone-700"><span>&#8505;</span><span><strong>${h.duplicate_names.length}</strong> ${tr('issue_duplicates')} : ${h.duplicate_names.map(n=>`<span class="font-mono">${escAttr(n)}</span>`).join(', ')}</span></div>`);
+      }
+      if(h.skill_issues && h.skill_issues.length){
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-stone-50 border border-stone-200 text-stone-600"><span>&#8505;</span><span><strong>${h.skill_issues.length}</strong> ${tr('issue_skill_no_frontmatter')} : ${h.skill_issues.map(s=>`<span class="font-mono">${escAttr(s.name)}</span>`).join(', ')}</span></div>`);
+      }
+      healthEl.innerHTML = issues.length ? `<div class="space-y-2">${issues.join('')}</div>` : `<div class="text-xs text-green-700 bg-green-50 border border-green-200 rounded p-2 flex items-center gap-2"><span>&#9989;</span><span>${tr('health_all_good')}</span></div>`;
+    }
+  }catch(e){console.error(e);}
+}
+async function loadSettings(){
+  try{
+    const r = await fetch('/api/settings');
+    if(!r.ok) return;
+    const d = await r.json();
+    const ta = document.getElementById('settings-textarea');
+    if(!ta) return;
+    ta.value = d.content || '{}';
+    validateSettingsLive();
+  }catch(e){console.error(e);}
+}
+function validateSettingsLive(){
+  const ta = document.getElementById('settings-textarea');
+  const status = document.getElementById('settings-status');
+  if(!ta || !status) return;
+  if(!ta.value.trim()){status.textContent = ''; ta.classList.remove('border-red-300'); return;}
+  try{JSON.parse(ta.value); status.textContent = '✓ ' + tr('json_valid'); status.className='text-xs text-green-700'; ta.classList.remove('border-red-300');}
+  catch(e){status.textContent = '✗ ' + e.message; status.className='text-xs text-red-700'; ta.classList.add('border-red-300');}
+}
+async function saveSettings(){
+  const ta = document.getElementById('settings-textarea');
+  try{JSON.parse(ta.value);}catch(e){banner('red', tr('json_invalid')+' : '+e.message); return;}
+  const j = await api('/api/save-settings', {content: ta.value});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadPlugins();}
+}
+async function loadClaudeMd(){
+  try{
+    const r = await fetch('/api/claude-md');
+    if(!r.ok) return;
+    const d = await r.json();
+    const ta = document.getElementById('claudemd-textarea');
+    if(!ta) return;
+    ta.value = d.content || '';
+    document.getElementById('claudemd-count').textContent = (d.content || '').length;
+    ta.oninput = ()=>{document.getElementById('claudemd-count').textContent = ta.value.length;};
+  }catch(e){console.error(e);}
+}
+async function saveClaudeMd(){
+  const ta = document.getElementById('claudemd-textarea');
+  const j = await api('/api/save-claude-md', {content: ta.value});
+  banner(j.success?'green':'red', j.message);
+}
+async function loadCommands(){
+  try{
+    const j = await (await fetch('/api/commands')).json();
+    const commands = j.commands || [];
+    const list = document.getElementById('commands');
+    if(!list) return;
+    if(commands.length===0){list.innerHTML = `<p class="text-xs text-stone-400">${tr('commands_empty')}</p>`;return;}
+    list.innerHTML = commands.map(c=>{
+      const ne = escAttr(c.name);
+      const sourceLabel = c.source==='user' ? tr('source_user') : c.source.replace(/^plugin:/, tr('source_plugin')+' ');
+      const actions = c.editable
+        ? `<input type="checkbox" ${c.active?'checked':''} onchange="toggleCommand('${ne}')" class="w-5 h-5 rounded accent-green-700" title="${tr('toggle_command_title')}"><button onclick="editCommand('${ne}','${escAttr(c.source)}')" class="text-xs text-stone-700 hover:text-stone-900 font-medium">${tr('btn_edit')}</button>`
+        : `<button onclick="editCommand('${ne}','${escAttr(c.source)}')" class="text-xs text-stone-500 hover:text-stone-700 font-medium">${tr('btn_view')}</button>`;
+      const opacity = c.active ? '' : 'opacity-60';
+      return `<div class="flex items-center justify-between gap-3 p-3 rounded-lg border border-stone-200 ${opacity}">
+<div class="flex flex-col flex-1 min-w-0">
+<div class="flex items-baseline gap-2 flex-wrap">
+<span class="font-medium text-sm">/${ne}</span>
+<span class="text-xs text-stone-400">${escAttr(sourceLabel)}</span>
+${c.editable ? '' : `<span class="text-xs text-stone-400" data-i18n="readonly">${tr('readonly')}</span>`}
+</div>
+</div>
+<div class="flex items-center gap-2 shrink-0">${actions}</div>
+</div>`;
+    }).join('');
+  }catch(e){console.error(e);}
+}
+async function toggleCommand(name){
+  const j = await api('/api/toggle-command', {name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success) loadCommands();
+}
+async function editCommand(name, source){
+  try{
+    const r = await fetch('/api/command/' + encodeURIComponent(name) + '?source=' + encodeURIComponent(source));
+    if(!r.ok){banner('red', tr('command_not_found'));return;}
+    const d = await r.json();
+    document.getElementById('cmd-edit-name').textContent = '/' + d.name;
+    document.getElementById('cmd-edit-source').textContent = d.source==='user' ? tr('source_user') : d.source.replace(/^plugin:/, tr('source_plugin')+' ');
+    document.getElementById('cmd-edit-content').value = d.content || '';
+    document.getElementById('cmd-edit-content').readOnly = !d.editable;
+    document.getElementById('cmd-edit-save').classList.toggle('hidden', !d.editable);
+    document.getElementById('cmd-edit-name-input').value = d.name;
+    document.getElementById('cmd-edit-modal').classList.remove('hidden');
+  }catch(e){banner('red', tr('net_error') + e);}
+}
+function closeCmdEdit(){document.getElementById('cmd-edit-modal').classList.add('hidden');}
+async function saveCommand(){
+  const name = document.getElementById('cmd-edit-name-input').value.trim();
+  const content = document.getElementById('cmd-edit-content').value;
+  if(!name){banner('red', tr('banner_name_required'));return;}
+  const j = await api('/api/save-command', {name:name, content:content});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){closeCmdEdit();loadCommands();}
 }
 async function loadPresets(){
   try{
@@ -1688,7 +2178,7 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-applyLang(CURRENT_LANG);loadState();loadPresets();loadPlugins();checkUpdate();setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(checkUpdate,3600000);
+applyLang(CURRENT_LANG);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
 
@@ -1731,6 +2221,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             lang = (qs.get("lang", ["fr"])[0] or "fr").lower()
             if lang not in ("fr", "en"): lang = "fr"
             self._json(read_mcp_error(name, lang))
+        elif path == "/api/commands":
+            self._json({"commands": list_commands()})
+        elif path == "/api/claude-md":
+            self._json(read_claude_md())
+        elif path == "/api/settings":
+            self._json(read_settings_raw())
+        elif path == "/api/overview":
+            self._json(get_overview())
+        elif path.startswith("/api/command/"):
+            qs = parse_qs(urlparse(self.path).query)
+            source = qs.get("source", ["user"])[0]
+            name = unquote(path[len("/api/command/"):])
+            ok, payload = get_command(name, source)
+            if ok:
+                self._json(payload)
+            else:
+                self._json({"error": payload}, status=404)
         else:
             self.send_response(404); self.end_headers()
 
@@ -1771,6 +2278,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/plugin-cleanup": lambda: cleanup_plugin_orphan(data.get("name", ""), data.get("version", "")),
             "/api/mcp-test": lambda: test_mcp(data.get("name", ""), data.get("lang", "fr")),
             "/api/mcp-set-env": lambda: set_mcp_env(data.get("name", ""), data.get("var", ""), data.get("value", "")),
+            "/api/toggle-command": lambda: toggle_command(data.get("name", "")),
+            "/api/save-command": lambda: save_command(data.get("name", ""), data.get("content", "")),
+            "/api/save-claude-md": lambda: save_claude_md(data.get("content", "")),
+            "/api/save-settings": lambda: save_settings(data.get("content", "")),
         }
         if path in routes:
             try:
