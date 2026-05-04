@@ -249,6 +249,70 @@ def toggle_command(name):
     return False, f"Command '{name}' introuvable"
 
 
+def get_overview():
+    """Vue agregee : stats + health checks (orphans, MCPs en erreur, doublons,
+    skills sans frontmatter, preset actif si applicable)."""
+    state = get_state()
+    plugins = []
+    try:
+        plugins = list_plugins()
+    except Exception:
+        pass
+    commands = []
+    try:
+        commands = list_commands()
+    except Exception:
+        pass
+    presets = list_presets()
+    active_preset = None
+    if isinstance(presets, dict):
+        active_mcp_names = sorted(m["name"] for m in state["mcps"] if m["active"])
+        for pname, pmcps in presets.items():
+            if sorted(pmcps) == active_mcp_names:
+                active_preset = pname
+                break
+    plugin_orphans = []
+    for p in plugins:
+        for v in p.get("extra_versions", []):
+            plugin_orphans.append({"plugin": p["full_name"], "version": v})
+    skill_issues = []
+    for sk in state["skills"]:
+        if not sk.get("description") and not sk.get("category"):
+            skill_issues.append({"name": sk["name"], "reason": "sans frontmatter"})
+    skill_names = {sk["name"] for sk in state["skills"]}
+    plugin_skill_names = set()
+    for p in plugins:
+        for s in (p.get("contents", {}).get("skills") or []):
+            plugin_skill_names.add(s)
+    duplicates = sorted(skill_names & plugin_skill_names)
+    mcps_active = [m for m in state["mcps"] if m["active"]]
+    mcps_running = [m for m in mcps_active if m["running"]]
+    mcps_failing = [m["name"] for m in mcps_active if not m["running"]]
+    plugins_enabled = sum(1 for p in plugins if p.get("enabled"))
+    return {
+        "stats": {
+            "mcps_total": len(state["mcps"]),
+            "mcps_active": len(mcps_active),
+            "mcps_running": len(mcps_running),
+            "mcps_failing": len(mcps_failing),
+            "skills_total": len(state["skills"]),
+            "skills_active": sum(1 for s in state["skills"] if s["active"]),
+            "plugins_total": len(plugins),
+            "plugins_enabled": plugins_enabled,
+            "commands_total": len(commands),
+            "commands_user": sum(1 for c in commands if c["source"] == "user"),
+        },
+        "active_preset": active_preset,
+        "presets_count": len(presets),
+        "health": {
+            "plugin_orphans": plugin_orphans,
+            "mcps_failing": mcps_failing,
+            "skill_issues": skill_issues,
+            "duplicate_names": duplicates,
+        },
+    }
+
+
 def read_settings_raw():
     if not SETTINGS_FILE.exists():
         return {"content": "{}", "exists": False, "size": 2, "path": str(SETTINGS_FILE)}
@@ -1243,6 +1307,14 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <span>&#x21bb;</span><span data-i18n="restart_claude">Redémarrer Claude</span></button>
 </div></header>
 <div id="banner" class="hidden mb-4 p-3 rounded-lg text-sm border"></div>
+<section class="card p-6 mb-6">
+<div class="flex items-baseline justify-between mb-3">
+<h2 class="text-lg font-semibold" data-i18n="overview">Vue d'ensemble</h2>
+<span id="overview-preset" class="text-xs text-stone-500"></span>
+</div>
+<div id="overview-stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4"></div>
+<div id="overview-health"></div>
+</section>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
 <section class="card p-6"><h2 class="text-lg font-semibold mb-1" data-i18n="mcp_section">Serveurs MCP</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="mcp_help">Coché = chargé au démarrage de Claude Desktop</p>
@@ -1533,6 +1605,18 @@ fr: {
   settings_help: "Le JSON est validé avant sauvegarde, et un backup horodaté est créé.",
   json_valid: "JSON valide",
   json_invalid: "JSON invalide",
+  overview: "Vue d'ensemble",
+  active_preset: "Preset actif",
+  presets_label: "preset(s)",
+  stat_mcps_running: "MCPs running",
+  stat_skills: "Skills actifs",
+  stat_plugins: "Plugins actifs",
+  stat_commands: "Commands user + plugin",
+  issue_mcps_not_running: "MCP(s) actifs mais non démarrés",
+  issue_orphans: "version(s) orpheline(s) de plugin",
+  issue_duplicates: "doublon(s) skill / plugin",
+  issue_skill_no_frontmatter: "skill(s) sans frontmatter",
+  health_all_good: "Tout est en ordre.",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -1647,6 +1731,18 @@ en: {
   settings_help: "JSON is validated before saving, and a timestamped backup is created.",
   json_valid: "Valid JSON",
   json_invalid: "Invalid JSON",
+  overview: "Overview",
+  active_preset: "Active preset",
+  presets_label: "preset(s)",
+  stat_mcps_running: "MCPs running",
+  stat_skills: "Active skills",
+  stat_plugins: "Active plugins",
+  stat_commands: "Commands user + plugin",
+  issue_mcps_not_running: "active MCP(s) not running",
+  issue_orphans: "orphan plugin version(s)",
+  issue_duplicates: "skill / plugin duplicate(s)",
+  issue_skill_no_frontmatter: "skill(s) without frontmatter",
+  health_all_good: "All clear.",
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -1668,6 +1764,7 @@ function applyLang(lang){
   if(typeof loadPlugins==='function') loadPlugins();
   if(typeof loadPresets==='function') loadPresets();
   if(typeof loadCommands==='function') loadCommands();
+  if(typeof loadOverview==='function') loadOverview();
 }
 function setLang(lang){applyLang(lang);}
 let CURRENT_STATE = {mcps:[], skills:[]};
@@ -1773,6 +1870,45 @@ async function cleanupOrphan(fn, version){
   const j = await api('/api/plugin-cleanup',{name:fn, version:version});
   banner(j.success?'green':'red',j.message);
   if(j.success){loadPlugins();}
+}
+function statBox(value, label, color){
+  return `<div class="p-3 rounded-lg border ${color}"><div class="text-2xl font-semibold leading-none mb-1">${value}</div><div class="text-xs text-stone-500">${label}</div></div>`;
+}
+async function loadOverview(){
+  try{
+    const r = await fetch('/api/overview');
+    if(!r.ok) return;
+    const o = await r.json();
+    const s = o.stats || {};
+    const h = o.health || {};
+    const stats = document.getElementById('overview-stats');
+    if(stats){
+      stats.innerHTML =
+        statBox(`${s.mcps_running}/${s.mcps_active}`, tr('stat_mcps_running'), s.mcps_failing>0?'border-amber-200 bg-amber-50':'border-green-200 bg-green-50') +
+        statBox(`${s.skills_active}/${s.skills_total}`, tr('stat_skills'), 'border-stone-200 bg-stone-50') +
+        statBox(`${s.plugins_enabled}/${s.plugins_total}`, tr('stat_plugins'), 'border-stone-200 bg-stone-50') +
+        statBox(`${s.commands_user}+${s.commands_total - s.commands_user}`, tr('stat_commands'), 'border-stone-200 bg-stone-50');
+    }
+    const presetEl = document.getElementById('overview-preset');
+    if(presetEl){presetEl.textContent = o.active_preset ? `${tr('active_preset')} : ${o.active_preset}` : (o.presets_count>0 ? `${o.presets_count} ${tr('presets_label')}` : '');}
+    const healthEl = document.getElementById('overview-health');
+    if(healthEl){
+      const issues = [];
+      if(h.mcps_failing && h.mcps_failing.length){
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-amber-50 border border-amber-200 text-amber-800"><span>&#9888;</span><span><strong>${h.mcps_failing.length}</strong> ${tr('issue_mcps_not_running')} : ${h.mcps_failing.map(n=>`<button onclick="showMcpError('${escAttr(n)}')" class="underline hover:no-underline font-mono">${escAttr(n)}</button>`).join(', ')}</span></div>`);
+      }
+      if(h.plugin_orphans && h.plugin_orphans.length){
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded text-white" style="background:linear-gradient(135deg,#D97757,#C15F3C)"><span>&#9888;</span><span><strong>${h.plugin_orphans.length}</strong> ${tr('issue_orphans')} : ${h.plugin_orphans.map(o=>`${escAttr(o.plugin)} v${escAttr(o.version)}`).join(', ')}</span></div>`);
+      }
+      if(h.duplicate_names && h.duplicate_names.length){
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-stone-100 border border-stone-200 text-stone-700"><span>&#8505;</span><span><strong>${h.duplicate_names.length}</strong> ${tr('issue_duplicates')} : ${h.duplicate_names.map(n=>`<span class="font-mono">${escAttr(n)}</span>`).join(', ')}</span></div>`);
+      }
+      if(h.skill_issues && h.skill_issues.length){
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-stone-50 border border-stone-200 text-stone-600"><span>&#8505;</span><span><strong>${h.skill_issues.length}</strong> ${tr('issue_skill_no_frontmatter')} : ${h.skill_issues.map(s=>`<span class="font-mono">${escAttr(s.name)}</span>`).join(', ')}</span></div>`);
+      }
+      healthEl.innerHTML = issues.length ? `<div class="space-y-2">${issues.join('')}</div>` : `<div class="text-xs text-green-700 bg-green-50 border border-green-200 rounded p-2 flex items-center gap-2"><span>&#9989;</span><span>${tr('health_all_good')}</span></div>`;
+    }
+  }catch(e){console.error(e);}
 }
 async function loadSettings(){
   try{
@@ -2042,7 +2178,7 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-applyLang(CURRENT_LANG);loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();checkUpdate();setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(checkUpdate,3600000);
+applyLang(CURRENT_LANG);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
 
@@ -2091,6 +2227,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(read_claude_md())
         elif path == "/api/settings":
             self._json(read_settings_raw())
+        elif path == "/api/overview":
+            self._json(get_overview())
         elif path.startswith("/api/command/"):
             qs = parse_qs(urlparse(self.path).query)
             source = qs.get("source", ["user"])[0]
