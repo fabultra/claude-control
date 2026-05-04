@@ -276,6 +276,45 @@ def delete_skill(name):
     return True, f"Skill '{name}' supprimé (backup : {backup.name})"
 
 
+def restart_mcp(name):
+    """Redémarre un MCP sans toucher à Claude Desktop : kill le process puis
+    toggle off/on dans claude_desktop_config.json (Claude Desktop surveille ce
+    fichier, le toggle déclenche un respawn du MCP par son host MCP)."""
+    if not name:
+        return False, "Nom MCP requis"
+    config = load_config()
+    is_active = name in config.get("mcpServers", {})
+    is_disabled = name in config.get("_disabledMcps", {})
+    if not (is_active or is_disabled):
+        return False, f"MCP '{name}' introuvable"
+    pids = _mcp_pids(name) if "_mcp_pids" in globals() else []
+    my_pid = os.getpid()
+    killed = 0
+    for pid in pids:
+        if pid == my_pid:
+            continue
+        try:
+            os.kill(pid, 9)
+            killed += 1
+        except Exception:
+            pass
+    if is_active:
+        config = load_config()
+        active = config.setdefault("mcpServers", {})
+        disabled = config.setdefault("_disabledMcps", {})
+        disabled[name] = active.pop(name)
+        save_config(config)
+        time.sleep(1.5)
+        config = load_config()
+        active = config.setdefault("mcpServers", {})
+        disabled = config.setdefault("_disabledMcps", {})
+        if name in disabled:
+            active[name] = disabled.pop(name)
+            save_config(config)
+        return True, f"MCP '{name}' redémarré (killed {killed}, config togglée)"
+    return True, f"MCP '{name}' inactif : {killed} process killed, rien d'autre à faire"
+
+
 def delete_mcp(name):
     if not name:
         return False, "Nom requis"
@@ -715,12 +754,12 @@ def _watchdog_loop():
                         # the last 2 * interval seconds.
                         window = max(60, interval * 2)
                         if _mcp_log_says_frozen(target, within_seconds=window):
-                            _watchdog_event("kill_mcp", f"MCP '{target}' shows freeze markers in log, killing PIDs to force respawn")
-                            for pid in pids:
-                                try:
-                                    os.kill(pid, 9)
-                                except Exception:
-                                    pass
+                            _watchdog_event("restart_mcp", f"MCP '{target}' shows freeze markers, restarting")
+                            try:
+                                ok, msg = restart_mcp(target)
+                                _watchdog_event("restart_mcp_result", msg if ok else f"failed: {msg}")
+                            except Exception as e:
+                                _watchdog_event("restart_mcp_error", str(e))
         except Exception as e:
             _log(f"watchdog loop error: {e}")
             interval = 30
@@ -2333,6 +2372,8 @@ fr: {
   watchdog_crash: "Redémarrer si crash",
   watchdog_freeze: "Détecter freeze + redémarrer",
   watchdog_target_label: "Cible",
+  btn_restart_mcp: "Redémarrer ce MCP (sans toucher à Claude)",
+  confirm_restart_mcp: "Redémarrer le MCP « {name} » ?\\n\\nLe process sera tué puis Claude Desktop le respawn automatiquement (toggle config). Tes conversations Claude restent intactes.",
   claude_running: "Claude tourne",
   claude_stopped: "Claude arrêté",
   tab_overview: "Vue d'ensemble",
@@ -2493,6 +2534,8 @@ en: {
   watchdog_crash: "Restart on crash",
   watchdog_freeze: "Detect freeze + restart",
   watchdog_target_label: "Target",
+  btn_restart_mcp: "Restart this MCP (without touching Claude)",
+  confirm_restart_mcp: 'Restart MCP "{name}"?\\n\\nThe process will be killed and Claude Desktop will respawn it automatically (config toggle). Your Claude conversations stay intact.',
   claude_running: "Claude running",
   claude_stopped: "Claude stopped",
   tab_overview: "Overview",
@@ -2555,7 +2598,7 @@ let CURRENT_STATE = {mcps:[], skills:[]};
 async function loadState(){
   const s = await (await fetch('/api/state')).json();
   CURRENT_STATE = s;
-  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>`<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" title="${tr('btn_delete')}" class="text-stone-400 hover:text-red-600 hover:bg-red-50 rounded px-2 py-1 text-base leading-none shrink-0">&times;</button></label>`).join('');
+  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>`<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="text-stone-400 hover:text-amber-700 hover:bg-amber-50 rounded px-2 py-1 text-sm leading-none shrink-0">&#x21bb;</button><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" title="${tr('btn_delete')}" class="text-stone-400 hover:text-red-600 hover:bg-red-50 rounded px-2 py-1 text-base leading-none shrink-0">&times;</button></label>`).join('');
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
 }
@@ -2683,6 +2726,13 @@ async function deleteSkill(name){
   const j = await api('/api/delete-skill', {name:name});
   banner(j.success?'green':'red', j.message);
   if(j.success){loadState();loadOverview();}
+}
+async function restartMcp(name){
+  if(!confirm(tr('confirm_restart_mcp').split('{name}').join(name)))return;
+  banner('blue', tr('banner_restarting'));
+  const j = await api('/api/restart-mcp', {name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadState();}
 }
 async function deleteMcp(name){
   if(!confirm(tr('confirm_delete_mcp').split('{name}').join(name)))return;
@@ -3217,6 +3267,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/save-settings": lambda: save_settings(data.get("content", "")),
             "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
+            "/api/restart-mcp": lambda: restart_mcp(data.get("name", "")),
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
             "/api/watchdog-config": lambda: save_watchdog_config(data),
