@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Claude Control - app locale pour gerer MCPs et Skills de Claude Desktop."""
-import http.server, io, json, re, shutil, socketserver, subprocess, tempfile, time, webbrowser, zipfile
+import http.server, io, json, os, re, shutil, socketserver, subprocess, sys, tempfile, threading, time, traceback, webbrowser, zipfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -24,6 +24,16 @@ ORPHAN_BACKUP_DIR = BACKUP_DIR / "orphan-plugins"
 
 VERSION_FILE = HOME / "dev/claude-control/version.txt"
 GITHUB_REPO_FILE = HOME / "dev/claude-control/.github-repo"
+LOG_FILE = HOME / "Library/Logs/claude-control.log"
+
+
+def _log(msg):
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass
 
 
 def load_config():
@@ -687,7 +697,30 @@ def apply_update():
             shutil.copy2(src, dst)
         except Exception as e:
             return False, f"Echec copie : {e}"
-    return True, "Mis a jour. Quitte et relance Claude Control pour appliquer."
+    return True, "Mis a jour. Redemarrage automatique..."
+
+
+def _apply_update_then_restart():
+    ok, msg = apply_update()
+    if ok:
+        restart_self()
+        return True, msg + " (redemarrage en cours)"
+    return ok, msg
+
+
+def restart_self():
+    """Replace the running process image with a fresh python running this script.
+    The .app launcher sees the same PID continuing — no "n'est plus ouverte" dialog."""
+    script = str(Path(__file__).resolve())
+    def _execv():
+        time.sleep(0.4)
+        try:
+            os.execv(sys.executable, [sys.executable, script])
+        except Exception as e:
+            _log(f"restart_self execv failed: {e}")
+            os._exit(0)
+    threading.Thread(target=_execv, daemon=True).start()
+    return True, "Redemarrage en cours..."
 
 
 HTML = r"""<!DOCTYPE html>
@@ -709,8 +742,11 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <p class="text-sm text-stone-500 mt-1">Sekoia &middot; Controle de Claude Desktop &middot; <span id="version" class="font-mono">v?</span></p>
 <div id="update-banner" class="hidden mt-3"><button onclick="applyUpdate()" class="update-badge text-white text-xs px-3 py-1.5 rounded-full font-medium hover:opacity-90"><span id="update-text">Update disponible</span></button></div>
 </div>
-<button onclick="restartClaude()" class="bg-stone-900 hover:bg-stone-800 text-white px-5 py-2.5 rounded-lg font-medium flex items-center gap-2 shrink-0">
-<span>&#x21bb;</span><span>Redemarrer Claude</span></button></header>
+<div class="flex gap-2 shrink-0">
+<button onclick="restartSelf()" class="bg-stone-100 hover:bg-stone-200 text-stone-700 px-3 py-2.5 rounded-lg text-sm font-medium" title="Redemarrer le serveur Claude Control">&#x21bb; App</button>
+<button onclick="restartClaude()" class="bg-stone-900 hover:bg-stone-800 text-white px-5 py-2.5 rounded-lg font-medium flex items-center gap-2">
+<span>&#x21bb;</span><span>Redemarrer Claude</span></button>
+</div></header>
 <div id="banner" class="hidden mb-4 p-3 rounded-lg text-sm border"></div>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
 <section class="card p-6"><h2 class="text-lg font-semibold mb-1">Serveurs MCP</h2>
@@ -936,7 +972,8 @@ async function api(path, body){
 async function toggleMcp(n){const j=await api('/api/toggle-mcp',{name:n});banner(j.success?'green':'red',j.message);loadState();}
 async function toggleSkill(n){const j=await api('/api/toggle-skill',{name:n});banner(j.success?'green':'red',j.message);loadState();}
 async function restartClaude(){if(!confirm('Redemarrer Claude Desktop ?'))return;banner('blue','Redemarrage...');const j=await api('/api/restart-claude');banner(j.success?'green':'red',j.message);setTimeout(loadState,4000);}
-async function applyUpdate(){if(!confirm('Mettre a jour Claude Control ? Tu devras quitter et relancer l\'app.'))return;banner('blue','Mise a jour...');const j=await api('/api/apply-update');banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('update-banner').classList.add('hidden');}}
+async function restartSelf(){if(!confirm('Redemarrer le serveur Claude Control ?'))return;banner('blue','Redemarrage...');try{await api('/api/restart-self');}catch(e){}setTimeout(()=>{banner('green','Reconnexion...');location.reload();}, 1500);}
+async function applyUpdate(){if(!confirm('Mettre a jour Claude Control ? L\'app va se relancer toute seule.'))return;banner('blue','Mise a jour...');try{const j=await api('/api/apply-update');if(!j.success){banner('red',j.message);return;}banner('green',j.message);}catch(e){}setTimeout(()=>{banner('blue','Reconnexion...');location.reload();}, 2500);}
 async function addMcpJson(){const v=document.getElementById('mcp-json-in').value.trim();if(!v)return;const j=await api('/api/import-mcp-json',{json:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('mcp-json-in').value='';loadState();}}
 async function addMcpFile(){const v=document.getElementById('mcp-file-in').value.trim();if(!v)return;const j=await api('/api/import-mcp-file',{path:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('mcp-file-in').value='';loadState();}}
 async function addMcpGit(){const v=document.getElementById('mcp-git-in').value.trim();if(!v)return;banner('blue','Clonage...');const j=await api('/api/import-mcp-git',{url:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('mcp-git-in').value='';loadState();}}
@@ -1050,7 +1087,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/toggle-mcp": lambda: toggle_mcp(data.get("name", "")),
             "/api/toggle-skill": lambda: toggle_skill(data.get("name", "")),
             "/api/restart-claude": lambda: restart_claude(),
-            "/api/apply-update": lambda: apply_update(),
+            "/api/restart-self": lambda: restart_self(),
+            "/api/apply-update": lambda: _apply_update_then_restart(),
             "/api/import-mcp-json": lambda: import_mcp_json(data.get("json", "")),
             "/api/import-mcp-file": lambda: import_mcp_file(data.get("path", "")),
             "/api/import-mcp-git": lambda: import_mcp_git(data.get("url", "")),
@@ -1076,25 +1114,63 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return
 
 
+def _show_dialog(message):
+    """Show a macOS dialog via osascript. Best-effort, no-op elsewhere."""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display dialog "{message}" buttons {{"OK"}} with icon stop with title "Claude Control"'],
+            check=False, timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _stay_alive_for_app():
+    """When the .app launcher's python would otherwise exit, sleep instead so
+    macOS does not show the 'L'application n'est plus ouverte' dialog."""
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+
+
 def main():
     SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     print(f"\n  Claude Control v{get_local_version()} - http://localhost:{PORT}")
     print(f"  Cmd+C pour arreter\n")
-    webbrowser.open(f"http://localhost:{PORT}")
     socketserver.TCPServer.allow_reuse_address = True
     try:
-        with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as server:
+        server = socketserver.TCPServer(("127.0.0.1", PORT), Handler)
+    except OSError as e:
+        if e.errno in (48, 98, 10048):
+            _log(f"port {PORT} already in use, opening browser to existing instance")
+            print(f"  Port {PORT} deja utilise. Ouverture du navigateur...")
+            webbrowser.open(f"http://localhost:{PORT}")
+            _stay_alive_for_app()
+            return
+        raise
+    webbrowser.open(f"http://localhost:{PORT}")
+    try:
+        with server:
             server.serve_forever()
     except KeyboardInterrupt:
         print("\n  Au revoir.")
-    except OSError as e:
-        if e.errno == 48:
-            print(f"\n  Port {PORT} deja utilise.")
-            webbrowser.open(f"http://localhost:{PORT}")
-        else:
-            raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        _log("startup crash:\n" + tb)
+        _show_dialog(
+            f"Claude Control a crashe au demarrage.\\n\\n"
+            f"Log : ~/Library/Logs/claude-control.log\\n\\n"
+            f"Premiere ligne : {tb.splitlines()[-1][:120]}"
+        )
+        _stay_alive_for_app()
