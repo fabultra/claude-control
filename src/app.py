@@ -249,6 +249,38 @@ def toggle_command(name):
     return False, f"Command '{name}' introuvable"
 
 
+def read_settings_raw():
+    if not SETTINGS_FILE.exists():
+        return {"content": "{}", "exists": False, "size": 2, "path": str(SETTINGS_FILE)}
+    try:
+        text = SETTINGS_FILE.read_text(errors="replace")
+    except Exception as e:
+        return {"content": "", "exists": True, "size": 0, "path": str(SETTINGS_FILE), "error": str(e)}
+    return {"content": text, "exists": True, "size": len(text), "path": str(SETTINGS_FILE)}
+
+
+def save_settings(content):
+    if not isinstance(content, str):
+        return False, "Contenu invalide"
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        return False, f"JSON invalide : {e.msg} (ligne {e.lineno})"
+    if not isinstance(parsed, dict):
+        return False, "settings.json doit être un objet JSON"
+    if SETTINGS_FILE.exists():
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = BACKUP_DIR / f"settings.json.{ts}"
+        try:
+            shutil.copy2(SETTINGS_FILE, backup)
+        except Exception:
+            pass
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(content)
+    return True, f"settings.json enregistré ({len(content)} caractères)"
+
+
 def read_claude_md():
     if not CLAUDE_MD_FILE.exists():
         return {"content": "", "exists": False, "size": 0, "path": str(CLAUDE_MD_FILE)}
@@ -1252,6 +1284,18 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <button onclick="saveClaudeMd()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium" data-i18n="btn_save">Sauvegarder</button>
 </div>
 </section>
+<section class="card p-6 mt-6">
+<div class="flex items-baseline justify-between mb-1">
+<h2 class="text-lg font-semibold"><span class="font-mono">settings.json</span></h2>
+<span class="text-xs text-stone-400" data-i18n="settings_meta">Configuration globale Claude Code (~/.claude/settings.json)</span>
+</div>
+<p class="text-xs text-stone-500 mb-3" data-i18n="settings_help">Le JSON est validé avant sauvegarde, et un backup horodaté est créé.</p>
+<textarea id="settings-textarea" class="w-full p-3 border border-stone-200 rounded-lg font-mono text-xs h-72 focus:outline-none focus:border-stone-400" spellcheck="false" oninput="validateSettingsLive()"></textarea>
+<div class="flex items-center justify-between mt-2">
+<span id="settings-status" class="text-xs"></span>
+<button onclick="saveSettings()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium" data-i18n="btn_save">Sauvegarder</button>
+</div>
+</section>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
 <section class="card p-6">
 <h2 class="text-lg font-semibold mb-1" data-i18n="add_mcp">+ Ajouter un MCP</h2>
@@ -1485,6 +1529,10 @@ fr: {
   claudemd_help: "Préférences globales injectées dans chaque conversation Claude Code (~/.claude/CLAUDE.md)",
   claudemd_placeholder: "# Mes préférences globales pour Claude Code...",
   characters: "caractères",
+  settings_meta: "Configuration globale Claude Code (~/.claude/settings.json)",
+  settings_help: "Le JSON est validé avant sauvegarde, et un backup horodaté est créé.",
+  json_valid: "JSON valide",
+  json_invalid: "JSON invalide",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -1595,6 +1643,10 @@ en: {
   claudemd_help: "Global preferences injected into every Claude Code conversation (~/.claude/CLAUDE.md)",
   claudemd_placeholder: "# My global preferences for Claude Code...",
   characters: "characters",
+  settings_meta: "Global Claude Code config (~/.claude/settings.json)",
+  settings_help: "JSON is validated before saving, and a timestamped backup is created.",
+  json_valid: "Valid JSON",
+  json_invalid: "Invalid JSON",
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -1720,6 +1772,32 @@ async function cleanupOrphan(fn, version){
   if(!confirm(msg))return;
   const j = await api('/api/plugin-cleanup',{name:fn, version:version});
   banner(j.success?'green':'red',j.message);
+  if(j.success){loadPlugins();}
+}
+async function loadSettings(){
+  try{
+    const r = await fetch('/api/settings');
+    if(!r.ok) return;
+    const d = await r.json();
+    const ta = document.getElementById('settings-textarea');
+    if(!ta) return;
+    ta.value = d.content || '{}';
+    validateSettingsLive();
+  }catch(e){console.error(e);}
+}
+function validateSettingsLive(){
+  const ta = document.getElementById('settings-textarea');
+  const status = document.getElementById('settings-status');
+  if(!ta || !status) return;
+  if(!ta.value.trim()){status.textContent = ''; ta.classList.remove('border-red-300'); return;}
+  try{JSON.parse(ta.value); status.textContent = '✓ ' + tr('json_valid'); status.className='text-xs text-green-700'; ta.classList.remove('border-red-300');}
+  catch(e){status.textContent = '✗ ' + e.message; status.className='text-xs text-red-700'; ta.classList.add('border-red-300');}
+}
+async function saveSettings(){
+  const ta = document.getElementById('settings-textarea');
+  try{JSON.parse(ta.value);}catch(e){banner('red', tr('json_invalid')+' : '+e.message); return;}
+  const j = await api('/api/save-settings', {content: ta.value});
+  banner(j.success?'green':'red', j.message);
   if(j.success){loadPlugins();}
 }
 async function loadClaudeMd(){
@@ -1964,7 +2042,7 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-applyLang(CURRENT_LANG);loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();checkUpdate();setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(checkUpdate,3600000);
+applyLang(CURRENT_LANG);loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();checkUpdate();setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
 
@@ -2011,6 +2089,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"commands": list_commands()})
         elif path == "/api/claude-md":
             self._json(read_claude_md())
+        elif path == "/api/settings":
+            self._json(read_settings_raw())
         elif path.startswith("/api/command/"):
             qs = parse_qs(urlparse(self.path).query)
             source = qs.get("source", ["user"])[0]
@@ -2063,6 +2143,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/toggle-command": lambda: toggle_command(data.get("name", "")),
             "/api/save-command": lambda: save_command(data.get("name", ""), data.get("content", "")),
             "/api/save-claude-md": lambda: save_claude_md(data.get("content", "")),
+            "/api/save-settings": lambda: save_settings(data.get("content", "")),
         }
         if path in routes:
             try:
