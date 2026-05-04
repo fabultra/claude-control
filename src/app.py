@@ -16,6 +16,11 @@ BACKUP_DIR = HOME / ".claude/backups/claude-control"
 IMPORTED_REPOS_DIR = HOME / ".claude/imported-mcps"
 PRESETS_FILE = HOME / ".claude/claude-control-presets.json"
 
+PLUGINS_DIR = HOME / ".claude/plugins"
+INSTALLED_PLUGINS_FILE = PLUGINS_DIR / "installed_plugins.json"
+KNOWN_MARKETPLACES_FILE = PLUGINS_DIR / "known_marketplaces.json"
+SETTINGS_FILE = HOME / ".claude/settings.json"
+
 VERSION_FILE = HOME / "dev/claude-control/version.txt"
 GITHUB_REPO_FILE = HOME / "dev/claude-control/.github-repo"
 
@@ -57,25 +62,28 @@ def get_running_mcps():
     return running
 
 
-def read_skill_category(skill_dir):
+def read_skill_meta(skill_dir):
+    """Lit le frontmatter YAML d'un SKILL.md et retourne {category, description}."""
+    meta = {"category": None, "description": None}
     md = skill_dir / "SKILL.md"
     if not md.exists():
-        return None
+        return meta
     try:
         content = md.read_text(errors="replace")
     except Exception:
-        return None
+        return meta
     if not content.startswith("---"):
-        return None
+        return meta
     end = content.find("\n---", 3)
     if end == -1:
-        return None
+        return meta
     for line in content[3:end].splitlines():
-        m = re.match(r'^\s*category\s*:\s*(.+?)\s*$', line)
-        if m:
-            cat = m.group(1).strip().strip('"').strip("'")
-            return cat or None
-    return None
+        for key in ("category", "description"):
+            m = re.match(rf'^\s*{key}\s*:\s*(.+?)\s*$', line)
+            if m:
+                v = m.group(1).strip().strip('"').strip("'")
+                meta[key] = v or None
+    return meta
 
 
 def get_state():
@@ -89,11 +97,14 @@ def get_state():
                             if d.is_dir() and (d / "SKILL.md").exists() and not d.name.startswith(".")])
     disabled_skills = sorted([d.name for d in SKILLS_DISABLED_DIR.iterdir()
                               if d.is_dir() and not d.name.startswith(".")])
+    def _skill_entry(name, base, active):
+        meta = read_skill_meta(base / name)
+        return {"name": name, "active": active, "category": meta["category"], "description": meta["description"]}
     return {
         "mcps": [{"name": n, "active": True, "running": n in running} for n in sorted(active.keys())]
               + [{"name": n, "active": False, "running": False} for n in sorted(disabled.keys())],
-        "skills": [{"name": n, "active": True, "category": read_skill_category(SKILLS_DIR / n)} for n in active_skills]
-                + [{"name": n, "active": False, "category": read_skill_category(SKILLS_DISABLED_DIR / n)} for n in disabled_skills],
+        "skills": [_skill_entry(n, SKILLS_DIR, True) for n in active_skills]
+                + [_skill_entry(n, SKILLS_DISABLED_DIR, False) for n in disabled_skills],
     }
 
 
@@ -393,6 +404,157 @@ def delete_preset(name):
     return True, f"Preset '{name}' supprime"
 
 
+# === PLUGINS ===
+
+def _load_settings():
+    if not SETTINGS_FILE.exists():
+        return {}
+    try:
+        with open(SETTINGS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_settings(data):
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    if SETTINGS_FILE.exists():
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = BACKUP_DIR / f"settings.json.backup.{ts}"
+        with open(SETTINGS_FILE) as src, open(backup, "w") as dst:
+            dst.write(src.read())
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _plugin_root(install_path):
+    """L'install_path pointe vers <cache>/<owner>/<repo>/<version>/plugins/<plugin>.
+    On veut souvent inspecter <plugin> directement, ou son sous-dossier .claude-plugin."""
+    p = Path(install_path)
+    if (p / ".claude-plugin").is_dir():
+        return p
+    return p
+
+
+def _scan_plugin_contents(install_path):
+    p = Path(install_path)
+    if not p.exists():
+        return {"skills_count": 0, "mcp_count": 0, "commands_count": 0, "hooks_count": 0,
+                "skills": [], "mcps": [], "commands": [], "missing": True}
+    candidates_skills = [p / "skills", p / ".claude-plugin/skills"]
+    skills = []
+    for sd in candidates_skills:
+        if sd.is_dir():
+            skills.extend(sorted(d.name for d in sd.iterdir() if d.is_dir() and not d.name.startswith(".")))
+    candidates_mcp = [p / ".mcp.json", p / ".claude-plugin/.mcp.json"]
+    mcps = []
+    for mf in candidates_mcp:
+        if mf.is_file():
+            try:
+                data = json.loads(mf.read_text())
+                servers = data.get("mcpServers", data) if isinstance(data, dict) else {}
+                if isinstance(servers, dict):
+                    mcps.extend(sorted(servers.keys()))
+            except Exception:
+                pass
+    cmd_dir = p / "commands"
+    commands = sorted(f.stem for f in cmd_dir.glob("*.md")) if cmd_dir.is_dir() else []
+    hooks_count = 0
+    plugin_json = p / "plugin.json"
+    if not plugin_json.is_file():
+        plugin_json = p / ".claude-plugin/plugin.json"
+    if plugin_json.is_file():
+        try:
+            data = json.loads(plugin_json.read_text())
+            hooks = data.get("hooks", {})
+            if isinstance(hooks, dict):
+                hooks_count = sum(len(v) if isinstance(v, list) else 1 for v in hooks.values())
+        except Exception:
+            pass
+    return {"skills_count": len(skills), "mcp_count": len(mcps),
+            "commands_count": len(commands), "hooks_count": hooks_count,
+            "skills": skills, "mcps": mcps, "commands": commands, "missing": False}
+
+
+def _split_plugin_name(full_name):
+    """github@claude-plugins-official -> ('github', 'claude-plugins-official')"""
+    if "@" in full_name:
+        n, m = full_name.split("@", 1)
+        return n, m
+    return full_name, ""
+
+
+def _load_installed_plugins():
+    if not INSTALLED_PLUGINS_FILE.exists():
+        return {}
+    try:
+        with open(INSTALLED_PLUGINS_FILE) as f:
+            data = json.load(f)
+        return data.get("plugins", {}) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def list_plugins():
+    installed = _load_installed_plugins()
+    settings = _load_settings()
+    enabled_map = settings.get("enabledPlugins", {}) if isinstance(settings, dict) else {}
+    plugins = []
+    for full_name, entries in installed.items():
+        if not isinstance(entries, list) or not entries:
+            continue
+        entry = entries[0]
+        if not isinstance(entry, dict):
+            continue
+        name, marketplace = _split_plugin_name(full_name)
+        install_path = entry.get("installPath", "")
+        contents = _scan_plugin_contents(install_path)
+        plugins.append({
+            "name": name,
+            "marketplace": marketplace,
+            "full_name": full_name,
+            "version": entry.get("version", ""),
+            "enabled": bool(enabled_map.get(full_name, True)),
+            "installPath": install_path,
+            "installedAt": entry.get("installedAt", ""),
+            "lastUpdated": entry.get("lastUpdated", ""),
+            "scope": entry.get("scope", ""),
+            "contents": contents,
+        })
+    plugins.sort(key=lambda x: (x["marketplace"], x["name"]))
+    return plugins
+
+
+def toggle_plugin(full_name):
+    if not full_name:
+        return False, "Nom de plugin requis"
+    installed = _load_installed_plugins()
+    if full_name not in installed:
+        return False, f"Plugin '{full_name}' introuvable"
+    settings = _load_settings()
+    enabled_map = settings.setdefault("enabledPlugins", {})
+    current = bool(enabled_map.get(full_name, True))
+    enabled_map[full_name] = not current
+    _save_settings(settings)
+    state = "active" if not current else "desactive"
+    return True, f"Plugin '{full_name}' {state}"
+
+
+def get_plugin_detail(full_name):
+    installed = _load_installed_plugins()
+    if full_name not in installed:
+        return False, f"Plugin '{full_name}' introuvable"
+    entry = installed[full_name][0]
+    contents = _scan_plugin_contents(entry.get("installPath", ""))
+    return True, {
+        "full_name": full_name,
+        "installPath": entry.get("installPath", ""),
+        "version": entry.get("version", ""),
+        "contents": contents,
+    }
+
+
 # === AUTO-UPDATE (interroge GitHub releases) ===
 
 def get_github_repo():
@@ -496,6 +658,14 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <p class="text-xs text-stone-500 mb-4">Coche = disponible pour Claude</p>
 <div id="skills" class="space-y-2 max-h-[500px] overflow-y-auto"></div></section>
 </div>
+<section class="card p-6 mt-6">
+<div class="flex items-baseline justify-between mb-1">
+<h2 class="text-lg font-semibold">Plugins</h2>
+<span class="text-xs text-stone-400">Lecture seule &middot; toggle persistant dans settings.json</span>
+</div>
+<p class="text-xs text-stone-500 mb-4">Plugins Claude Code installes via marketplace</p>
+<div id="plugins" class="space-y-2"></div>
+</section>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
 <section class="card p-6">
 <h2 class="text-lg font-semibold mb-1">+ Ajouter un MCP</h2>
@@ -573,6 +743,57 @@ function renderSkills(skills){
     const items = groups[cat].map(sk=>`<label class="flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}"><input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700"><span class="font-medium text-sm">${sk.name}</span></label>`).join('');
     return `<details open class="mb-2"><summary class="cursor-pointer text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1.5 px-1 select-none hover:text-stone-900">${escAttr(cat)} <span class="text-stone-400 font-normal normal-case">(${groups[cat].length})</span></summary><div class="space-y-1.5 mt-1.5">${items}</div></details>`;
   }).join('');
+}
+function pluginContentBadge(c){
+  const parts = [];
+  if(c.skills_count) parts.push(c.skills_count + ' skill' + (c.skills_count>1?'s':''));
+  if(c.mcp_count) parts.push(c.mcp_count + ' MCP' + (c.mcp_count>1?'s':''));
+  if(c.commands_count) parts.push(c.commands_count + ' command' + (c.commands_count>1?'s':''));
+  if(c.hooks_count) parts.push(c.hooks_count + ' hook' + (c.hooks_count>1?'s':''));
+  if(c.missing) parts.push('install path manquant');
+  return parts.length ? parts.join(' &middot; ') : 'vide';
+}
+function pluginDetailHtml(c){
+  const sections = [];
+  if(c.skills && c.skills.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Skills</span><div class="mt-1 flex flex-wrap gap-1.5">${c.skills.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">${escAttr(s)}</span>`).join('')}</div></div>`);
+  if(c.mcps && c.mcps.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">MCPs</span><div class="mt-1 flex flex-wrap gap-1.5">${c.mcps.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">${escAttr(s)}</span>`).join('')}</div></div>`);
+  if(c.commands && c.commands.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Commands</span><div class="mt-1 flex flex-wrap gap-1.5">${c.commands.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">/${escAttr(s)}</span>`).join('')}</div></div>`);
+  return sections.length ? `<div class="mt-3 pt-3 border-t border-stone-100 space-y-3">${sections.join('')}</div>` : '<div class="mt-3 pt-3 border-t border-stone-100 text-xs text-stone-400">Aucun contenu detecte.</div>';
+}
+async function loadPlugins(){
+  try{
+    const j = await (await fetch('/api/plugins')).json();
+    const plugins = j.plugins || [];
+    const list = document.getElementById('plugins');
+    if(plugins.length===0){list.innerHTML = '<p class="text-xs text-stone-400">Aucun plugin installe.</p>';return;}
+    list.innerHTML = plugins.map(p=>{
+      const fn = escAttr(p.full_name);
+      const opacity = p.enabled ? '' : 'opacity-60';
+      return `<div class="border ${p.enabled?'border-stone-200':'border-stone-100'} rounded-lg p-3 ${opacity}">
+<div class="flex items-center gap-3">
+<input type="checkbox" ${p.enabled?'checked':''} onchange="togglePlugin('${fn}')" class="w-5 h-5 rounded accent-green-700 shrink-0">
+<button onclick="togglePluginDetail('${fn}')" class="flex-1 text-left">
+<div class="flex items-baseline gap-2 flex-wrap">
+<span class="font-medium">${escAttr(p.name)}</span>
+<span class="text-xs text-stone-400 font-mono">v${escAttr(p.version||'?')}</span>
+<span class="text-xs text-stone-500">${escAttr(p.marketplace||'')}</span>
+</div>
+<div class="text-xs text-stone-500 mt-0.5">${pluginContentBadge(p.contents||{})}</div>
+</button>
+</div>
+<div id="pl-detail-${fn}" class="hidden">${pluginDetailHtml(p.contents||{})}</div>
+</div>`;
+    }).join('');
+  }catch(e){console.error(e);}
+}
+function togglePluginDetail(fn){
+  const el = document.getElementById('pl-detail-'+fn);
+  if(el) el.classList.toggle('hidden');
+}
+async function togglePlugin(fn){
+  const j = await api('/api/toggle-plugin',{name:fn});
+  banner(j.success?'green':'red',j.message);
+  loadPlugins();
 }
 async function loadPresets(){
   try{
@@ -665,7 +886,7 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-loadState();loadPresets();checkUpdate();setInterval(loadState,5000);setInterval(checkUpdate,3600000);
+loadState();loadPresets();loadPlugins();checkUpdate();setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
 
@@ -693,6 +914,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(check_update())
         elif path == "/api/presets":
             self._json({"presets": list_presets()})
+        elif path == "/api/plugins":
+            self._json({"plugins": list_plugins()})
+        elif path.startswith("/api/plugin-detail/"):
+            full_name = unquote(path[len("/api/plugin-detail/"):])
+            ok, payload = get_plugin_detail(full_name)
+            if ok:
+                self._json(payload)
+            else:
+                self._json({"error": payload}, status=404)
         else:
             self.send_response(404); self.end_headers()
 
@@ -728,6 +958,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/preset-save": lambda: save_preset(data.get("name", ""), data.get("mcps", [])),
             "/api/preset-apply": lambda: apply_preset(data.get("name", "")),
             "/api/preset-delete": lambda: delete_preset(data.get("name", "")),
+            "/api/toggle-plugin": lambda: toggle_plugin(data.get("name", "")),
         }
         if path in routes:
             try:
@@ -748,6 +979,7 @@ def main():
     print(f"\n  Claude Control v{get_local_version()} - http://localhost:{PORT}")
     print(f"  Cmd+C pour arreter\n")
     webbrowser.open(f"http://localhost:{PORT}")
+    socketserver.TCPServer.allow_reuse_address = True
     try:
         with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as server:
             server.serve_forever()
