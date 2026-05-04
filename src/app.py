@@ -276,6 +276,45 @@ def delete_skill(name):
     return True, f"Skill '{name}' supprimé (backup : {backup.name})"
 
 
+def restart_mcp(name):
+    """Redémarre un MCP sans toucher à Claude Desktop : kill le process puis
+    toggle off/on dans claude_desktop_config.json (Claude Desktop surveille ce
+    fichier, le toggle déclenche un respawn du MCP par son host MCP)."""
+    if not name:
+        return False, "Nom MCP requis"
+    config = load_config()
+    is_active = name in config.get("mcpServers", {})
+    is_disabled = name in config.get("_disabledMcps", {})
+    if not (is_active or is_disabled):
+        return False, f"MCP '{name}' introuvable"
+    pids = _mcp_pids(name) if "_mcp_pids" in globals() else []
+    my_pid = os.getpid()
+    killed = 0
+    for pid in pids:
+        if pid == my_pid:
+            continue
+        try:
+            os.kill(pid, 9)
+            killed += 1
+        except Exception:
+            pass
+    if is_active:
+        config = load_config()
+        active = config.setdefault("mcpServers", {})
+        disabled = config.setdefault("_disabledMcps", {})
+        disabled[name] = active.pop(name)
+        save_config(config)
+        time.sleep(1.5)
+        config = load_config()
+        active = config.setdefault("mcpServers", {})
+        disabled = config.setdefault("_disabledMcps", {})
+        if name in disabled:
+            active[name] = disabled.pop(name)
+            save_config(config)
+        return True, f"MCP '{name}' redémarré (killed {killed}, config togglée)"
+    return True, f"MCP '{name}' inactif : {killed} process killed, rien d'autre à faire"
+
+
 def delete_mcp(name):
     if not name:
         return False, "Nom requis"
@@ -715,12 +754,12 @@ def _watchdog_loop():
                         # the last 2 * interval seconds.
                         window = max(60, interval * 2)
                         if _mcp_log_says_frozen(target, within_seconds=window):
-                            _watchdog_event("kill_mcp", f"MCP '{target}' shows freeze markers in log, killing PIDs to force respawn")
-                            for pid in pids:
-                                try:
-                                    os.kill(pid, 9)
-                                except Exception:
-                                    pass
+                            _watchdog_event("restart_mcp", f"MCP '{target}' shows freeze markers, restarting")
+                            try:
+                                ok, msg = restart_mcp(target)
+                                _watchdog_event("restart_mcp_result", msg if ok else f"failed: {msg}")
+                            except Exception as e:
+                                _watchdog_event("restart_mcp_error", str(e))
         except Exception as e:
             _log(f"watchdog loop error: {e}")
             interval = 30
@@ -2312,10 +2351,10 @@ fr: {
   plugin_add_btn: "+ Ajouter un plugin (Git)",
   plugin_add_modal_title: "Ajouter un plugin via Git",
   plugin_add_modal_help: "Le repo sera cloné dans ~/.claude/plugins/cache/manual/, plugin.json sera lu pour le nom et la version, puis enregistré comme <name>@manual et activé.",
-  confirm_delete_skill: "Supprimer le skill « {name} » ?\\n\\nUn backup ZIP sera créé dans ~/.claude/backups/claude-control/.",
-  confirm_delete_mcp: "Supprimer le MCP « {name} » de ta config ?\\n\\nLa config Claude Desktop est sauvegardée automatiquement avant écriture.",
-  confirm_delete_plugin: "Supprimer le plugin « {name} » ET ses fichiers cache ?\\n\\nUn backup ZIP du dossier sera créé. Annule ici si tu veux garder les fichiers.",
-  confirm_delete_plugin_metadata_only: "Supprimer seulement l'enregistrement du plugin « {name} » dans installed_plugins.json (les fichiers cache restent intacts) ?",
+  confirm_delete_skill: "Supprimer le skill « {name} » ?\\n\\n• Le dossier ~/.claude/skills/{name}/ va être effacé\\n• Un backup ZIP est créé dans ~/.claude/backups/claude-control/ — tu peux toujours restaurer\\n• Si tu veux juste désactiver sans effacer, décoche la case à la place",
+  confirm_delete_mcp: "Supprimer le MCP « {name} » de ta config ?\\n\\n• L'entrée disparaît de claude_desktop_config.json\\n• Le binaire / package reste sur ton disque\\n• Si tu veux juste désactiver, décoche la case à la place",
+  confirm_delete_plugin: "Supprimer le plugin « {name} » ET ses fichiers cache ?\\n\\n• L'entrée disparaît de installed_plugins.json\\n• Le dossier ~/.claude/plugins/cache/.../ est zippé (backup) puis effacé\\n• Annule ici si tu veux garder les fichiers (autre étape ensuite)",
+  confirm_delete_plugin_metadata_only: "Supprimer seulement l'enregistrement du plugin « {name} » ?\\n\\n• Le plugin disparaît de installed_plugins.json\\n• Les fichiers cache restent intacts sur ton disque\\n• Tu peux le réenregistrer plus tard sans re-cloner",
   source_user_skills: "Skills utilisateur",
   general_category: "Général",
   auto_cat_hint: "(catégorie auto)",
@@ -2333,6 +2372,15 @@ fr: {
   watchdog_crash: "Redémarrer si crash",
   watchdog_freeze: "Détecter freeze + redémarrer",
   watchdog_target_label: "Cible",
+  btn_restart_mcp: "Redémarrer ce MCP (sans toucher à Claude)",
+  skill_filter_mine: "Mes skills",
+  skill_filter_plugins: "Plugins",
+  skill_filter_all: "Tous",
+  skill_filter_all_cats: "Toutes les catégories",
+  category_filter: "Catégorie",
+  source_badge_user: "perso",
+  source_badge_plugin: "plugin",
+  confirm_restart_mcp: "Redémarrer le MCP « {name} » ?\\n\\nLe process sera tué puis Claude Desktop le respawn automatiquement (toggle config). Tes conversations Claude restent intactes.",
   claude_running: "Claude tourne",
   claude_stopped: "Claude arrêté",
   tab_overview: "Vue d'ensemble",
@@ -2472,10 +2520,10 @@ en: {
   plugin_add_btn: "+ Add plugin (Git)",
   plugin_add_modal_title: "Add a plugin via Git",
   plugin_add_modal_help: "The repo will be cloned into ~/.claude/plugins/cache/manual/, plugin.json will be read for name and version, then registered as <name>@manual and enabled.",
-  confirm_delete_skill: 'Delete skill "{name}"?\\n\\nA ZIP backup will be created in ~/.claude/backups/claude-control/.',
-  confirm_delete_mcp: 'Delete MCP "{name}" from your config?\\n\\nThe Claude Desktop config is backed up automatically before writing.',
-  confirm_delete_plugin: 'Delete plugin "{name}" AND its cache files?\\n\\nA ZIP backup of the folder will be created. Cancel here if you want to keep the files.',
-  confirm_delete_plugin_metadata_only: 'Delete only the plugin "{name}" entry from installed_plugins.json (cache files remain intact)?',
+  confirm_delete_skill: 'Delete skill "{name}"?\\n\\n• The folder ~/.claude/skills/{name}/ will be removed\\n• A ZIP backup is created in ~/.claude/backups/claude-control/ — you can restore it\\n• To just disable it without removing, uncheck the box instead',
+  confirm_delete_mcp: 'Delete MCP "{name}" from your config?\\n\\n• The entry is removed from claude_desktop_config.json\\n• The binary / package stays on your disk\\n• To just disable it, uncheck the box instead',
+  confirm_delete_plugin: 'Delete plugin "{name}" AND its cache files?\\n\\n• The entry is removed from installed_plugins.json\\n• The folder under ~/.claude/plugins/cache/.../ is zipped (backup) and removed\\n• Cancel here to keep the files (next step asks)',
+  confirm_delete_plugin_metadata_only: 'Delete only the plugin "{name}" entry?\\n\\n• The plugin disappears from installed_plugins.json\\n• Cache files stay on your disk\\n• You can re-register it later without re-cloning',
   source_user_skills: "User skills",
   general_category: "General",
   auto_cat_hint: "(auto-category)",
@@ -2493,6 +2541,15 @@ en: {
   watchdog_crash: "Restart on crash",
   watchdog_freeze: "Detect freeze + restart",
   watchdog_target_label: "Target",
+  btn_restart_mcp: "Restart this MCP (without touching Claude)",
+  skill_filter_mine: "My skills",
+  skill_filter_plugins: "Plugins",
+  skill_filter_all: "All",
+  skill_filter_all_cats: "All categories",
+  category_filter: "Category",
+  source_badge_user: "yours",
+  source_badge_plugin: "plugin",
+  confirm_restart_mcp: 'Restart MCP "{name}"?\\n\\nThe process will be killed and Claude Desktop will respawn it automatically (config toggle). Your Claude conversations stay intact.',
   claude_running: "Claude running",
   claude_stopped: "Claude stopped",
   tab_overview: "Overview",
@@ -2555,56 +2612,77 @@ let CURRENT_STATE = {mcps:[], skills:[]};
 async function loadState(){
   const s = await (await fetch('/api/state')).json();
   CURRENT_STATE = s;
-  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>`<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" title="${tr('btn_delete')}" class="text-stone-400 hover:text-red-600 hover:bg-red-50 rounded px-2 py-1 text-base leading-none shrink-0">&times;</button></label>`).join('');
+  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>`<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="toggleMcp('${m.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="text-stone-400 hover:text-amber-700 hover:bg-amber-50 rounded px-2 py-1 text-sm leading-none shrink-0">&#x21bb;</button><button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button></label>`).join('');
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
 }
 function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');}
 let SKILL_USAGE = {};
+let SKILL_SOURCE_FILTER = (localStorage.getItem('cc-skill-src') || 'user');
+let SKILL_CAT_FILTER = '';
+function setSkillSourceFilter(src){
+  SKILL_SOURCE_FILTER = src;
+  localStorage.setItem('cc-skill-src', src);
+  if(typeof loadState==='function') loadState();
+}
+function setSkillCatFilter(cat){
+  SKILL_CAT_FILTER = cat;
+  if(typeof loadState==='function') loadState();
+}
 function renderSkills(skills){
   if(!skills || skills.length===0) return `<p class="text-stone-400 text-sm">${tr('no_skill')}</p>`;
-  // Source-first grouping: User first, then each plugin (alpha)
-  const bySource = {};
-  skills.forEach(sk=>{const src = sk.source || 'user'; (bySource[src] = bySource[src] || []).push(sk);});
-  const sources = Object.keys(bySource).sort((a,b)=>{
-    if(a==='user') return -1; if(b==='user') return 1;
+  const userCount = skills.filter(s=>s.source==='user').length;
+  const pluginCount = skills.length - userCount;
+  let filtered;
+  if(SKILL_SOURCE_FILTER === 'user') filtered = skills.filter(s=>s.source==='user');
+  else if(SKILL_SOURCE_FILTER === 'plugin') filtered = skills.filter(s=>s.source!=='user');
+  else filtered = skills;
+  // Build category list for the dropdown — based on filtered set
+  const allCats = new Set();
+  filtered.forEach(sk=>{allCats.add(sk.category || sk.auto_category || tr('general_category'));});
+  const sortedCats = Array.from(allCats).sort((a,b)=>{
+    if(a===tr('general_category')) return 1; if(b===tr('general_category')) return -1;
     return a.localeCompare(b);
   });
-  return sources.map(src=>{
-    const sourceLabel = src==='user' ? tr('source_user_skills') : src.replace(/^plugin:/, tr('source_plugin')+' ');
-    const itemsBySrc = bySource[src];
-    // Sub-group by category (frontmatter > auto > "General")
-    const subGroups = {};
-    itemsBySrc.forEach(sk=>{
-      const cat = sk.category || sk.auto_category || tr('general_category');
-      (subGroups[cat] = subGroups[cat] || []).push(sk);
-    });
-    const cats = Object.keys(subGroups).sort((a,b)=>{
-      if(a===tr('general_category')) return 1; if(b===tr('general_category')) return -1;
-      return a.localeCompare(b);
-    });
-    const subBlocks = cats.map(cat=>{
-      const items = subGroups[cat].map(sk=>{
-        const desc = sk.description || '';
-        const search = (sk.name + ' ' + desc).toLowerCase();
-        const descHtml = desc ? `<span class="text-xs text-stone-500 truncate">${escAttr(desc)}</span>` : '';
-        const tagHtml = (sk.tags||[]).slice(0,4).map(t=>`<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded">${escAttr(t)}</span>`).join('');
-        const autoHint = (!sk.category && sk.auto_category) ? `<span class="text-[10px] text-stone-400 italic">${tr('auto_cat_hint')}</span>` : '';
-        const usageCount = SKILL_USAGE[sk.name] || 0;
-        const usageBadge = usageCount > 0 ? `<span class="text-[10px] text-stone-500 bg-stone-100 px-1.5 py-0.5 rounded font-mono" title="${tr('used_x_times').split('{n}').join(usageCount)}">${usageCount}×</span>` : '';
-        const editable = sk.editable !== false;
-        const checkbox = editable
-          ? `<input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0">`
-          : `<span class="w-5 h-5 inline-flex items-center justify-center text-stone-300 shrink-0" title="${tr('readonly')}">&#128274;</span>`;
-        const deleteBtn = editable
-          ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteSkill('${sk.name}')" title="${tr('btn_delete')}" class="text-stone-400 hover:text-red-600 hover:bg-red-50 rounded px-2 py-1 text-base leading-none shrink-0">&times;</button>`
-          : '';
-        return `<label data-skill data-search="${escAttr(search)}" class="group flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}">${checkbox}<div class="flex flex-col min-w-0 flex-1"><div class="flex items-baseline gap-2 flex-wrap"><span class="font-medium text-sm truncate">${escAttr(sk.name)}</span>${usageBadge}${tagHtml}${autoHint}</div>${descHtml}</div>${deleteBtn}</label>`;
-      }).join('');
-      return `<details data-skill-cat="${escAttr(cat)}" open class="mb-2 ml-3"><summary class="cursor-pointer text-[11px] font-medium tracking-wide text-stone-500 mb-1 px-1 select-none hover:text-stone-800">${escAttr(cat)} <span class="text-stone-400 font-normal" data-cat-count>(${subGroups[cat].length})</span></summary><div class="space-y-1.5 mt-1.5">${items}</div></details>`;
+  if(SKILL_CAT_FILTER) filtered = filtered.filter(sk=>(sk.category || sk.auto_category || tr('general_category')) === SKILL_CAT_FILTER);
+  const cats = SKILL_CAT_FILTER ? [SKILL_CAT_FILTER] : sortedCats;
+  // Source filter pills
+  const pill = (val, label, count) => `<button onclick="setSkillSourceFilter('${val}')" class="px-3 py-1 text-xs rounded-full font-medium ${SKILL_SOURCE_FILTER===val ? 'bg-stone-900 text-white' : 'bg-stone-100 text-stone-700 hover:bg-stone-200'}">${escAttr(label)} <span class="opacity-70">(${count})</span></button>`;
+  const sourceBar = `<div class="flex flex-wrap items-center gap-2 mb-3">${pill('user', tr('skill_filter_mine'), userCount)}${pill('plugin', tr('skill_filter_plugins'), pluginCount)}${pill('all', tr('skill_filter_all'), skills.length)}</div>`;
+  // Category dropdown
+  const catOptions = `<option value="">${tr('skill_filter_all_cats')}</option>` + sortedCats.map(c=>`<option value="${escAttr(c)}" ${SKILL_CAT_FILTER===c?'selected':''}>${escAttr(c)}</option>`).join('');
+  const catBar = `<div class="flex items-center gap-2 mb-4 text-xs"><label class="text-stone-500">${tr('category_filter')}:</label><select onchange="setSkillCatFilter(this.value)" class="border border-stone-200 rounded px-2 py-1 bg-white">${catOptions}</select></div>`;
+  if(filtered.length === 0) return sourceBar + catBar + `<p class="text-stone-400 text-sm">${tr('no_skill')}</p>`;
+  // Group filtered by category
+  const groups = {};
+  filtered.forEach(sk=>{
+    const cat = sk.category || sk.auto_category || tr('general_category');
+    (groups[cat] = groups[cat] || []).push(sk);
+  });
+  const blocks = cats.filter(c=>groups[c]).map(cat=>{
+    const items = groups[cat].map(sk=>{
+      const desc = sk.description || '';
+      const search = (sk.name + ' ' + desc).toLowerCase();
+      const descHtml = desc ? `<span class="text-xs text-stone-500 truncate">${escAttr(desc)}</span>` : '';
+      const tagHtml = (sk.tags||[]).slice(0,4).map(t=>`<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded">${escAttr(t)}</span>`).join('');
+      const autoHint = (!sk.category && sk.auto_category) ? `<span class="text-[10px] text-stone-400 italic">${tr('auto_cat_hint')}</span>` : '';
+      const sourceBadge = sk.source==='user'
+        ? `<span class="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded">${tr('source_badge_user')}</span>`
+        : `<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded" title="${escAttr(sk.source)}">${tr('source_badge_plugin')}</span>`;
+      const usageCount = SKILL_USAGE[sk.name] || 0;
+      const usageBadge = usageCount > 0 ? `<span class="text-[10px] text-stone-500 bg-stone-100 px-1.5 py-0.5 rounded font-mono" title="${tr('used_x_times').split('{n}').join(usageCount)}">${usageCount}×</span>` : '';
+      const editable = sk.editable !== false;
+      const checkbox = editable
+        ? `<input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0">`
+        : `<span class="w-5 h-5 inline-flex items-center justify-center text-stone-300 shrink-0" title="${tr('readonly')}">&#128274;</span>`;
+      const deleteBtn = editable
+        ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteSkill('${sk.name}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>`
+        : '';
+      return `<label data-skill data-search="${escAttr(search)}" class="flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}">${checkbox}<div class="flex flex-col min-w-0 flex-1"><div class="flex items-baseline gap-2 flex-wrap"><span class="font-medium text-sm truncate">${escAttr(sk.name)}</span>${sourceBadge}${usageBadge}${tagHtml}${autoHint}</div>${descHtml}</div>${deleteBtn}</label>`;
     }).join('');
-    return `<details data-skill-cat="src:${escAttr(src)}" open class="mb-3"><summary class="cursor-pointer text-xs font-semibold uppercase tracking-wide text-stone-700 mb-2 px-1 select-none hover:text-stone-900">${escAttr(sourceLabel)} <span class="text-stone-400 font-normal normal-case">(${itemsBySrc.length})</span></summary>${subBlocks}</details>`;
+    return `<details data-skill-cat="${escAttr(cat)}" open class="mb-3"><summary class="cursor-pointer text-sm font-semibold text-stone-800 mb-2 px-1 select-none hover:text-stone-900">${escAttr(cat)} <span class="text-stone-400 font-normal text-xs" data-cat-count>(${groups[cat].length})</span></summary><div class="space-y-1.5">${items}</div></details>`;
   }).join('');
+  return sourceBar + catBar + blocks;
 }
 function filterSkills(){
   const q = (document.getElementById('skills-search').value || '').trim().toLowerCase();
@@ -2662,7 +2740,7 @@ ${orphans}
 </div>
 <div class="text-xs text-stone-500 mt-0.5">${pluginContentBadge(p.contents||{})}</div>
 </button>
-<button type="button" onclick="event.stopPropagation();deletePlugin('${fn}')" title="${tr('btn_delete')}" class="text-stone-400 hover:text-red-600 hover:bg-red-50 rounded px-2 py-1 text-base leading-none shrink-0">&times;</button>
+<button type="button" onclick="event.stopPropagation();deletePlugin('${fn}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>
 </div>
 <div id="pl-detail-${fn}" class="hidden">${pluginDetailHtml(p.contents||{})}</div>
 </div>`;
@@ -2683,6 +2761,13 @@ async function deleteSkill(name){
   const j = await api('/api/delete-skill', {name:name});
   banner(j.success?'green':'red', j.message);
   if(j.success){loadState();loadOverview();}
+}
+async function restartMcp(name){
+  if(!confirm(tr('confirm_restart_mcp').split('{name}').join(name)))return;
+  banner('blue', tr('banner_restarting'));
+  const j = await api('/api/restart-mcp', {name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadState();}
 }
 async function deleteMcp(name){
   if(!confirm(tr('confirm_delete_mcp').split('{name}').join(name)))return;
@@ -3217,6 +3302,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/save-settings": lambda: save_settings(data.get("content", "")),
             "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
+            "/api/restart-mcp": lambda: restart_mcp(data.get("name", "")),
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
             "/api/watchdog-config": lambda: save_watchdog_config(data),
