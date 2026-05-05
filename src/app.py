@@ -649,36 +649,99 @@ def _mcp_process_fingerprint(name):
     return cmd or None
 
 
+def _find_mcp_log(name):
+    """Trouve le fichier mcp-server-<X>.log correspondant au MCP. Tolère les
+    noms avec espaces, casse différente, suffixes, etc. via normalisation."""
+    if not CLAUDE_LOGS_DIR.exists() or not name:
+        return None
+    name_lc = re.sub(r'[^a-z0-9]', '', str(name).lower())
+    if not name_lc:
+        return None
+    exact = None
+    fuzzy = []
+    for f in CLAUDE_LOGS_DIR.glob("mcp-server-*.log"):
+        stem = f.stem
+        log_name = stem[len("mcp-server-"):] if stem.startswith("mcp-server-") else stem
+        log_name_lc = re.sub(r'[^a-z0-9]', '', log_name.lower())
+        if log_name_lc == name_lc:
+            return f
+        if log_name_lc and (name_lc in log_name_lc or log_name_lc in name_lc):
+            fuzzy.append(f)
+    if fuzzy:
+        return max(fuzzy, key=lambda f: f.stat().st_mtime)
+    return None
+
+
+def _pids_via_lsof(log_path):
+    """Retourne les PIDs des process qui ont le fichier ouvert. Stable et fiable
+    quand pgrep ne marche pas (process avec fingerprint trop générique)."""
+    if not log_path or not Path(log_path).exists():
+        return []
+    try:
+        r = subprocess.run(["lsof", "-t", str(log_path)], capture_output=True, text=True, timeout=3)
+    except Exception:
+        return []
+    my_pid = os.getpid()
+    pids = []
+    for line in r.stdout.split():
+        try:
+            pid = int(line.strip())
+        except Exception:
+            continue
+        if pid != my_pid:
+            pids.append(pid)
+    return pids
+
+
 def _mcp_pids(name):
     fp = _mcp_process_fingerprint(name)
-    if not fp:
-        return []
-    return _safe_pids_for_fingerprint(fp)
+    if fp:
+        pids = _safe_pids_for_fingerprint(fp)
+        if pids:
+            return pids
+    log = _find_mcp_log(name)
+    if log:
+        pids = _pids_via_lsof(log)
+        if pids:
+            return pids
+    return []
 
 
 def _mcp_log_says_frozen(name, within_seconds):
-    """Lit mcp-server-<name>.log et regarde si une erreur 'transport closed' /
-    'process exiting early' est apparue dans la fenêtre."""
-    log = CLAUDE_LOGS_DIR / f"mcp-server-{name}.log"
-    if not log.exists():
+    """Détecte un freeze via le log Claude. Deux signaux :
+    1. Marker d'erreur ('transport closed', 'process exiting early', ...)
+       dans la queue du log, modifié récemment.
+    2. Log inactif (mtime ancien) alors que Claude Desktop est responsive
+       — le MCP a probablement gelé silencieusement (typique de Desktop
+       Commander qui devient muet sans crasher)."""
+    log = _find_mcp_log(name)
+    if not log or not log.exists():
         return False
     try:
         mtime = log.stat().st_mtime
     except Exception:
         return False
-    if mtime < time.time() - within_seconds:
-        return False
-    try:
-        text = log.read_text(errors="replace")
-    except Exception:
-        return False
-    tail = text[-4000:].lower()
-    return any(k in tail for k in (
-        "transport closed unexpectedly",
-        "process exiting early",
-        "process exited early",
-        "server disconnected",
-    ))
+    now = time.time()
+    if now - mtime <= within_seconds:
+        try:
+            text = log.read_text(errors="replace")
+            tail = text[-4000:].lower()
+            if any(k in tail for k in (
+                "transport closed unexpectedly",
+                "process exiting early",
+                "process exited early",
+                "server disconnected",
+            )):
+                return True
+        except Exception:
+            pass
+    if now - mtime > max(within_seconds * 2, 120):
+        try:
+            if _claude_responsive(timeout=2):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _claude_pids():
@@ -852,8 +915,8 @@ def _safe_pids_for_fingerprint(fingerprint):
 
 
 def _extension_pids(ext_name_or_id):
-    """Trouve les PIDs d'une extension via fingerprints du plus spécifique au moins.
-    Premier fingerprint qui matche gagne — évite l'union qui ramène trop de bruit."""
+    """Trouve les PIDs d'une extension via fingerprints (du plus spécifique au
+    moins) puis fallback sur lsof du log file Claude correspondant."""
     extensions = _list_extensions()
     target = next((e for e in extensions if e["name"] == ext_name_or_id or e["id"] == ext_name_or_id), None)
     if not target:
@@ -869,6 +932,12 @@ def _extension_pids(ext_name_or_id):
         pids = _safe_pids_for_fingerprint(fp)
         if pids:
             return pids
+    for nm in (target["name"], target["id"], target["id"].split(".")[-1]):
+        log = _find_mcp_log(nm)
+        if log:
+            pids = _pids_via_lsof(log)
+            if pids:
+                return pids
     return []
 
 
