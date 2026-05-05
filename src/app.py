@@ -32,12 +32,30 @@ VERSION_FILE = HOME / "dev/claude-control/version.txt"
 GITHUB_REPO_FILE = HOME / "dev/claude-control/.github-repo"
 LOG_FILE = HOME / "Library/Logs/claude-control.log"
 
+# v1.6.6 : tracking en memoire des derniers restarts MCP/extension pour
+# afficher "Dernier restart : il y a X min" dans la carte Action rapide.
+# Reset au redemarrage du serveur Claude Control.
+_LAST_RESTARTS = {}
+
 
 def _log(msg):
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG_FILE, "a") as f:
             f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _notify(title, message):
+    """Affiche une notification macOS native via osascript. Best-effort,
+    silencieux si echec. v1.6.6 : utilise pour signaler la fin d'un restart
+    MCP/extension meme quand l'UI Claude Control n'est pas au premier plan."""
+    try:
+        safe_title = (title or "").replace('"', '\\"').replace('\\', '\\\\')[:120]
+        safe_msg = (message or "").replace('"', '\\"').replace('\\', '\\\\')[:300]
+        script = f'display notification "{safe_msg}" with title "{safe_title}"'
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=3)
     except Exception:
         pass
 
@@ -329,6 +347,8 @@ def restart_mcp(name):
         if name in disabled:
             active[name] = disabled.pop(name)
             save_config(config)
+        _LAST_RESTARTS[name] = datetime.now().isoformat(timespec="seconds")
+        _notify(f"{name} redémarré", f"{killed} process tué - Claude Desktop intact")
         return True, f"MCP '{name}' redémarré (killed {killed}, config togglée)"
     return True, f"MCP '{name}' inactif : {killed} process killed, rien d'autre à faire"
 
@@ -681,8 +701,16 @@ def _find_mcp_log(name, return_method=False):
 
 
 def _pids_via_lsof(log_path):
-    """Retourne les PIDs des process qui ont le fichier ouvert. Stable et fiable
-    quand pgrep ne marche pas (process avec fingerprint trop générique)."""
+    """Retourne les PIDs des process qui ont le fichier ouvert, en filtrant
+    via la meme allow-list que _safe_pids_for_fingerprint.
+
+    v1.6.6 : sans ce filtre, lsof peut retourner le PID du binaire principal
+    /Applications/Claude.app/Contents/MacOS/Claude (qui pipe le log de ses
+    extensions). Un kill -9 sur ce PID tuait Claude Desktop entier au lieu
+    de redemarrer juste l'extension. Le filtre ne garde que les PIDs dont
+    le first token de la cmdline est un launcher MCP connu (node, python,
+    npx, etc.), ce qui correspond aux Helper Node enfants de Claude Desktop
+    qui hostent reellement le code de l'extension."""
     if not log_path or not Path(log_path).exists():
         return []
     try:
@@ -690,15 +718,33 @@ def _pids_via_lsof(log_path):
     except Exception:
         return []
     my_pid = os.getpid()
-    pids = []
+    raw_pids = []
     for line in r.stdout.split():
         try:
             pid = int(line.strip())
         except Exception:
             continue
         if pid != my_pid:
-            pids.append(pid)
-    return pids
+            raw_pids.append(pid)
+    if not raw_pids:
+        return []
+    safe = []
+    for pid in raw_pids:
+        try:
+            ps = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                capture_output=True, text=True, timeout=2)
+        except Exception:
+            continue
+        cmd = (ps.stdout or "").strip()
+        if not cmd:
+            continue
+        if "claude-control/app.py" in cmd or "Applications/claude-control/app.py" in cmd:
+            continue
+        first_token = cmd.split(None, 1)[0]
+        bn = Path(first_token).name.lower()
+        if bn in _KILL_ALLOWED_LAUNCHERS:
+            safe.append(pid)
+    return safe
 
 
 def _mcp_pids(name):
@@ -1098,7 +1144,88 @@ def restart_extension(name):
         _save_extension_settings(target["id"], settings)
     except Exception as e:
         return False, f"Erreur toggle settings : {e}"
-    return True, f"Extension '{name}' redémarrée (killed {killed}, settings togglée)"
+    _LAST_RESTARTS[name] = datetime.now().isoformat(timespec="seconds")
+    msg = f"Extension '{name}' redémarrée (killed {killed}, settings togglée)"
+    _notify(f"{name} redémarré", f"{killed} process tué - Claude Desktop intact")
+    return True, msg
+
+
+def dc_status():
+    """v1.6.6 - Etat detaille de Desktop Commander pour la carte Action rapide
+    en haut de la tab MCPs. Retourne null si DC n'est pas installe."""
+    extensions = _list_extensions()
+    target = next((e for e in extensions
+                   if e["name"] == "Desktop Commander"
+                   or "desktopcommander" in e["id"].lower().replace("-", "")
+                   or "desktopcommander" in e["name"].lower().replace(" ", "")),
+                  None)
+    if not target:
+        return None
+    log_path, log_method = _find_mcp_log(target["name"], return_method=True)
+    log_age = None
+    if log_path and log_path.exists():
+        try:
+            log_age = int(time.time() - log_path.stat().st_mtime)
+        except Exception:
+            pass
+    pids = _extension_pids(target["name"])
+    last_restart_iso = _LAST_RESTARTS.get(target["name"]) or _LAST_RESTARTS.get(target["id"])
+    last_restart_age = None
+    if last_restart_iso:
+        try:
+            dt = datetime.fromisoformat(last_restart_iso)
+            last_restart_age = int((datetime.now() - dt).total_seconds())
+        except Exception:
+            pass
+    # v1.6.6 : sur Claude Desktop moderne, DC tourne dans un Helper Node embarque
+    # (node.mojom.NodeService) anonyme parmi 7 helpers identiques. lsof retourne
+    # le main Claude (filtre par allow-list) et pgrep ne match pas car la cmdline
+    # est generique. Le seul indicateur fiable de "DC est vivant" devient le
+    # mtime du log : si DC a ecrit dans son log dans les 120 dernieres secondes,
+    # on considere qu'il tourne. Au-dela, suspect ou freeze.
+    running_by_pid = len(pids) > 0
+    running_by_log = log_age is not None and log_age <= 120
+    running = running_by_pid or running_by_log
+    return {
+        "name": target["name"],
+        "id": target["id"],
+        "version": target["version"],
+        "enabled": target["enabled"],
+        "running": running,
+        "running_by_pid": running_by_pid,
+        "running_by_log": running_by_log,
+        "pids": pids,
+        "log_path": str(log_path) if log_path else None,
+        "log_age_seconds": log_age,
+        "last_restart_iso": last_restart_iso,
+        "last_restart_age_seconds": last_restart_age,
+        "arch_note": (
+            "DC tourne dans un Helper Node embarque de Claude Desktop "
+            "(node.mojom.NodeService). Pas de PID granulaire identifiable. "
+            "Le statut est inferre via le mtime du log."
+        ) if not running_by_pid else None,
+    }
+
+
+def restart_claude_desktop():
+    """v1.6.6 - Option nucleaire : redemarre Claude Desktop entier.
+
+    Sur Claude Desktop moderne, redemarrer une extension granulairement n'est
+    pas possible (les Helper Node embarques sont anonymes). La seule garantie
+    de debloquer une extension freezee est de redemarrer Claude Desktop. Cela
+    ferme toutes les conversations en cours - a utiliser quand le toggle
+    settings best-effort n'a pas suffi.
+    """
+    try:
+        subprocess.run(["pkill", "-9", "-f", "/Applications/Claude.app/Contents/MacOS/Claude"],
+                       capture_output=True, timeout=5)
+        time.sleep(2)
+        subprocess.run(["open", "-a", "Claude"], capture_output=True, timeout=5)
+        _LAST_RESTARTS["__claude_desktop__"] = datetime.now().isoformat(timespec="seconds")
+        _notify("Claude Desktop redemarre", "Tous les MCPs et extensions vont reapparaitre dans 5-10s")
+        return True, "Claude Desktop redemarre - patience 5-10s"
+    except Exception as e:
+        return False, f"Erreur restart Claude Desktop : {e}"
 
 
 def scan_processes(pattern):
@@ -2481,6 +2608,12 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </section>
 </div>
 <div data-main-tab="mcps" class="hidden">
+<section id="dc-quick-section" class="card p-6 mb-6 border-l-4 border-amber-500" style="display:none">
+<div class="flex items-center justify-between mb-3">
+<h2 class="text-lg font-semibold flex items-center gap-2"><span class="text-amber-600">⚡</span><span data-i18n="dc_quick_title">Action rapide</span></h2>
+</div>
+<div id="dc-quick-card"><p class="text-xs text-stone-400">Chargement...</p></div>
+</section>
 <section class="card p-6">
 <h2 class="text-lg font-semibold mb-1" data-i18n="mcp_section">Serveurs MCP</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="mcp_help">Coché = chargé au démarrage de Claude Desktop</p>
@@ -3142,11 +3275,162 @@ async function loadState(){
     const versionBadge = isExt && m.version ? `<span class="text-[10px] text-stone-400 font-mono">v${escAttr(m.version)}</span>` : '';
     const toggleFn = isExt ? `toggleExtension('${m.name}', this.checked)` : `toggleMcp('${m.name}')`;
     const deleteBtn = isExt ? '' : `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>`;
-    return `<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="${toggleFn}" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${extBadge}${versionBadge}${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active && !isExt?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="text-stone-400 hover:text-amber-700 hover:bg-amber-50 rounded px-2 py-1 text-sm leading-none shrink-0">&#x21bb;</button>${deleteBtn}</label>`;
+    return `<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="${toggleFn}" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${extBadge}${versionBadge}${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active && !isExt?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="text-amber-700 hover:text-amber-900 hover:bg-amber-50 rounded px-2 py-1 text-base leading-none shrink-0">&#x21bb;</button>${deleteBtn}</label>`;
   }).join('');
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
+  loadDcStatus();
 }
+
+async function loadDcStatus(){
+  try {
+    const r = await fetch('/api/dc-status');
+    const d = await r.json();
+    const section = document.getElementById('dc-quick-section');
+    const card = document.getElementById('dc-quick-card');
+    if (!section || !card) return;
+    if (!d || d.installed === false || !d.name){
+      section.style.display = 'none';
+      return;
+    }
+    section.style.display = '';
+    const running = d.running;
+    const dot = running
+      ? '<span class="inline-block w-2.5 h-2.5 rounded-full bg-green-500"></span>'
+      : '<span class="inline-block w-2.5 h-2.5 rounded-full bg-red-500"></span>';
+    const statusText = running
+      ? '<span class="text-green-700 font-medium">Running</span>'
+      : '<span class="text-red-700 font-medium">Down</span>';
+    let logActivity = '';
+    if (d.log_age_seconds !== null && d.log_age_seconds !== undefined){
+      const a = d.log_age_seconds;
+      const lbl = a < 60 ? a + 's' : (a < 3600 ? Math.floor(a/60) + ' min' : Math.floor(a/3600) + ' h');
+      const cls = a > 60 ? 'text-amber-700' : 'text-stone-600';
+      logActivity = `<span class="${cls}">log ecrit il y a ${lbl}</span>`;
+    }
+    const pidsLabel = d.pids && d.pids.length
+      ? `${d.pids.length} process (PID ${d.pids.join(', ')})`
+      : '<span class="text-red-700">aucun process</span>';
+    let restartLine;
+    if (d.last_restart_age_seconds !== null && d.last_restart_age_seconds !== undefined){
+      const a = d.last_restart_age_seconds;
+      const lbl = a < 60 ? a + 's' : (a < 3600 ? Math.floor(a/60) + ' min' : Math.floor(a/3600) + ' h');
+      restartLine = `<div class="text-xs text-stone-500 mt-1">Dernier restart : il y a ${lbl}</div>`;
+    } else {
+      restartLine = `<div class="text-xs text-stone-400 mt-1">Dernier restart : jamais (cette session)</div>`;
+    }
+    card.innerHTML = `
+      <div class="flex items-start justify-between gap-4 flex-wrap">
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 mb-1.5">
+            <span class="font-semibold text-base">${escAttr(d.name)}</span>
+            ${d.version ? `<span class="text-xs text-stone-400 font-mono">v${escAttr(d.version)}</span>` : ''}
+          </div>
+          <div class="text-sm text-stone-600 flex items-center gap-2 flex-wrap">
+            ${dot}${statusText}
+            ${logActivity ? '<span class="text-stone-300">·</span>' + logActivity : ''}
+            ${d.running_by_log && !d.running_by_pid ? '<span class="text-[10px] text-stone-400" title="Statut inferre via mtime du log">via log</span>' : ''}
+          </div>
+          ${restartLine}
+        </div>
+        <div class="flex flex-col gap-2 shrink-0">
+          <button id="dc-restart-btn" onclick="restartDc()"
+            class="bg-amber-600 hover:bg-amber-700 active:bg-amber-800 text-white font-medium px-5 py-2.5 rounded-lg flex items-center gap-2 shadow-sm justify-center">
+            <span class="text-lg">&#x21bb;</span><span>Toggle settings DC</span>
+          </button>
+          <button id="dc-restart-claude-btn" onclick="restartClaudeDesktop()"
+            class="bg-stone-100 hover:bg-red-50 hover:text-red-700 border border-stone-300 hover:border-red-300 text-stone-700 font-medium px-5 py-2 rounded-lg flex items-center gap-2 text-sm justify-center">
+            <span>&#128260;</span><span>Redemarrer Claude Desktop</span>
+          </button>
+        </div>
+      </div>
+      <div class="mt-3 p-3 bg-amber-50/50 border border-amber-100 rounded text-xs text-stone-600 leading-relaxed">
+        <strong class="text-amber-900">Note :</strong> sur Claude Desktop moderne, DC tourne dans un Helper Node embarque. Le toggle settings est best-effort - il peut ou non forcer le respawn. Si DC reste freeze apres 30s, utilise <strong>Redemarrer Claude Desktop</strong> (option garantie mais ferme tes chats en cours).
+      </div>
+    `;
+  } catch(e) {
+    console.error('loadDcStatus failed', e);
+  }
+}
+
+async function restartClaudeDesktop(){
+  const btn = document.getElementById('dc-restart-claude-btn');
+  if (!btn) return;
+  if (!confirm('Redemarrer Claude Desktop ?\n\nToutes tes conversations en cours seront fermees. Tous les MCPs et extensions seront reinitialises. Claude Desktop reapparaitra dans 5-10 secondes.\n\nCONFIRMER ?')) return;
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.classList.add('opacity-70');
+  btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span><span>Redemarrage...</span>';
+  try {
+    const r = await fetch('/api/restart-claude-desktop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+    const j = await r.json();
+    if (j.success){
+      btn.innerHTML = '<span>&#10003;</span><span>Claude Desktop relance</span>';
+      banner('green', j.message);
+    } else {
+      btn.disabled = false;
+      btn.classList.remove('opacity-70');
+      btn.innerHTML = orig;
+      banner('red', 'Echec : ' + (j.message || 'inconnu'));
+    }
+  } catch(e) {
+    btn.disabled = false;
+    btn.classList.remove('opacity-70');
+    btn.innerHTML = orig;
+    banner('red', 'Erreur reseau : ' + e.message);
+  }
+}
+
+async function restartDc(){
+  const btn = document.getElementById('dc-restart-btn');
+  if (!btn) return;
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.classList.add('opacity-70');
+  btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span><span>Redemarrage...</span>';
+  try {
+    const r = await fetch('/api/restart-mcp', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: 'Desktop Commander'})
+    });
+    const j = await r.json();
+    if (j.success){
+      btn.innerHTML = '<span>&#10003;</span><span>Redemarre</span>';
+      btn.classList.remove('bg-amber-600', 'hover:bg-amber-700');
+      btn.classList.add('bg-green-600');
+      setTimeout(() => {
+        btn.disabled = false;
+        btn.classList.remove('opacity-70', 'bg-green-600');
+        btn.classList.add('bg-amber-600', 'hover:bg-amber-700');
+        btn.innerHTML = orig;
+        loadDcStatus();
+        loadState();
+      }, 2000);
+    } else {
+      btn.innerHTML = '<span>&#10007;</span><span>Echec</span>';
+      btn.classList.remove('bg-amber-600');
+      btn.classList.add('bg-red-600');
+      setTimeout(() => {
+        btn.disabled = false;
+        btn.classList.remove('opacity-70', 'bg-red-600');
+        btn.classList.add('bg-amber-600', 'hover:bg-amber-700');
+        btn.innerHTML = orig;
+      }, 3000);
+      banner('red', 'Erreur restart DC : ' + (j.message || 'inconnue'));
+    }
+  } catch(e) {
+    btn.disabled = false;
+    btn.classList.remove('opacity-70');
+    btn.innerHTML = orig;
+    banner('red', 'Erreur reseau : ' + e.message);
+  }
+}
+
 function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');}
 let SKILL_USAGE = {};
 let SKILL_SOURCE_FILTER = (localStorage.getItem('cc-skill-src') || 'user');
@@ -3851,6 +4135,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(get_watchdog_status())
         elif path == "/api/diagnose-extensions":
             self._json(diagnose_extensions())
+        elif path == "/api/dc-status":
+            self._json(dc_status() or {"installed": False})
         elif path.startswith("/api/command/"):
             qs = parse_qs(urlparse(self.path).query)
             source = qs.get("source", ["user"])[0]
@@ -3907,6 +4193,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
             "/api/restart-mcp": lambda: restart_mcp(data.get("name", "")),
+            "/api/restart-claude-desktop": lambda: restart_claude_desktop(),
             "/api/toggle-extension": lambda: toggle_extension(data.get("name", ""), data.get("enabled")),
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
