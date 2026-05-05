@@ -649,27 +649,35 @@ def _mcp_process_fingerprint(name):
     return cmd or None
 
 
-def _find_mcp_log(name):
+def _find_mcp_log(name, return_method=False):
     """Trouve le fichier mcp-server-<X>.log correspondant au MCP. Tolère les
-    noms avec espaces, casse différente, suffixes, etc. via normalisation."""
+    noms avec espaces, casse différente, suffixes, etc. via normalisation.
+
+    Si return_method=True, retourne (path|None, method) où method est:
+      "exact_match"  - normalized log_name == normalized query
+      "fuzzy_in"     - substring match dans une direction ou l'autre
+      "none"         - aucun candidat trouvé
+    """
+    def _r(p, m):
+        return (p, m) if return_method else p
+
     if not CLAUDE_LOGS_DIR.exists() or not name:
-        return None
+        return _r(None, "none")
     name_lc = re.sub(r'[^a-z0-9]', '', str(name).lower())
     if not name_lc:
-        return None
-    exact = None
+        return _r(None, "none")
     fuzzy = []
     for f in CLAUDE_LOGS_DIR.glob("mcp-server-*.log"):
         stem = f.stem
         log_name = stem[len("mcp-server-"):] if stem.startswith("mcp-server-") else stem
         log_name_lc = re.sub(r'[^a-z0-9]', '', log_name.lower())
         if log_name_lc == name_lc:
-            return f
+            return _r(f, "exact_match")
         if log_name_lc and (name_lc in log_name_lc or log_name_lc in name_lc):
             fuzzy.append(f)
     if fuzzy:
-        return max(fuzzy, key=lambda f: f.stat().st_mtime)
-    return None
+        return _r(max(fuzzy, key=lambda f: f.stat().st_mtime), "fuzzy_in")
+    return _r(None, "none")
 
 
 def _pids_via_lsof(log_path):
@@ -953,6 +961,126 @@ def _extension_pids(ext_name_or_id):
             if pids:
                 return pids
     return []
+
+
+def diagnose_extensions():
+    """v1.6.4 - Surface tous les mismatches manifest <-> log <-> process pour
+    chaque Desktop Extension installee. Le bug v1.6.3 (5 extensions actives
+    affichees running:false sans aucune indication) est typique de ces
+    mismatches silencieux : un display_name qui ne matche pas le log file, un
+    process qui n'apparait dans aucune fingerprint connue, un log inactif
+    depuis longtemps, etc.
+
+    Retourne un dict {extensions: [...], summary: {...}}.
+    Pour chaque extension, on tente d'abord de matcher le log via le nom
+    (display_name), puis via le slug d'id si echec.
+    """
+    if not EXTENSIONS_INSTALL_FILE.exists():
+        return {"extensions": [], "summary": {"total": 0, "with_warnings": 0}}
+    try:
+        raw = json.loads(EXTENSIONS_INSTALL_FILE.read_text(errors="replace"))
+    except Exception:
+        return {"extensions": [], "summary": {"total": 0, "with_warnings": 0}}
+
+    raw_entries = []
+    if isinstance(raw, list):
+        raw_entries = raw
+    elif isinstance(raw, dict):
+        for key in ("installations", "extensions"):
+            if isinstance(raw.get(key), list):
+                raw_entries = raw[key]
+                break
+            if isinstance(raw.get(key), dict):
+                raw_entries = list(raw[key].values())
+                break
+        if not raw_entries and all(isinstance(v, dict) for v in raw.values()):
+            raw_entries = list(raw.values())
+
+    raw_by_id = {}
+    for e in raw_entries:
+        if isinstance(e, dict):
+            eid = e.get("id") or e.get("extensionId") or e.get("identifier")
+            if eid:
+                raw_by_id[eid] = e
+
+    out = []
+    for ext in _list_extensions():
+        ext_id = ext["id"]
+        name = ext["name"]
+        raw_entry = raw_by_id.get(ext_id, {})
+        manifest = raw_entry.get("manifest") if isinstance(raw_entry.get("manifest"), dict) else None
+        has_manifest = manifest is not None
+        has_display_name = bool(manifest.get("display_name")) if has_manifest else False
+
+        id_slug = str(ext_id).split(".")[-1]
+        log, method = _find_mcp_log(name, return_method=True)
+        if not log and id_slug and id_slug.lower() != name.lower():
+            log2, _m2 = _find_mcp_log(id_slug, return_method=True)
+            if log2:
+                log = log2
+                method = "fallback_id_slug"
+        log_path = str(log) if log else None
+        log_mtime_age = None
+        if log:
+            try:
+                log_mtime_age = int(time.time() - log.stat().st_mtime)
+            except Exception:
+                log_mtime_age = None
+
+        pids = []
+        pid_method = "none"
+        candidates = [ext_id, id_slug, name]
+        for fp in candidates:
+            if fp and len(fp) >= 6:
+                p = _safe_pids_for_fingerprint(fp)
+                if p:
+                    pids = p
+                    pid_method = "fingerprint"
+                    break
+        if not pids and log:
+            p = _pids_via_lsof(log)
+            if p:
+                pids = p
+                pid_method = "lsof"
+
+        manifest_version = (manifest or {}).get("version") if has_manifest else None
+        top_version = ext.get("version") or ""
+
+        warnings = []
+        if ext["enabled"] and not log:
+            warnings.append("enabled_but_no_log")
+        if log and log_mtime_age is not None and log_mtime_age > 300:
+            warnings.append("log_inactive_5min")
+        if log and log_mtime_age is not None and log_mtime_age <= 300 and not pids:
+            warnings.append("log_active_no_pid")
+        if has_manifest and not has_display_name:
+            warnings.append("display_name_missing")
+        if not has_manifest:
+            warnings.append("manifest_missing")
+        if manifest_version and top_version and str(manifest_version) != str(top_version):
+            warnings.append("version_mismatch")
+
+        out.append({
+            "id": ext_id,
+            "name": name,
+            "enabled": ext["enabled"],
+            "has_manifest": has_manifest,
+            "has_display_name": has_display_name,
+            "version": top_version,
+            "manifest_version": manifest_version,
+            "log_path": log_path,
+            "log_match_method": method,
+            "log_mtime_age_seconds": log_mtime_age,
+            "pids": pids,
+            "pid_method": pid_method,
+            "warnings": warnings,
+        })
+
+    with_warnings = sum(1 for e in out if e["warnings"])
+    return {
+        "extensions": out,
+        "summary": {"total": len(out), "with_warnings": with_warnings},
+    }
 
 
 def restart_extension(name):
@@ -2375,6 +2503,18 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </div>
 <div id="mcps" class="space-y-2"></div>
 </section>
+<section class="card p-6 mt-6">
+<button onclick="toggleDiagExt()" class="w-full flex items-center justify-between text-left">
+<div>
+<h2 class="text-lg font-semibold" data-i18n="mcp_diag_title">Diagnostics extensions</h2>
+<p class="text-xs text-stone-500 mt-1" data-i18n="mcp_diag_help">Mismatches manifest &harr; log &harr; process pour les Desktop Extensions</p>
+</div>
+<span id="diag-ext-caret" class="text-stone-400">&#9656;</span>
+</button>
+<div id="diag-ext-body" class="hidden mt-4">
+<div id="diag-ext-content" class="text-sm text-stone-500" data-i18n="mcp_diag_loading">Chargement...</div>
+</div>
+</section>
 </div>
 <div data-main-tab="skills" class="hidden">
 <section class="card p-6">
@@ -2740,6 +2880,23 @@ fr: {
   plugins_search_placeholder: "Rechercher un plugin...",
   advanced_warning_title: "Section avancée",
   advanced_warning_text: "éditer ces fichiers peut casser Claude Code. Backups horodatés créés à chaque sauvegarde.",
+  mcp_diag_title: "Diagnostics extensions",
+  mcp_diag_help: "Mismatches manifest ↔ log ↔ process pour les Desktop Extensions",
+  mcp_diag_loading: "Chargement...",
+  mcp_diag_all_ok: "Toutes les extensions sont correctement matchées (manifest, log et process).",
+  mcp_diag_with_warnings: "{n} extension(s) sur {t} avec avertissements",
+  mcp_diag_col_name: "Nom",
+  mcp_diag_col_status: "Statut",
+  mcp_diag_col_warnings: "Avertissements",
+  mcp_diag_status_ok: "OK",
+  mcp_diag_status_warn: "À vérifier",
+  mcp_diag_status_off: "Désactivée",
+  mcp_diag_warn_enabled_but_no_log: "Activée mais aucun fichier log trouvé",
+  mcp_diag_warn_log_inactive_5min: "Log inactif depuis plus de 5 min",
+  mcp_diag_warn_log_active_no_pid: "Log actif mais aucun PID détecté",
+  mcp_diag_warn_display_name_missing: "manifest.display_name absent",
+  mcp_diag_warn_manifest_missing: "manifest absent dans extensions-installations.json",
+  mcp_diag_warn_version_mismatch: "Version manifest != version racine",
 },
 en: {
   header_subtitle: "Claude Desktop control",
@@ -2917,6 +3074,23 @@ en: {
   plugins_search_placeholder: "Search a plugin...",
   advanced_warning_title: "Advanced section",
   advanced_warning_text: "editing these files can break Claude Code. Timestamped backups are created on every save.",
+  mcp_diag_title: "Extension diagnostics",
+  mcp_diag_help: "manifest ↔ log ↔ process mismatches for Desktop Extensions",
+  mcp_diag_loading: "Loading...",
+  mcp_diag_all_ok: "All extensions are matched correctly (manifest, log and process).",
+  mcp_diag_with_warnings: "{n} extension(s) out of {t} with warnings",
+  mcp_diag_col_name: "Name",
+  mcp_diag_col_status: "Status",
+  mcp_diag_col_warnings: "Warnings",
+  mcp_diag_status_ok: "OK",
+  mcp_diag_status_warn: "Check",
+  mcp_diag_status_off: "Disabled",
+  mcp_diag_warn_enabled_but_no_log: "Enabled but no log file found",
+  mcp_diag_warn_log_inactive_5min: "Log inactive for over 5 min",
+  mcp_diag_warn_log_active_no_pid: "Log active but no PID detected",
+  mcp_diag_warn_display_name_missing: "manifest.display_name missing",
+  mcp_diag_warn_manifest_missing: "manifest missing in extensions-installations.json",
+  mcp_diag_warn_version_mismatch: "Manifest version != root version",
 },
 };
 let CURRENT_LANG = (localStorage.getItem('cc-lang') || 'fr');
@@ -3244,6 +3418,51 @@ async function testWatchdogPattern(){
   }
   out.innerHTML = `<div class="mb-1 text-stone-700">${tr('scan_n_matches').split('{n}').join(j.matches.length).split('{p}').join(escAttr(p))}</div>` +
     j.matches.slice(0,8).map(m=>`<div class="font-mono text-[11px] text-stone-500 truncate" title="${escAttr(m.cmd)}"><span class="text-stone-700 font-semibold mr-2">${m.pid}</span>${escAttr(m.cmd.substring(0,180))}</div>`).join('');
+}
+function toggleDiagExt(){
+  const body = document.getElementById('diag-ext-body');
+  const caret = document.getElementById('diag-ext-caret');
+  if(!body || !caret) return;
+  const opening = body.classList.contains('hidden');
+  body.classList.toggle('hidden');
+  caret.innerHTML = opening ? '&#9662;' : '&#9656;';
+  if(opening) loadDiagExt();
+}
+async function loadDiagExt(){
+  const out = document.getElementById('diag-ext-content');
+  if(!out) return;
+  out.innerHTML = `<div class="text-stone-500">${tr('mcp_diag_loading')}</div>`;
+  try{
+    const r = await fetch('/api/diagnose-extensions');
+    if(!r.ok){ out.innerHTML = `<div class="text-red-700">HTTP ${r.status}</div>`; return; }
+    const d = await r.json();
+    const exts = d.extensions || [];
+    const summary = d.summary || {total:0, with_warnings:0};
+    if(exts.length === 0){
+      out.innerHTML = `<div class="text-stone-500">${tr('mcp_diag_all_ok')}</div>`;
+      return;
+    }
+    if(summary.with_warnings === 0){
+      out.innerHTML = `<div class="p-3 rounded-lg bg-green-50 border border-green-200 text-sm text-green-800">${tr('mcp_diag_all_ok')}</div>`;
+      return;
+    }
+    const head = `<div class="text-xs text-stone-600 mb-3">${tr('mcp_diag_with_warnings').split('{n}').join(summary.with_warnings).split('{t}').join(summary.total)}</div>`;
+    const rows = exts.map(e=>{
+      const status = !e.enabled
+        ? `<span class="text-xs text-stone-500 bg-stone-100 px-2 py-0.5 rounded-full">${tr('mcp_diag_status_off')}</span>`
+        : (e.warnings.length === 0
+            ? `<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full">${tr('mcp_diag_status_ok')}</span>`
+            : `<span class="text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full">${tr('mcp_diag_status_warn')}</span>`);
+      const warns = e.warnings.length === 0
+        ? '<span class="text-stone-300">&mdash;</span>'
+        : e.warnings.map(w=>`<div class="text-xs text-amber-800">${tr('mcp_diag_warn_'+w) || w}</div>`).join('');
+      const meta = `<div class="text-[10px] text-stone-400 font-mono mt-0.5">${escAttr(e.id)}${e.log_match_method && e.log_match_method !== 'none' ? ' &middot; '+escAttr(e.log_match_method) : ''}${e.pid_method && e.pid_method !== 'none' ? ' &middot; '+escAttr(e.pid_method) : ''}</div>`;
+      return `<tr class="border-t border-stone-100"><td class="py-2 pr-3 align-top"><div class="text-sm font-medium text-stone-800">${escAttr(e.name)}</div>${meta}</td><td class="py-2 pr-3 align-top">${status}</td><td class="py-2 align-top">${warns}</td></tr>`;
+    }).join('');
+    out.innerHTML = head + `<table class="w-full text-sm"><thead><tr class="text-xs uppercase tracking-wide text-stone-500"><th class="text-left pb-2 pr-3">${tr('mcp_diag_col_name')}</th><th class="text-left pb-2 pr-3">${tr('mcp_diag_col_status')}</th><th class="text-left pb-2">${tr('mcp_diag_col_warnings')}</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch(e){
+    out.innerHTML = `<div class="text-red-700">${escAttr(String(e))}</div>`;
+  }
 }
 async function loadSkillSuggestions(){
   try{
@@ -3640,6 +3859,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(skill_optimization_suggestions())
         elif path == "/api/watchdog":
             self._json(get_watchdog_status())
+        elif path == "/api/diagnose-extensions":
+            self._json(diagnose_extensions())
         elif path.startswith("/api/command/"):
             qs = parse_qs(urlparse(self.path).query)
             source = qs.get("source", ["user"])[0]
