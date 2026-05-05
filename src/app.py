@@ -716,40 +716,30 @@ def _mcp_pids(name):
 
 
 def _mcp_log_says_frozen(name, within_seconds):
-    """Détecte un freeze via le log Claude. Deux signaux :
-    1. Marker d'erreur ('transport closed', 'process exiting early', ...)
-       dans la queue du log, modifié récemment.
-    2. Log inactif (mtime ancien) alors que Claude Desktop est responsive
-       — le MCP a probablement gelé silencieusement (typique de Desktop
-       Commander qui devient muet sans crasher)."""
+    """Detecte un freeze via le log Claude — uniquement sur signal POSITIF
+    (markers d'erreur dans la queue du log).
+
+    v1.6.5 : on ne traite PLUS un mtime ancien comme un freeze. Beaucoup de
+    MCPs n'ecrivent dans leur log que quand ils traitent une requete, donc un
+    MCP sain mais idle a un log vieux de plusieurs minutes — l'ancienne
+    heuristique le tuait alors qu'il etait fonctionnel. Maintenant un freeze
+    n'est declare que si la queue du log contient un marker d'erreur explicite
+    ('transport closed unexpectedly', 'process exiting early', ...).
+    """
     log = _find_mcp_log(name)
     if not log or not log.exists():
         return False
     try:
-        mtime = log.stat().st_mtime
+        text = log.read_text(errors="replace")
     except Exception:
         return False
-    now = time.time()
-    if now - mtime <= within_seconds:
-        try:
-            text = log.read_text(errors="replace")
-            tail = text[-4000:].lower()
-            if any(k in tail for k in (
-                "transport closed unexpectedly",
-                "process exiting early",
-                "process exited early",
-                "server disconnected",
-            )):
-                return True
-        except Exception:
-            pass
-    if now - mtime > max(within_seconds * 2, 120):
-        try:
-            if _claude_responsive(timeout=2):
-                return True
-        except Exception:
-            pass
-    return False
+    tail = text[-4000:].lower()
+    return any(k in tail for k in (
+        "transport closed unexpectedly",
+        "process exiting early",
+        "process exited early",
+        "server disconnected",
+    ))
 
 
 def _claude_pids():
