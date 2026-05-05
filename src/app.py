@@ -836,8 +836,22 @@ def _list_extensions():
         ext_id = e.get("id") or e.get("extensionId") or e.get("identifier")
         if not ext_id:
             continue
-        name = e.get("name") or e.get("displayName") or str(ext_id).split(".")[-1]
-        version = str(e.get("version") or e.get("manifestVersion") or "")
+        # v1.6.3: lire manifest.display_name (puis manifest.name) en priorite.
+        # Le name racine de l'entry est en fait absent (le nom humain est imbrique
+        # dans manifest), donc l'ancien fallback retombait toujours sur le slug
+        # technique de l'id, ce qui cassait le matching log<->extension pour
+        # toute extension dont le display_name differe de son slug
+        # (ex: chrome-control vs "Control Chrome", osascript vs "Control your Mac",
+        # ms_office_word vs "Word (By Anthropic)", etc).
+        manifest = e.get("manifest") if isinstance(e.get("manifest"), dict) else {}
+        name = (
+            manifest.get("display_name")
+            or manifest.get("name")
+            or e.get("name")
+            or e.get("displayName")
+            or str(ext_id).split(".")[-1]
+        )
+        version = str(e.get("version") or e.get("manifestVersion") or manifest.get("version") or "")
         settings = _load_extension_settings(ext_id)
         enabled = bool(settings.get("enabled", e.get("enabled", e.get("status") != "disabled")))
         env_keys = list(settings.get("env", {}).keys()) if isinstance(settings.get("env"), dict) else []
