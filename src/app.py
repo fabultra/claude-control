@@ -1872,6 +1872,19 @@ _DC_GRACEFUL_SHUTDOWN_MARKERS = (
     "server transport closed (intentional shutdown)",
     "shutting down server",
     "process exited gracefully",
+    "client transport closed",
+)
+
+# v1.8.4 - markers d'activite recente. Si l'un d'eux apparait APRES un
+# marker de shutdown dans le tail du log, ca signale qu'une nouvelle
+# instance s'est demarree depuis le shutdown - le log est en realite
+# vivant. Critere positif fort : init explicite ou message protocolaire.
+_MCP_ACTIVE_MARKERS = (
+    "initializing server",
+    "server started",
+    "server connected",
+    "message from client",
+    "message from server",
 )
 
 
@@ -1952,17 +1965,36 @@ def _scan_main_log_for_extension_failures(name_or_id, max_lines=200, max_bytes=1
 
 
 def _log_shows_graceful_shutdown(path, max_lines=20):
-    """v1.8.0 - Retourne True si la queue du log indique un shutdown
-    gracieux (transport closed intentional, shutting down server, ...).
-    Apprentissage 2026-05-06 : un log avec mtime recent peut refleter
-    le shutdown lui-meme, pas une activite en cours. Ne pas classer
-    comme 'idle_legitimate' dans ce cas.
+    """v1.8.0 / v1.8.4 - Retourne True ssi le log se TERMINE par un
+    shutdown gracieux. Apprentissage 2026-05-06 (Bug v1.8.3) : un log
+    persiste au reboot Claude Desktop. Apres reboot, le tail contient
+    typiquement :
+      [ancien CD] Shutting down server...
+      [ancien CD] Client transport closed
+      [nouveau CD] Initializing server...
+      [nouveau CD] Server started and connected successfully
+      [nouveau CD] Message from client: {...}
+    L'ancienne logique 'any shutdown marker in tail' classifiait ce
+    log comme shut down, alors que la nouvelle instance est vivante.
+    Resultat : 7/14 MCPs MCPB en standby legitime classees 'Inactifs'.
+
+    Fix v1.8.4 : on scanne le tail en ordre INVERSE, on s'arrete au
+    premier marker trouve. Si le dernier marker est un activity (init,
+    Server started, Message from ...), on retourne False (vivant). Si
+    c'est un shutdown, True. Si aucun marker connu, conservateur :
+    False (statu quo, log considere comme vivant tant qu'on n'a pas
+    de signal explicite).
     """
     tail = _read_log_tail(path, max_lines=max_lines)
     if not tail:
         return False
-    blob = "\n".join(tail).lower()
-    return any(m in blob for m in _DC_GRACEFUL_SHUTDOWN_MARKERS)
+    for line in reversed(tail):
+        line_lc = line.lower()
+        if any(m in line_lc for m in _MCP_ACTIVE_MARKERS):
+            return False  # activite recente, log vivant
+        if any(m in line_lc for m in _DC_GRACEFUL_SHUTDOWN_MARKERS):
+            return True  # shutdown recent, log mort
+    return False  # aucun marker connu, conservateur
 
 
 def _classify_dc_log_freeze_type(path, max_lines=200):
