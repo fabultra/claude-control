@@ -184,6 +184,21 @@ def _list_plugin_skills():
     return items
 
 
+def _skill_quality(description):
+    """v1.7.7 - Classifie un skill par qualite de description, qui est le
+    seul facteur qui determine si Claude le declenche automatiquement.
+    - 'broken'    : pas de description -> ne se declenche jamais
+    - 'enrich'    : description < 30 chars -> peu fiable
+    - 'excellent' : description >= 30 chars
+    """
+    desc = (description or "").strip()
+    if not desc:
+        return "broken"
+    if len(desc) < 30:
+        return "enrich"
+    return "excellent"
+
+
 def get_state():
     config = load_config()
     active = config.get("mcpServers", {})
@@ -195,6 +210,14 @@ def get_state():
                             if d.is_dir() and (d / "SKILL.md").exists() and not d.name.startswith(".")])
     disabled_skills = sorted([d.name for d in SKILLS_DISABLED_DIR.iterdir()
                               if d.is_dir() and not d.name.startswith(".")])
+    # v1.7.7 - usage counts par skill via parsing JSONL des sessions Claude Code,
+    # injecte par skill pour rendre actionable la qualite vs usage dans la tab.
+    try:
+        usage = get_skill_usage(days=30)
+        usage_counts = usage.get("counts", {}) if isinstance(usage, dict) else {}
+    except Exception:
+        usage_counts = {}
+
     def _skill_entry(name, base, active, source):
         meta = read_skill_meta(base / name)
         return {
@@ -205,6 +228,8 @@ def get_state():
             "tags": meta["tags"],
             "source": source,
             "editable": source == "user",
+            "quality": _skill_quality(meta["description"]),
+            "usage_count": int(usage_counts.get(name, 0)),
         }
     skills = [_skill_entry(n, SKILLS_DIR, True, "user") for n in active_skills]
     skills += [_skill_entry(n, SKILLS_DISABLED_DIR, False, "user") for n in disabled_skills]
@@ -221,6 +246,8 @@ def get_state():
             "tags": meta["tags"],
             "source": it["_source"],
             "editable": False,
+            "quality": _skill_quality(meta["description"]),
+            "usage_count": int(usage_counts.get(it["name"], 0)),
         })
     mcps_list = (
         [{"name": n, "active": True, "running": n in running, "type": "classic"} for n in sorted(active.keys())]
@@ -3148,12 +3175,17 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </section>
 </div>
 <div data-main-tab="skills" class="hidden">
-<section class="card p-6">
-<h2 class="text-lg font-semibold mb-1" data-i18n="skills">Skills</h2>
-<p class="text-xs text-stone-500 mb-4" data-i18n="skills_help">Coché = disponible pour Claude</p>
-<input id="skills-search" type="search" oninput="filterSkills()" data-i18n-placeholder="skills_search_placeholder" placeholder="Rechercher un skill (nom ou description)..." class="w-full mb-3 p-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:border-stone-400"/>
-<div id="skills" class="space-y-2 max-h-[600px] overflow-y-auto"></div>
+<section id="skills-health-banner" class="card p-4 mb-4"></section>
+<div class="grid grid-cols-1 md:grid-cols-[260px_1fr] gap-4">
+<aside class="card p-4 md:sticky md:top-4 md:self-start md:max-h-[calc(100vh-2rem)] md:overflow-y-auto">
+<input id="skills-search" type="search" oninput="filterSkills()" data-i18n-placeholder="skills_search_placeholder" placeholder="Rechercher..." class="w-full mb-4 p-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:border-stone-400"/>
+<div id="skills-filters" class="space-y-4 text-sm"></div>
+</aside>
+<section>
+<div id="skills-bulkbar" class="hidden card p-3 mb-3 flex items-center gap-3 bg-stone-900 text-white"></div>
+<div id="skills" class="grid grid-cols-1 lg:grid-cols-2 gap-3"></div>
 </section>
+</div>
 </div>
 <div data-main-tab="plugins" class="hidden">
 <section class="card p-6">
@@ -3554,6 +3586,34 @@ fr: {
   skill_filter_all: "Tous",
   skill_filter_all_cats: "Toutes les catégories",
   category_filter: "Catégorie",
+  skills_health_title: "Santé de tes skills",
+  skills_health_ready: "prêts à se déclencher",
+  skills_health_all_good: "Tous tes skills sont en bonne forme",
+  chip_broken_action: "à corriger (sans description)",
+  chip_enrich_action: "à enrichir (description courte)",
+  chip_duplicate_action: "doublons à nettoyer",
+  filter_status: "État",
+  filter_status_active: "Actifs",
+  filter_status_inactive: "Inactifs",
+  filter_quality: "Qualité",
+  quality_excellent: "Excellents",
+  quality_enrich: "À enrichir",
+  quality_broken: "Cassés",
+  quality_broken_hint: "Sans description : ne se déclenchera jamais automatiquement.",
+  filter_usage: "Usage (30j)",
+  filter_usage_top: "Top 10",
+  filter_usage_recent: "Utilisés",
+  filter_usage_never: "Jamais utilisés",
+  filter_source: "Source",
+  filter_all: "Tous",
+  toggle_skill_title: "Activer / désactiver le skill",
+  select_for_bulk_title: "Sélectionner pour action groupée",
+  selected_count: "sélectionné(s)",
+  bulk_disable_btn: "Désactiver",
+  bulk_delete_btn: "Supprimer",
+  confirm_bulk_disable: "Désactiver les {n} skills sélectionnés ?\\n\\nIls passent dans skills-disabled. Toujours réactivables un par un ensuite.\\n\\nCONFIRMER ?",
+  confirm_bulk_delete: "Supprimer définitivement les {n} skills sélectionnés ?\\n\\nUn backup zip individuel par skill est créé dans ~/.claude/backups/claude-control/.\\n\\nCONFIRMER ?",
+  skills_empty_with_filters: "Aucun skill ne correspond aux filtres actifs.",
   source_badge_user: "perso",
   source_badge_plugin: "plugin",
   confirm_restart_mcp: "Redémarrer le MCP « {name} » ?\\n\\nLe process sera tué puis Claude Desktop le respawn automatiquement (toggle config). Tes conversations Claude restent intactes.",
@@ -3780,6 +3840,34 @@ en: {
   skill_filter_all: "All",
   skill_filter_all_cats: "All categories",
   category_filter: "Category",
+  skills_health_title: "Skills health",
+  skills_health_ready: "ready to trigger",
+  skills_health_all_good: "All your skills are in good shape",
+  chip_broken_action: "to fix (no description)",
+  chip_enrich_action: "to enrich (short description)",
+  chip_duplicate_action: "duplicates to clean",
+  filter_status: "Status",
+  filter_status_active: "Active",
+  filter_status_inactive: "Inactive",
+  filter_quality: "Quality",
+  quality_excellent: "Excellent",
+  quality_enrich: "To enrich",
+  quality_broken: "Broken",
+  quality_broken_hint: "No description: will never auto-trigger.",
+  filter_usage: "Usage (30d)",
+  filter_usage_top: "Top 10",
+  filter_usage_recent: "Used",
+  filter_usage_never: "Never used",
+  filter_source: "Source",
+  filter_all: "All",
+  toggle_skill_title: "Enable / disable the skill",
+  select_for_bulk_title: "Select for bulk action",
+  selected_count: "selected",
+  bulk_disable_btn: "Disable",
+  bulk_delete_btn: "Delete",
+  confirm_bulk_disable: "Disable the {n} selected skills?\\n\\nThey move to skills-disabled. Re-enable any one of them later.\\n\\nCONFIRM?",
+  confirm_bulk_delete: "Permanently delete the {n} selected skills?\\n\\nAn individual zip backup per skill is created under ~/.claude/backups/claude-control/.\\n\\nCONFIRM?",
+  skills_empty_with_filters: "No skill matches the active filters.",
   source_badge_user: "yours",
   source_badge_plugin: "plugin",
   confirm_restart_mcp: 'Restart MCP "{name}"?\\n\\nThe process will be killed and Claude Desktop will respawn it automatically (config toggle). Your Claude conversations stay intact.',
@@ -3940,88 +4028,216 @@ async function restartClaudeDesktop(){
 
 function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');}
 let SKILL_USAGE = {};
-let SKILL_SOURCE_FILTER = (localStorage.getItem('cc-skill-src') || 'user');
-let SKILL_CAT_FILTER = '';
+let SKILL_SOURCE_FILTER = (localStorage.getItem('cc-skill-src') || 'all');
+let SKILL_CAT_FILTER = (localStorage.getItem('cc-skill-cat') || '');
 function setSkillSourceFilter(src){
   SKILL_SOURCE_FILTER = src;
   localStorage.setItem('cc-skill-src', src);
+  if(typeof SKILL_SELECTED !== 'undefined') SKILL_SELECTED.clear();
   if(typeof loadState==='function') loadState();
 }
 function setSkillCatFilter(cat){
   SKILL_CAT_FILTER = cat;
+  localStorage.setItem('cc-skill-cat', cat);
+  if(typeof SKILL_SELECTED !== 'undefined') SKILL_SELECTED.clear();
   if(typeof loadState==='function') loadState();
 }
-function renderSkills(skills){
-  if(!skills || skills.length===0) return `<p class="text-stone-400 text-sm">${tr('no_skill')}</p>`;
+// v1.7.7 - refactor complet 3 zones (health banner + sidebar filters + cards
+// grid). Filtres orthogonaux : status, qualite, usage, source, categorie.
+// Tout le state est persiste dans localStorage pour survivre aux reloads.
+let SKILL_STATUS_FILTER  = (localStorage.getItem('cc-skill-status') || 'all');     // all|active|inactive
+let SKILL_QUALITY_FILTER = (localStorage.getItem('cc-skill-quality') || 'all');    // all|excellent|enrich|broken
+let SKILL_USAGE_FILTER   = (localStorage.getItem('cc-skill-usage') || 'all');      // all|top|recent|never
+let SKILL_SELECTED       = new Set();
+function setSkillStatusFilter(v){ SKILL_STATUS_FILTER=v; localStorage.setItem('cc-skill-status', v); SKILL_SELECTED.clear(); loadState(); }
+function setSkillQualityFilter(v){ SKILL_QUALITY_FILTER=v; localStorage.setItem('cc-skill-quality', v); SKILL_SELECTED.clear(); loadState(); }
+function setSkillUsageFilter(v){ SKILL_USAGE_FILTER=v; localStorage.setItem('cc-skill-usage', v); SKILL_SELECTED.clear(); loadState(); }
+function _skillCat(sk){ return sk.category || sk.auto_category || tr('general_category'); }
+function _qualityClass(q){
+  if(q==='excellent') return {bg:'bg-green-50', text:'text-green-700', border:'border-green-200', dot:'bg-green-500', label:tr('quality_excellent')};
+  if(q==='enrich')    return {bg:'bg-amber-50', text:'text-amber-700', border:'border-amber-200', dot:'bg-amber-500', label:tr('quality_enrich')};
+  return                     {bg:'bg-red-50',   text:'text-red-700',   border:'border-red-200',   dot:'bg-red-500',   label:tr('quality_broken')};
+}
+function _applySkillFilters(skills){
+  let f = skills;
+  if(SKILL_STATUS_FILTER==='active')   f = f.filter(s=>s.active);
+  if(SKILL_STATUS_FILTER==='inactive') f = f.filter(s=>!s.active);
+  if(SKILL_QUALITY_FILTER!=='all')     f = f.filter(s=>s.quality===SKILL_QUALITY_FILTER);
+  if(SKILL_SOURCE_FILTER==='user')     f = f.filter(s=>s.source==='user');
+  else if(SKILL_SOURCE_FILTER==='plugin') f = f.filter(s=>s.source!=='user');
+  if(SKILL_CAT_FILTER)                 f = f.filter(s=>_skillCat(s)===SKILL_CAT_FILTER);
+  if(SKILL_USAGE_FILTER==='never')     f = f.filter(s=>(s.usage_count||0)===0);
+  else if(SKILL_USAGE_FILTER==='recent') f = f.filter(s=>(s.usage_count||0)>0);
+  else if(SKILL_USAGE_FILTER==='top'){
+    const top = [...skills].sort((a,b)=>(b.usage_count||0)-(a.usage_count||0)).slice(0,10).map(s=>s.name);
+    const set = new Set(top);
+    f = f.filter(s=>set.has(s.name));
+  }
+  return f;
+}
+function _renderHealthBanner(skills){
+  const total = skills.length;
+  const excellent = skills.filter(s=>s.quality==='excellent').length;
+  const enrich = skills.filter(s=>s.quality==='enrich').length;
+  const broken = skills.filter(s=>s.quality==='broken').length;
+  const ratio = total>0 ? Math.round(excellent/total*100) : 0;
+  const barColor = ratio>=80 ? 'bg-green-500' : (ratio>=50 ? 'bg-amber-500' : 'bg-red-500');
+  // Compte des doublons user/plugin (action via cleanupDuplicateUserSkills)
+  const userNames = new Set(skills.filter(s=>s.source==='user').map(s=>s.name));
+  const pluginNames = new Set(skills.filter(s=>s.source!=='user').map(s=>s.name));
+  let dups = 0; userNames.forEach(n=>{ if(pluginNames.has(n)) dups++; });
+  const chipBroken = broken>0 ? `<button onclick="setSkillQualityFilter('broken')" class="text-xs px-2.5 py-1 rounded-full bg-red-50 text-red-700 border border-red-200 hover:bg-red-100">${broken} ${tr('chip_broken_action')}</button>` : '';
+  const chipEnrich = enrich>0 ? `<button onclick="setSkillQualityFilter('enrich')" class="text-xs px-2.5 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100">${enrich} ${tr('chip_enrich_action')}</button>` : '';
+  const chipDup = dups>0 ? `<button onclick="cleanupDuplicateUserSkills()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${dups} ${tr('chip_duplicate_action')}</button>` : '';
+  const allOk = (broken+enrich+dups)===0 ? `<span class="text-xs text-green-700">${tr('skills_health_all_good')}</span>` : '';
+  const banner = document.getElementById('skills-health-banner');
+  if(!banner) return;
+  banner.innerHTML = `
+    <div class="flex items-baseline justify-between mb-2 flex-wrap gap-2">
+      <h2 class="text-lg font-semibold">${tr('skills_health_title')}</h2>
+      <span class="text-xs text-stone-500">${excellent}/${total} ${tr('skills_health_ready')}</span>
+    </div>
+    <div class="w-full h-2 rounded-full bg-stone-100 overflow-hidden mb-3"><div class="h-full ${barColor}" style="width:${ratio}%"></div></div>
+    <div class="flex flex-wrap gap-2">${chipBroken}${chipEnrich}${chipDup}${allOk}</div>
+  `;
+}
+function _renderFiltersSidebar(skills){
+  const el = document.getElementById('skills-filters');
+  if(!el) return;
+  const total = skills.length;
+  const active = skills.filter(s=>s.active).length;
   const userCount = skills.filter(s=>s.source==='user').length;
-  const pluginCount = skills.length - userCount;
-  let filtered;
-  if(SKILL_SOURCE_FILTER === 'user') filtered = skills.filter(s=>s.source==='user');
-  else if(SKILL_SOURCE_FILTER === 'plugin') filtered = skills.filter(s=>s.source!=='user');
-  else filtered = skills;
-  // Build category list for the dropdown — based on filtered set
-  const allCats = new Set();
-  filtered.forEach(sk=>{allCats.add(sk.category || sk.auto_category || tr('general_category'));});
-  const sortedCats = Array.from(allCats).sort((a,b)=>{
-    if(a===tr('general_category')) return 1; if(b===tr('general_category')) return -1;
-    return a.localeCompare(b);
+  const pluginCount = total - userCount;
+  const qExc = skills.filter(s=>s.quality==='excellent').length;
+  const qEnr = skills.filter(s=>s.quality==='enrich').length;
+  const qBro = skills.filter(s=>s.quality==='broken').length;
+  const usageNever = skills.filter(s=>(s.usage_count||0)===0).length;
+  const usageRecent = skills.filter(s=>(s.usage_count||0)>0).length;
+  const allCats = {};
+  skills.forEach(s=>{ const c=_skillCat(s); allCats[c]=(allCats[c]||0)+1; });
+  const catEntries = Object.entries(allCats).sort((a,b)=>{
+    if(a[0]===tr('general_category')) return 1;
+    if(b[0]===tr('general_category')) return -1;
+    return a[0].localeCompare(b[0]);
   });
-  if(SKILL_CAT_FILTER) filtered = filtered.filter(sk=>(sk.category || sk.auto_category || tr('general_category')) === SKILL_CAT_FILTER);
-  const cats = SKILL_CAT_FILTER ? [SKILL_CAT_FILTER] : sortedCats;
-  // Source filter pills
-  const pill = (val, label, count) => `<button onclick="setSkillSourceFilter('${val}')" class="px-3 py-1 text-xs rounded-full font-medium ${SKILL_SOURCE_FILTER===val ? 'bg-stone-900 text-white' : 'bg-stone-100 text-stone-700 hover:bg-stone-200'}">${escAttr(label)} <span class="opacity-70">(${count})</span></button>`;
-  const sourceBar = `<div class="flex flex-wrap items-center gap-2 mb-3">${pill('user', tr('skill_filter_mine'), userCount)}${pill('plugin', tr('skill_filter_plugins'), pluginCount)}${pill('all', tr('skill_filter_all'), skills.length)}</div>`;
-  // Category dropdown
-  const catOptions = `<option value="">${tr('skill_filter_all_cats')}</option>` + sortedCats.map(c=>`<option value="${escAttr(c)}" ${SKILL_CAT_FILTER===c?'selected':''}>${escAttr(c)}</option>`).join('');
-  const catBar = `<div class="flex items-center gap-2 mb-4 text-xs"><label class="text-stone-500">${tr('category_filter')}:</label><select onchange="setSkillCatFilter(this.value)" class="border border-stone-200 rounded px-2 py-1 bg-white">${catOptions}</select></div>`;
-  if(filtered.length === 0) return sourceBar + catBar + `<p class="text-stone-400 text-sm">${tr('no_skill')}</p>`;
-  // Group filtered by category
-  const groups = {};
-  filtered.forEach(sk=>{
-    const cat = sk.category || sk.auto_category || tr('general_category');
-    (groups[cat] = groups[cat] || []).push(sk);
-  });
-  const blocks = cats.filter(c=>groups[c]).map(cat=>{
-    const items = groups[cat].map(sk=>{
-      const desc = sk.description || '';
-      const search = (sk.name + ' ' + desc).toLowerCase();
-      const descHtml = desc ? `<span class="text-xs text-stone-500 truncate">${escAttr(desc)}</span>` : '';
-      const tagHtml = (sk.tags||[]).slice(0,4).map(t=>`<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded">${escAttr(t)}</span>`).join('');
-      const autoHint = (!sk.category && sk.auto_category) ? `<span class="text-[10px] text-stone-400 italic">${tr('auto_cat_hint')}</span>` : '';
-      const sourceBadge = sk.source==='user'
-        ? `<span class="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded">${tr('source_badge_user')}</span>`
-        : `<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded" title="${escAttr(sk.source)}">${tr('source_badge_plugin')}</span>`;
-      const usageCount = SKILL_USAGE[sk.name] || 0;
-      const usageBadge = usageCount > 0 ? `<span class="text-[10px] text-stone-500 bg-stone-100 px-1.5 py-0.5 rounded font-mono" title="${tr('used_x_times').split('{n}').join(usageCount)}">${usageCount}×</span>` : '';
-      const editable = sk.editable !== false;
-      const checkbox = editable
-        ? `<input type="checkbox" ${sk.active?'checked':''} onchange="toggleSkill('${sk.name}')" class="w-5 h-5 rounded accent-green-700 shrink-0">`
-        : `<span class="w-5 h-5 inline-flex items-center justify-center text-stone-300 shrink-0" title="${tr('readonly')}">&#128274;</span>`;
-      const deleteBtn = editable
-        ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteSkill('${sk.name}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>`
-        : '';
-      return `<label data-skill data-search="${escAttr(search)}" class="flex items-center gap-3 p-2.5 rounded-lg hover:bg-stone-50 cursor-pointer border ${sk.active?'border-stone-200':'border-stone-100 opacity-60'}">${checkbox}<div class="flex flex-col min-w-0 flex-1"><div class="flex items-baseline gap-2 flex-wrap"><span class="font-medium text-sm truncate">${escAttr(sk.name)}</span>${sourceBadge}${usageBadge}${tagHtml}${autoHint}</div>${descHtml}</div>${deleteBtn}</label>`;
-    }).join('');
-    return `<details data-skill-cat="${escAttr(cat)}" open class="mb-3"><summary class="cursor-pointer text-sm font-semibold text-stone-800 mb-2 px-1 select-none hover:text-stone-900">${escAttr(cat)} <span class="text-stone-400 font-normal text-xs" data-cat-count>(${groups[cat].length})</span></summary><div class="space-y-1.5">${items}</div></details>`;
-  }).join('');
-  return sourceBar + catBar + blocks;
+  const radio = (group, val, label, count, cur, fn) =>
+    `<button onclick="${fn}('${val}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${cur===val?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${escAttr(label)}</span><span class="text-xs ${cur===val?'opacity-80':'text-stone-400'}">${count}</span></button>`;
+  el.innerHTML = `
+    <div>
+      <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_status')}</div>
+      ${radio('status','all',tr('filter_all'),total,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','active',tr('filter_status_active'),active,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','inactive',tr('filter_status_inactive'),total-active,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+    </div>
+    <div>
+      <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_quality')}</div>
+      ${radio('quality','all',tr('filter_all'),total,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','excellent',tr('quality_excellent'),qExc,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','enrich',tr('quality_enrich'),qEnr,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','broken',tr('quality_broken'),qBro,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+    </div>
+    <div>
+      <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_usage')}</div>
+      ${radio('usage','all',tr('filter_all'),total,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','top',tr('filter_usage_top'),Math.min(10,usageRecent),SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','recent',tr('filter_usage_recent'),usageRecent,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','never',tr('filter_usage_never'),usageNever,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+    </div>
+    <div>
+      <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_source')}</div>
+      ${radio('source','all',tr('filter_all'),total,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','user',tr('skill_filter_mine'),userCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','plugin',tr('skill_filter_plugins'),pluginCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+    </div>
+    <div>
+      <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('category_filter')}</div>
+      <button onclick="setSkillCatFilter('')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${!SKILL_CAT_FILTER?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${tr('skill_filter_all_cats')}</span><span class="text-xs ${!SKILL_CAT_FILTER?'opacity-80':'text-stone-400'}">${total}</span></button>
+      ${catEntries.map(([c,n])=>`<button onclick="setSkillCatFilter('${escAttr(c)}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${SKILL_CAT_FILTER===c?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span class="truncate">${escAttr(c)}</span><span class="text-xs ${SKILL_CAT_FILTER===c?'opacity-80':'text-stone-400'} ml-2 shrink-0">${n}</span></button>`).join('')}
+    </div>
+  `;
+}
+function _renderSkillCard(sk){
+  const q = _qualityClass(sk.quality);
+  const sourceBadge = sk.source==='user'
+    ? `<span class="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded">${tr('source_badge_user')}</span>`
+    : `<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded" title="${escAttr(sk.source)}">${tr('source_badge_plugin')}</span>`;
+  const usageBadge = (sk.usage_count||0)>0
+    ? `<span class="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded font-mono" title="${tr('used_x_times').split('{n}').join(sk.usage_count)}">${sk.usage_count}&times;</span>`
+    : '';
+  const cat = _skillCat(sk);
+  const catBadge = `<span class="text-[10px] bg-stone-100 text-stone-500 px-1.5 py-0.5 rounded">${escAttr(cat)}</span>`;
+  const desc = (sk.description || '').trim();
+  const descHtml = desc
+    ? `<p class="text-xs text-stone-600 mt-2 line-clamp-2">${escAttr(desc)}</p>`
+    : `<p class="text-xs italic text-red-700 mt-2">${tr('quality_broken_hint')}</p>`;
+  const editable = sk.editable !== false;
+  const checkbox = editable
+    ? `<input type="checkbox" ${sk.active?'checked':''} onchange="event.stopPropagation();toggleSkill('${escAttr(sk.name)}')" class="w-4 h-4 rounded accent-green-700 shrink-0" title="${tr('toggle_skill_title')}">`
+    : `<span class="w-4 h-4 inline-flex items-center justify-center text-stone-300 shrink-0" title="${tr('readonly')}">&#128274;</span>`;
+  const deleteBtn = editable
+    ? `<button type="button" onclick="event.stopPropagation();deleteSkill('${escAttr(sk.name)}')" class="text-[11px] text-stone-400 hover:text-red-700 hover:underline">${tr('btn_delete')}</button>`
+    : '';
+  const checked = SKILL_SELECTED.has(sk.name) ? 'checked' : '';
+  const selectCheckbox = `<input type="checkbox" ${checked} onchange="event.stopPropagation();toggleSkillSelect('${escAttr(sk.name)}', this.checked)" class="w-3.5 h-3.5 rounded accent-stone-700 shrink-0" title="${tr('select_for_bulk_title')}">`;
+  return `<div data-skill data-search="${escAttr((sk.name+' '+desc).toLowerCase())}" class="card p-3 border-l-4 ${q.border} ${sk.active?'':'opacity-60'}">
+    <div class="flex items-start gap-2">
+      ${selectCheckbox}
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-2 mb-0.5">
+          <span class="inline-block w-1.5 h-1.5 rounded-full ${q.dot}" title="${escAttr(q.label)}"></span>
+          <span class="font-semibold text-sm truncate">${escAttr(sk.name)}</span>
+        </div>
+        <div class="flex flex-wrap items-center gap-1">${catBadge}${sourceBadge}${usageBadge}</div>
+        ${descHtml}
+      </div>
+      <div class="flex flex-col items-end gap-1 shrink-0">${checkbox}${deleteBtn}</div>
+    </div>
+  </div>`;
+}
+function _renderBulkBar(){
+  const bar = document.getElementById('skills-bulkbar');
+  if(!bar) return;
+  const n = SKILL_SELECTED.size;
+  if(n===0){ bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  bar.innerHTML = `<span class="text-xs">${n} ${tr('selected_count')}</span>
+    <button onclick="bulkDisableSelectedSkills()" class="text-xs px-3 py-1 rounded bg-stone-700 hover:bg-stone-600">${tr('bulk_disable_btn')}</button>
+    <button onclick="bulkDeleteSelectedSkills()" class="text-xs px-3 py-1 rounded bg-red-700 hover:bg-red-600">${tr('bulk_delete_btn')}</button>
+    <button onclick="SKILL_SELECTED.clear();loadState();" class="text-xs px-3 py-1 rounded bg-stone-600 hover:bg-stone-500 ml-auto">${tr('btn_cancel')}</button>`;
+}
+function toggleSkillSelect(name, on){
+  if(on) SKILL_SELECTED.add(name); else SKILL_SELECTED.delete(name);
+  _renderBulkBar();
+}
+async function bulkDisableSelectedSkills(){
+  const names = Array.from(SKILL_SELECTED);
+  if(names.length===0) return;
+  if(!confirm(tr('confirm_bulk_disable').split('{n}').join(names.length))) return;
+  for(const n of names){ await api('/api/toggle-skill', {name:n}); }
+  SKILL_SELECTED.clear(); loadState();
+}
+async function bulkDeleteSelectedSkills(){
+  const names = Array.from(SKILL_SELECTED);
+  if(names.length===0) return;
+  if(!confirm(tr('confirm_bulk_delete').split('{n}').join(names.length))) return;
+  for(const n of names){ await api('/api/delete-skill', {name:n}); }
+  SKILL_SELECTED.clear(); loadState(); loadOverview();
+}
+function renderSkills(skills){
+  _renderHealthBanner(skills);
+  _renderFiltersSidebar(skills);
+  if(!skills || skills.length===0) return `<p class="text-stone-400 text-sm col-span-full">${tr('no_skill')}</p>`;
+  const filtered = _applySkillFilters(skills);
+  if(filtered.length === 0) return `<p class="text-stone-400 text-sm col-span-full italic p-4">${tr('skills_empty_with_filters')}</p>`;
+  return filtered.map(_renderSkillCard).join('');
 }
 function filterSkills(){
   const q = (document.getElementById('skills-search').value || '').trim().toLowerCase();
   const root = document.getElementById('skills');
+  if(!root) return;
   root.querySelectorAll('[data-skill]').forEach(el=>{
     const match = !q || (el.getAttribute('data-search')||'').includes(q);
     el.classList.toggle('hidden', !match);
-  });
-  root.querySelectorAll('[data-skill-cat]').forEach(d=>{
-    const visible = d.querySelectorAll('[data-skill]:not(.hidden)').length;
-    d.classList.toggle('hidden', visible===0);
-    if(q && visible>0) d.setAttribute('open','');
-    const counter = d.querySelector('[data-cat-count]');
-    if(counter){
-      const total = d.querySelectorAll('[data-skill]').length;
-      counter.textContent = q ? `(${visible}/${total})` : `(${total})`;
-    }
   });
 }
 function pluginContentBadge(c){
