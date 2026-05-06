@@ -1182,6 +1182,184 @@ def _list_extensions():
     return items
 
 
+def _list_raw_extensions():
+    """v1.8.1 - Variante de _list_extensions qui retourne aussi le manifest
+    brut, utilise par _detect_mcp_conflicts pour comparer avec les args du
+    classic MCP (matcher npm package name comme signal de conflit fort)."""
+    if not EXTENSIONS_INSTALL_FILE.exists():
+        return []
+    try:
+        data = json.loads(EXTENSIONS_INSTALL_FILE.read_text(errors="replace"))
+    except Exception:
+        return []
+    entries = []
+    if isinstance(data, list):
+        entries = data
+    elif isinstance(data, dict):
+        for key in ("installations", "extensions"):
+            if isinstance(data.get(key), list):
+                entries = data[key]
+                break
+            if isinstance(data.get(key), dict):
+                entries = list(data[key].values())
+                break
+        if not entries and all(isinstance(v, dict) for v in data.values()):
+            entries = list(data.values())
+    out = []
+    for e in entries:
+        if isinstance(e, dict) and (e.get("id") or e.get("extensionId") or e.get("identifier")):
+            out.append(e)
+    return out
+
+
+def _normalize_mcp_name(s):
+    """v1.8.1 - Normalisation cohérente avec _find_mcp_log (v1.6.3) :
+    lowercase + suppression de tout char non alphanum. Permet de matcher
+    'Desktop Commander' (display_name MCPB) avec 'desktop-commander'
+    (clé config) -> 'desktopcommander' des deux cotes."""
+    if not s:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+_NPM_PACKAGE_RE = re.compile(r"@[a-z0-9][a-z0-9\-_.]*/[a-z0-9][a-z0-9\-_.]+", re.IGNORECASE)
+
+
+def _extract_npm_packages(value):
+    """v1.8.1 - Extrait recursivement les patterns @scope/package des
+    valeurs (str, list, dict). Retourne un set de packages normalises
+    en lowercase."""
+    found = set()
+
+    def _walk(v):
+        if isinstance(v, str):
+            for m in _NPM_PACKAGE_RE.findall(v):
+                found.add(m.lower())
+        elif isinstance(v, list):
+            for it in v:
+                _walk(it)
+        elif isinstance(v, dict):
+            for it in v.values():
+                _walk(it)
+
+    _walk(value)
+    return found
+
+
+def _detect_mcp_conflicts():
+    """v1.8.1 - Croise Desktop Extensions et entrees classic dans
+    claude_desktop_config.json -> mcpServers / _disabledMcps. Retourne
+    la liste des conflits detectes.
+
+    Apprentissage 2026-05-06 : DC tournait en double (extension MCPB
+    'ant.dir.gh.wonderwhy-er.desktopcommandermcp' + cle 'desktop-commander'
+    en npx dans le config). 16 Helper Nodes au lieu de 8. Cause probable
+    du freeze Type B (concurrence + duplicate tool calls).
+
+    Critere de conflit (l'un des deux suffit, both=match fort) :
+      - name : nom normalise extension == nom normalise cle config
+        ('Desktop Commander' -> 'desktopcommander', 'desktop-commander'
+        -> 'desktopcommander')
+      - package : meme @scope/package dans args du config ET dans
+        manifest extension (signal fort, pas de faux positifs).
+
+    Pour chaque conflit, recommandation par defaut : remove_classic.
+    Les extensions sont managees (marketplace), les entrees manuelles
+    config dupliquent des extensions et peuvent rester orphelines apres
+    une mise a jour MCPB. Garder l'extension comme source de verite.
+    """
+    config = load_config()
+    classic_active = config.get("mcpServers", {}) or {}
+    classic_disabled = config.get("_disabledMcps", {}) or {}
+    raw_exts = _list_raw_extensions()
+
+    # Pour chaque extension : nom normalise + packages npm extraits du manifest
+    ext_index = []
+    for e in raw_exts:
+        eid = e.get("id") or e.get("extensionId") or e.get("identifier")
+        manifest = e.get("manifest") if isinstance(e.get("manifest"), dict) else {}
+        display = (
+            manifest.get("display_name")
+            or manifest.get("name")
+            or e.get("name")
+            or e.get("displayName")
+            or str(eid).split(".")[-1]
+        )
+        ext_index.append({
+            "id": eid,
+            "name": str(display),
+            "norm_name": _normalize_mcp_name(display),
+            "norm_id_slug": _normalize_mcp_name(str(eid).split(".")[-1]),
+            "packages": _extract_npm_packages(manifest) | _extract_npm_packages(e),
+            "enabled": bool(_load_extension_settings(eid).get("enabled", True)),
+        })
+
+    conflicts = []
+    for bucket_name, bucket in (("active", classic_active), ("disabled", classic_disabled)):
+        for cfg_name, cfg_entry in bucket.items():
+            if not isinstance(cfg_entry, dict):
+                continue
+            cfg_norm = _normalize_mcp_name(cfg_name)
+            cfg_packages = _extract_npm_packages(cfg_entry)
+            for ext in ext_index:
+                name_match = (
+                    cfg_norm == ext["norm_name"]
+                    or cfg_norm == ext["norm_id_slug"]
+                )
+                package_match = bool(cfg_packages & ext["packages"])
+                if not (name_match or package_match):
+                    continue
+                if name_match and package_match:
+                    match_type = "both"
+                elif package_match:
+                    match_type = "package"
+                else:
+                    match_type = "name"
+                conflicts.append({
+                    "classic_name": cfg_name,
+                    "classic_active": bucket_name == "active",
+                    "classic_command": cfg_entry.get("command", ""),
+                    "classic_args": cfg_entry.get("args") or [],
+                    "extension_id": ext["id"],
+                    "extension_name": ext["name"],
+                    "extension_enabled": ext["enabled"],
+                    "match_type": match_type,
+                    "matched_packages": sorted(cfg_packages & ext["packages"]),
+                    "recommendation": "remove_classic",
+                })
+    return conflicts
+
+
+def resolve_mcp_conflict(classic_name, action="remove_classic"):
+    """v1.8.1 - Resout un conflit MCP detecte par _detect_mcp_conflicts.
+    Pour 'remove_classic' : supprime l'entree classic (active ou disabled)
+    de claude_desktop_config.json. Backup horodate cree par save_config.
+    Garde-fou : on ne supprime que l'entree classic confirmee comme etant
+    en conflit avec une extension active. Pas d'action automatique sur
+    l'extension (elle reste source de verite).
+    """
+    if action != "remove_classic":
+        return False, f"Action '{action}' non supportee (seul 'remove_classic' implementee)"
+    if not classic_name:
+        return False, "Nom du MCP classic requis"
+    conflicts = _detect_mcp_conflicts()
+    target = next((c for c in conflicts if c["classic_name"] == classic_name), None)
+    if not target:
+        return False, f"Aucun conflit detecte pour '{classic_name}' (deja resolu ?)"
+    config = load_config()
+    found = False
+    for bucket in ("mcpServers", "_disabledMcps"):
+        if classic_name in config.get(bucket, {}):
+            del config[bucket][classic_name]
+            found = True
+    if not found:
+        return False, f"Entree '{classic_name}' introuvable dans le config"
+    save_config(config)
+    return True, (f"Conflit resolu : entree classic '{classic_name}' retiree "
+                  f"de claude_desktop_config.json (backup horodate). L'extension "
+                  f"'{target['extension_name']}' reste en place comme source de verite.")
+
+
 def toggle_extension(name, enabled=None):
     """Toggle une extension via son fichier de settings (avec backup)."""
     if not name:
@@ -3381,6 +3559,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </section>
 </div>
 <div data-main-tab="mcps" class="hidden">
+<div id="mcp-conflicts-banner" class="mb-4 hidden"></div>
 <section class="card p-6">
 <h2 class="text-lg font-semibold mb-1" data-i18n="mcp_section">Serveurs MCP</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="mcp_help">Coché = chargé au démarrage de Claude Desktop</p>
@@ -3813,6 +3992,15 @@ fr: {
   scan_n_matches: "{n} process trouvé(s) qui contiennent « {p} » :",
   banner_pattern_too_short: "Pattern trop court (>= 2 caractères)",
   ext_badge: "ext",
+  mcp_conflict_title: "conflit(s) MCP detecte(s)",
+  mcp_conflict_help: "Une Desktop Extension et une entree dans claude_desktop_config.json declarent le meme MCP. Resultat : 2 instances tournent en parallele (cas observe : 16 Helper Nodes au lieu de 8). Recommandation : retirer l'entree manuelle, l'extension reste source de verite (geree via marketplace).",
+  mcp_conflict_keep: "À garder (extension)",
+  mcp_conflict_remove: "À retirer (config manuelle)",
+  mcp_conflict_resolve_btn: "Retirer la config manuelle",
+  mcp_conflict_match_name_title: "Match par nom normalise (insensible casse + tirets/espaces)",
+  mcp_conflict_match_package_title: "Match par package npm partage (signal fort)",
+  mcp_conflict_match_both_title: "Match par nom ET package npm (certitude maximale)",
+  confirm_resolve_mcp_conflict: "Retirer l'entree '{classic}' de claude_desktop_config.json ?\\n\\nL'extension '{ext}' reste en place et continue de fournir le MCP. Un backup horodate du config est cree avant la modification.\\n\\nCe nettoyage evite les doublons (2 instances en parallele = concurrence + duplicate tool calls = risque de freeze UI).\\n\\nCONFIRMER ?",
   btn_restart_mcp: "Redémarrer ce MCP (sans toucher à Claude)",
   btn_restart_mcp_short: "Redémarrer",
   btn_stop_mcp_short: "Stopper",
@@ -4067,6 +4255,15 @@ en: {
   scan_n_matches: '{n} process(es) match "{p}":',
   banner_pattern_too_short: "Pattern too short (>= 2 characters)",
   ext_badge: "ext",
+  mcp_conflict_title: "MCP conflict(s) detected",
+  mcp_conflict_help: "A Desktop Extension and a claude_desktop_config.json entry declare the same MCP. Result: 2 instances run in parallel (observed: 16 Helper Nodes instead of 8). Recommendation: remove the manual entry; the extension remains source of truth (managed via marketplace).",
+  mcp_conflict_keep: "Keep (extension)",
+  mcp_conflict_remove: "Remove (manual config)",
+  mcp_conflict_resolve_btn: "Remove manual config",
+  mcp_conflict_match_name_title: "Match by normalized name (case + dashes/spaces insensitive)",
+  mcp_conflict_match_package_title: "Match by shared npm package (strong signal)",
+  mcp_conflict_match_both_title: "Match by name AND npm package (maximum certainty)",
+  confirm_resolve_mcp_conflict: "Remove '{classic}' from claude_desktop_config.json?\\n\\nExtension '{ext}' stays in place and keeps providing the MCP. A timestamped config backup is created before the change.\\n\\nThis cleanup avoids duplicates (2 parallel instances = concurrency + duplicate tool calls = UI freeze risk).\\n\\nCONFIRM?",
   btn_restart_mcp: "Restart this MCP (without touching Claude)",
   btn_restart_mcp_short: "Restart",
   btn_stop_mcp_short: "Stop",
@@ -4252,6 +4449,72 @@ async function loadState(){
   if(elStopCnt) elStopCnt.textContent = String(stopped.length);
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
+  loadMcpConflicts();
+}
+
+// v1.8.1 - bandeau de conflits MCP en haut de l'onglet Serveurs MCP.
+// Detecte les doublons entre Desktop Extensions et entrees classic dans
+// claude_desktop_config.json (apprentissage 2026-05-06 : DC tournait en
+// double, 16 Helper Nodes au lieu de 8). Action : retirer l'entree
+// classic, l'extension reste source de verite.
+async function loadMcpConflicts(){
+  const banner = document.getElementById('mcp-conflicts-banner');
+  if(!banner) return;
+  try {
+    const r = await fetch('/api/mcp-conflicts');
+    if(!r.ok){ banner.classList.add('hidden'); return; }
+    const d = await r.json();
+    const conflicts = d.conflicts || [];
+    if(conflicts.length === 0){ banner.classList.add('hidden'); banner.innerHTML = ''; return; }
+    banner.classList.remove('hidden');
+    const rows = conflicts.map(c => {
+      const matchBadge = {
+        both: `<span class="text-[10px] bg-red-100 text-red-700 px-1.5 py-0.5 rounded font-mono" title="${tr('mcp_conflict_match_both_title')}">match: name + package</span>`,
+        package: `<span class="text-[10px] bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded font-mono" title="${tr('mcp_conflict_match_package_title')}">match: package</span>`,
+        name: `<span class="text-[10px] bg-stone-100 text-stone-700 px-1.5 py-0.5 rounded font-mono" title="${tr('mcp_conflict_match_name_title')}">match: name</span>`,
+      }[c.match_type] || '';
+      const pkgs = (c.matched_packages && c.matched_packages.length)
+        ? `<div class="text-[11px] text-stone-500 font-mono mt-0.5">${escAttr(c.matched_packages.join(', '))}</div>`
+        : '';
+      return `<div class="p-3 bg-white rounded border border-red-200">
+        <div class="flex items-baseline justify-between flex-wrap gap-2 mb-2">
+          <div class="font-semibold text-sm">${escAttr(c.extension_name)} <span class="text-stone-400 font-normal">↔</span> <span class="font-mono">${escAttr(c.classic_name)}</span> ${matchBadge}</div>
+          <button onclick="resolveMcpConflict('${escAttr(c.classic_name)}', '${escAttr(c.extension_name)}')" class="text-xs font-medium text-white bg-red-700 hover:bg-red-800 rounded-md px-3 py-1.5">${tr('mcp_conflict_resolve_btn')}</button>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+          <div class="p-2 bg-green-50 rounded border border-green-100">
+            <div class="text-[10px] uppercase tracking-wide text-green-700 font-semibold mb-1">${tr('mcp_conflict_keep')}</div>
+            <div class="font-medium">${escAttr(c.extension_name)} <span class="text-[10px] bg-amber-100 text-amber-800 px-1 rounded">${tr('ext_badge')}</span></div>
+            <div class="text-[10px] text-stone-500 font-mono break-all">${escAttr(c.extension_id)}</div>
+          </div>
+          <div class="p-2 bg-red-50 rounded border border-red-100">
+            <div class="text-[10px] uppercase tracking-wide text-red-700 font-semibold mb-1">${tr('mcp_conflict_remove')}</div>
+            <div class="font-medium font-mono">${escAttr(c.classic_name)}</div>
+            <div class="text-[10px] text-stone-500 font-mono break-all">${escAttr(c.classic_command)} ${escAttr((c.classic_args || []).join(' '))}</div>
+            ${pkgs}
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+    banner.innerHTML = `<div class="card p-4 border-l-4 border-red-500 bg-red-50/30">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-lg">&#9888;</span>
+        <h3 class="text-base font-semibold text-red-800">${conflicts.length} ${tr('mcp_conflict_title')}</h3>
+      </div>
+      <p class="text-xs text-stone-600 mb-3">${tr('mcp_conflict_help')}</p>
+      <div class="space-y-2">${rows}</div>
+    </div>`;
+  } catch(e){ console.error(e); }
+}
+
+async function resolveMcpConflict(classicName, extName){
+  const msg = tr('confirm_resolve_mcp_conflict')
+    .split('{classic}').join(classicName)
+    .split('{ext}').join(extName);
+  if(!confirm(msg)) return;
+  const j = await api('/api/resolve-mcp-conflict', {name: classicName, action: 'remove_classic'});
+  banner(j.success ? 'green' : 'red', j.message);
+  if(j.success){ loadState(); }
 }
 
 // v1.7.3 - Restart Claude Desktop nucleaire, deplace de l'ancienne carte
@@ -5200,6 +5463,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(get_watchdog_status())
         elif path == "/api/diagnose-extensions":
             self._json(diagnose_extensions())
+        elif path == "/api/mcp-conflicts":
+            self._json({"conflicts": _detect_mcp_conflicts()})
         elif path == "/api/dc-status":
             self._json(dc_status() or {"installed": False})
         elif path.startswith("/api/command/"):
@@ -5259,6 +5524,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/delete-user-skill-duplicates": lambda: delete_user_skill_duplicates(),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
             "/api/delete-extension": lambda: delete_extension(data.get("name", "")),
+            "/api/resolve-mcp-conflict": lambda: resolve_mcp_conflict(data.get("name", ""), data.get("action", "remove_classic")),
             "/api/restart-mcp": lambda: restart_mcp(data.get("name", "")),
             "/api/stop-mcp": lambda: stop_mcp(data.get("name", "")),
             "/api/start-mcp": lambda: start_mcp(data.get("name", "")),
