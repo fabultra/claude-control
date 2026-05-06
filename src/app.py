@@ -227,8 +227,24 @@ def get_state():
         + [{"name": n, "active": False, "running": False, "type": "classic"} for n in sorted(disabled.keys())]
     )
     extensions = _list_extensions()
+    now = time.time()
     for e in extensions:
+        # v1.7.4 - meme strategie que dc_status() en v1.6.6 : sur Claude Desktop
+        # moderne, les extensions tournent dans des Helper Nodes anonymes
+        # (node.mojom.NodeService) impossibles a matcher par PID. _extension_pids
+        # echoue silencieusement et l'extension apparait alors comme 'pas
+        # demarre' dans la Vue d'ensemble. Fallback log mtime : si le fichier
+        # log a ete touche dans les 120 dernieres secondes, l'extension tourne
+        # probablement.
         running_ext = bool(_extension_pids(e["name"]))
+        if not running_ext:
+            try:
+                log = _find_mcp_log(e["name"])
+                if log and log.exists():
+                    if (now - log.stat().st_mtime) <= 120:
+                        running_ext = True
+            except Exception:
+                pass
         mcps_list.append({
             "name": e["name"],
             "active": e["enabled"],
@@ -308,6 +324,49 @@ def delete_skill(name):
         return False, f"Backup échoué : {e}"
     shutil.rmtree(target)
     return True, f"Skill '{name}' supprimé (backup : {backup.name})"
+
+
+def delete_user_skill_duplicates():
+    """v1.7.4 - Bulk-delete des skills cote utilisateur quand le meme nom
+    existe aussi cote plugin. Le plugin devient la source de verite (les
+    plugins sont gerables / mis a jour via leur marketplace, alors que les
+    copies utilisateur peuvent rapidement diverger). Backup zip individuel
+    par skill avant suppression (cf. delete_skill).
+    """
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
+    user_names = set()
+    for d in SKILLS_DIR.iterdir():
+        if d.is_dir() and not d.name.startswith(".") and (d / "SKILL.md").exists():
+            user_names.add(d.name)
+    for d in SKILLS_DISABLED_DIR.iterdir():
+        if d.is_dir() and not d.name.startswith("."):
+            user_names.add(d.name)
+    plugin_names = set()
+    try:
+        for it in _list_plugin_skills():
+            plugin_names.add(it["name"])
+    except Exception:
+        return False, "Erreur listing skills plugin", []
+    duplicates = sorted(user_names & plugin_names)
+    if not duplicates:
+        return True, {"message": "Aucun doublon a supprimer", "deleted": [], "failed": []}
+    deleted, failed = [], []
+    for name in duplicates:
+        ok, _msg = delete_skill(name)
+        if ok:
+            deleted.append(name)
+        else:
+            failed.append(name)
+    if failed:
+        return False, {
+            "message": f"{len(deleted)} supprimes, {len(failed)} en echec : {', '.join(failed[:3])}",
+            "deleted": deleted, "failed": failed,
+        }
+    return True, {
+        "message": f"{len(deleted)} skill(s) utilisateur supprime(s) (backup zip individuel par skill)",
+        "deleted": deleted, "failed": [],
+    }
 
 
 def restart_mcp(name):
@@ -1784,10 +1843,11 @@ def get_overview():
     for p in plugins:
         for v in p.get("extra_versions", []):
             plugin_orphans.append({"plugin": p["full_name"], "version": v})
+    # v1.7.4 - 'sans frontmatter' faisait double emploi avec le suggestion
+    # 'no_description' (meme set de skills, deux warnings cote a cote dans la
+    # Vue d'ensemble). Le suggestion 'no_description' est plus actionable et
+    # localise mieux le probleme - on garde uniquement celui-la.
     skill_issues = []
-    for sk in state["skills"]:
-        if not sk.get("description") and not sk.get("category"):
-            skill_issues.append({"name": sk["name"], "reason": "sans frontmatter"})
     skill_names = {sk["name"] for sk in state["skills"]}
     plugin_skill_names = set()
     for p in plugins:
@@ -3265,6 +3325,9 @@ fr: {
   used_x_times: "Utilisé {n} fois ces 30 derniers jours",
   skill_suggestions: "Suggestions d'optimisation",
   fallback_no_usage: "heuristiques uniquement (pas de données d'usage)",
+  cleanup_duplicates_btn: "Supprimer les versions utilisateur en doublon",
+  confirm_cleanup_duplicates: "Supprimer toutes les versions utilisateur en doublon avec un plugin ?\n\nUn backup zip individuel est cree avant chaque suppression dans ~/.claude/backups/claude-control/. Les versions plugin restent en place et deviennent la source de verite.\n\nCONFIRMER ?",
+  banner_cleanup_running: "Nettoyage des doublons en cours...",
   watchdog_label: "Surveillance",
   watchdog_active: "Active &middot; vérification toutes les {n}s",
   watchdog_inactive: "Désactivée",
@@ -3479,6 +3542,9 @@ en: {
   used_x_times: "Used {n} times in the last 30 days",
   skill_suggestions: "Optimization suggestions",
   fallback_no_usage: "heuristics only (no usage data)",
+  cleanup_duplicates_btn: "Delete duplicate user versions",
+  confirm_cleanup_duplicates: "Delete all user-side skill versions duplicated by a plugin?\n\nAn individual zip backup is created before each deletion under ~/.claude/backups/claude-control/. Plugin versions remain and become the source of truth.\n\nCONFIRM?",
+  banner_cleanup_running: "Cleaning up duplicates...",
   watchdog_label: "Watchdog",
   watchdog_active: "On &middot; checking every {n}s",
   watchdog_inactive: "Off",
@@ -4032,9 +4098,24 @@ async function loadSkillSuggestions(){
         const color = s.severity === 'warn' ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-stone-50 border-stone-200 text-stone-700';
         const icon = s.severity === 'warn' ? '&#9888;' : '&#8505;';
         const items = (s.items || []).slice(0,8).map(n=>`<span class="text-[10px] font-mono bg-white px-1.5 py-0.5 rounded border border-stone-200">${escAttr(n)}</span>`).join(' ');
-        return `<div class="text-xs p-2 rounded border ${color}"><div class="flex gap-2 items-start"><span class="shrink-0">${icon}</span><div class="flex-1"><div>${escAttr(s[msgKey] || '')}</div>${items ? '<div class="mt-1 flex flex-wrap gap-1">'+items+'</div>' : ''}</div></div></div>`;
+        // v1.7.4 - bouton d'action quand le suggestion est actionable cote backend.
+        // Pour l'instant : kind in {duplicate, duplicate_many} -> bulk delete des
+        // versions utilisateur en doublon avec un plugin (backup zip individuel).
+        let actionBtn = '';
+        if (s.kind === 'duplicate' || s.kind === 'duplicate_many'){
+          const n = (s.items || []).length;
+          actionBtn = `<div class="mt-2"><button onclick="cleanupDuplicateUserSkills()" class="inline-flex items-center gap-1 text-xs font-medium text-amber-800 bg-white border border-amber-300 hover:bg-amber-100 rounded-md px-2.5 py-1">&#x1f9f9; ${tr('cleanup_duplicates_btn')}</button></div>`;
+        }
+        return `<div class="text-xs p-2 rounded border ${color}"><div class="flex gap-2 items-start"><span class="shrink-0">${icon}</span><div class="flex-1"><div>${escAttr(s[msgKey] || '')}</div>${items ? '<div class="mt-1 flex flex-wrap gap-1">'+items+'</div>' : ''}${actionBtn}</div></div></div>`;
       }).join('') + '</div>';
   }catch(e){console.error(e);}
+}
+async function cleanupDuplicateUserSkills(){
+  if(!confirm(tr('confirm_cleanup_duplicates'))) return;
+  banner('blue', tr('banner_cleanup_running'));
+  const j = await api('/api/delete-user-skill-duplicates', {});
+  banner(j.success ? 'green' : 'red', j.message || (j.success ? 'OK' : 'Echec'));
+  if(j.success){ loadOverview(); loadSkillSuggestions(); loadState(); }
 }
 async function loadOverview(){
   try{
@@ -4483,6 +4564,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/save-claude-md": lambda: save_claude_md(data.get("content", "")),
             "/api/save-settings": lambda: save_settings(data.get("content", "")),
             "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
+            "/api/delete-user-skill-duplicates": lambda: delete_user_skill_duplicates(),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
             "/api/restart-mcp": lambda: restart_mcp(data.get("name", "")),
             "/api/restart-claude-desktop": lambda: restart_claude_desktop(),
