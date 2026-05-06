@@ -1,0 +1,70 @@
+# Fixture Type B : Claude Desktop UI rendering frozen, DC backend OK
+#
+# Source : log Desktop Commander de Fabien le 2026-05-05 entre 19:16:19 et 19:16:27 UTC
+# Anonymisation : /Users/fabienfayard/ -> /Users/USER/
+#
+# Pattern à reconnaitre :
+# - 4 read_file IDENTIQUES sur desktop-commander-usage/SKILL.md (ids 236, 237, 240, 241)
+# - 14 track_ui_event preview_shown en rafale (ids 242 à 255)
+# - 3 calls QUASI-SIMULTANÉS (ids 257-260) dont 2 read_file IDENTIQUES sur
+#   claude-control-app/SKILL.md (546 lignes, response > 25 000 chars)
+# - DC répond à TOUS les ids client (jusqu'à 260 inclus)
+# - Aucune nouvelle requête client après 19:16:27 (silence pendant 23 minutes)
+#
+# Verdict attendu du classifier :
+#   type = frozen_ui_rendering (ex Type B)
+#   details.duplicate_read_file = True
+#   details.large_payload = True
+#   details.track_ui_event_burst = True
+
+2026-05-05T19:16:19.982Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/.claude/skills/desktop-commander-usage/SKILL.md"}},"jsonrpc":"2.0","id":237} { metadata: undefined }
+2026-05-05T19:16:19.982Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/.claude/skills/desktop-commander-usage/SKILL.md"}},"jsonrpc":"2.0","id":241} { metadata: undefined }
+2026-05-05T19:16:19.982Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/.claude/skills/desktop-commander-usage/SKILL.md"}},"jsonrpc":"2.0","id":236} { metadata: undefined }
+2026-05-05T19:16:19.982Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/.claude/skills/desktop-commander-usage/SKILL.md"}},"jsonrpc":"2.0","id":240} { metadata: undefined }
+2026-05-05T19:16:19.984Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"[Reading 255 lines from start (total: 255 lines, 0 remaining)]\n\n---\nname: desktop-commander-usage\ndescription: Use ONLY when Desktop Commander MCP tools are visibly available...[10919 chars truncated]...end."}],"structuredContent":{"fileName":"SKILL.md","filePath":"/Users/USER/.claude/skills/desktop-commander-usage/SKILL.md","fileType":"markdown"}},"jsonrpc":"2.0","id":237} { metadata: undefined }
+2026-05-05T19:16:19.984Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"[Reading 255 lines from start (total: 255 lines, 0 remaining)]\n\n---\nname: desktop-commander-usage\ndescription: Use ONLY when Desktop Commander MCP tools are visibly available...[10919 chars truncated]...end."}],"structuredContent":{"fileName":"SKILL.md","filePath":"/Users/USER/.claude/skills/desktop-commander-usage/SKILL.md","fileType":"markdown"}},"jsonrpc":"2.0","id":241} { metadata: undefined }
+2026-05-05T19:16:19.984Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"[Reading 255 lines from start (total: 255 lines, 0 remaining)]\n\n---\nname: desktop-commander-usage\ndescription: Use ONLY when Desktop Commander MCP tools are visibly available...[10919 chars truncated]...end."}],"structuredContent":{"fileName":"SKILL.md","filePath":"/Users/USER/.claude/skills/desktop-commander-usage/SKILL.md","fileType":"markdown"}},"jsonrpc":"2.0","id":236} { metadata: undefined }
+2026-05-05T19:16:19.985Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"[Reading 255 lines from start (total: 255 lines, 0 remaining)]\n\n---\nname: desktop-commander-usage\ndescription: Use ONLY when Desktop Commander MCP tools are visibly available...[10919 chars truncated]...end."}],"structuredContent":{"fileName":"SKILL.md","filePath":"/Users/USER/.claude/skills/desktop-commander-usage/SKILL.md","fileType":"markdown"}},"jsonrpc":"2.0","id":240} { metadata: undefined }
+2026-05-05T19:16:21.141Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":242} { metadata: undefined }
+2026-05-05T19:16:21.171Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":242} { metadata: undefined }
+2026-05-05T19:16:21.299Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":243} { metadata: undefined }
+2026-05-05T19:16:21.338Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":243} { metadata: undefined }
+2026-05-05T19:16:21.398Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":244} { metadata: undefined }
+2026-05-05T19:16:21.428Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":244} { metadata: undefined }
+2026-05-05T19:16:21.525Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":245} { metadata: undefined }
+2026-05-05T19:16:21.555Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":245} { metadata: undefined }
+2026-05-05T19:16:21.605Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":246} { metadata: undefined }
+2026-05-05T19:16:21.638Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":246} { metadata: undefined }
+2026-05-05T19:16:21.779Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":247} { metadata: undefined }
+2026-05-05T19:16:21.813Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":247} { metadata: undefined }
+2026-05-05T19:16:21.913Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":248} { metadata: undefined }
+2026-05-05T19:16:21.943Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":248} { metadata: undefined }
+2026-05-05T19:16:23.577Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/dev/claude-control/version.txt"}},"jsonrpc":"2.0","id":249} { metadata: undefined }
+2026-05-05T19:16:23.643Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"[Reading 1 lines from start (total: 1 lines, 0 remaining)]\n\n1.6.6"}],"structuredContent":{"fileName":"version.txt","filePath":"/Users/USER/dev/claude-control/version.txt","fileType":"text"}},"jsonrpc":"2.0","id":249} { metadata: undefined }
+2026-05-05T19:16:23.645Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":250} { metadata: undefined }
+2026-05-05T19:16:23.674Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":250} { metadata: undefined }
+2026-05-05T19:16:23.754Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":251} { metadata: undefined }
+2026-05-05T19:16:23.793Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":251} { metadata: undefined }
+2026-05-05T19:16:25.394Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":252} { metadata: undefined }
+2026-05-05T19:16:25.424Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":252} { metadata: undefined }
+2026-05-05T19:16:26.794Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":253} { metadata: undefined }
+2026-05-05T19:16:26.823Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":253} { metadata: undefined }
+2026-05-05T19:16:26.902Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":254} { metadata: undefined }
+2026-05-05T19:16:26.939Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":254} { metadata: undefined }
+2026-05-05T19:16:27.022Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":255} { metadata: undefined }
+2026-05-05T19:16:27.055Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":255} { metadata: undefined }
+2026-05-05T19:16:27.166Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/.claude/skills/claude-control-app/SKILL.md"}},"jsonrpc":"2.0","id":256} { metadata: undefined }
+2026-05-05T19:16:27.231Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"[Reading 546 lines from start (total: 546 lines, 0 remaining)]\n\n---\nname: claude-control-app\ndescription: Use this skill when working on the Claude Control project...[25276 chars truncated]...end."}],"structuredContent":{"fileName":"SKILL.md","filePath":"/Users/USER/.claude/skills/claude-control-app/SKILL.md","fileType":"markdown"}},"jsonrpc":"2.0","id":256} { metadata: undefined }
+2026-05-05T19:16:27.262Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"start_process","arguments":{"command":"osascript -e 'set appAlias to default application of (info for POSIX file \"/Users/USER/.claude/skills/claude-control-app/SKILL.md\")'","timeout_ms":12000}},"jsonrpc":"2.0","id":257} { metadata: undefined }
+2026-05-05T19:16:27.263Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"track_ui_event","arguments":{"event":"preview_shown"}},"jsonrpc":"2.0","id":258} { metadata: undefined }
+2026-05-05T19:16:27.264Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/.claude/skills/claude-control-app/SKILL.md"}},"jsonrpc":"2.0","id":259} { metadata: undefined }
+2026-05-05T19:16:27.264Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/.claude/skills/claude-control-app/SKILL.md"}},"jsonrpc":"2.0","id":260} { metadata: undefined }
+2026-05-05T19:16:27.357Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Tracked UI event: preview_shown"}]},"jsonrpc":"2.0","id":258} { metadata: undefined }
+2026-05-05T19:16:27.487Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"Process started with PID 67277"}]},"jsonrpc":"2.0","id":257} { metadata: undefined }
+2026-05-05T19:16:27.489Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"[Reading 546 lines from start (total: 546 lines, 0 remaining)]\n\n---\nname: claude-control-app\ndescription: Use this skill when working on the Claude Control project...[25276 chars truncated]...end."}],"structuredContent":{"fileName":"SKILL.md","filePath":"/Users/USER/.claude/skills/claude-control-app/SKILL.md","fileType":"markdown"}},"jsonrpc":"2.0","id":259} { metadata: undefined }
+2026-05-05T19:16:27.489Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"[Reading 546 lines from start (total: 546 lines, 0 remaining)]\n\n---\nname: claude-control-app\ndescription: Use this skill when working on the Claude Control project...[25276 chars truncated]...end."}],"structuredContent":{"fileName":"SKILL.md","filePath":"/Users/USER/.claude/skills/claude-control-app/SKILL.md","fileType":"markdown"}},"jsonrpc":"2.0","id":260} { metadata: undefined }
+
+# === SILENCE COMPLET DE 19:16:27.489 jusqu'à 19:39:00 ===
+# Aucune nouvelle requête client envoyée à DC pendant ~23 minutes.
+# DC a répondu à TOUS les ids ci-dessus (236, 237, 240, 241, 242-255, 249, 250, 256, 257, 258, 259, 260).
+# Le freeze est côté Claude Desktop UI, pas DC backend.

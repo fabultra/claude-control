@@ -1,0 +1,26 @@
+# Fixture shutdown gracieux : log avec mtime récent mais instance arrêtée
+#
+# Source : log mcp-server-desktop-commander.log de Fabien le 2026-05-06 17:21 UTC
+# (instance npx désinstallée après nettoyage doublon MCP)
+#
+# Pattern à reconnaitre :
+# - Présence de marqueurs de shutdown gracieux dans les dernières lignes
+# - 'Server transport closed (intentional shutdown)'
+# - 'Shutting down server'
+# - 'Client transport closed'
+#
+# Verdict attendu du classifier :
+#   type = no_log (l'instance ne tourne pas, mtime trompeur)
+# OU
+#   type = idle_legitimate (selon comment on choisit de modéliser)
+#
+# IMPORTANT : ne PAS classifier comme frozen_isolated même si le mtime
+# est récent. Le contenu indique clairement que l'instance s'est arrêtée
+# proprement.
+
+2026-05-06T17:21:18.927Z [desktop-commander] [info] Client transport closed { metadata: undefined }
+2026-05-06T17:21:18.927Z [desktop-commander] [info] Server transport closed (intentional shutdown) { metadata: undefined }
+2026-05-06T17:21:18.927Z [desktop-commander] [info] Client transport closed { metadata: undefined }
+2026-05-06T17:21:18.927Z [desktop-commander] [info] Shutting down server... { metadata: undefined }
+2026-05-06T17:21:19.174Z [desktop-commander] [info] Server transport closed { metadata: undefined }
+2026-05-06T17:21:19.174Z [desktop-commander] [info] Client transport closed { metadata: undefined }

@@ -61,5 +61,66 @@ class FrozenDetectionTests(unittest.TestCase):
         self.assertFalse(app._mcp_log_says_frozen("nonexistent", within_seconds=60))
 
 
+class DcLogFreezeTypeClassifierTests(unittest.TestCase):
+    """v1.8.0 P0 - distingue Type A (frozen_backend) vs Type B
+    (frozen_ui_rendering) en parsant les correspondances client_ids
+    <-> server_ids dans le log Claude. Fixtures reelles dans tests/fixtures/.
+    """
+
+    @property
+    def fixtures_dir(self):
+        return Path(__file__).parent / "fixtures"
+
+    def test_type_a_frozen_backend(self):
+        """Fixture synthetique : 3 client ids, 2 server ids, id 102 sans
+        reponse. Verdict attendu : frozen_backend, unanswered = [102]."""
+        result = app._classify_dc_log_freeze_type(self.fixtures_dir / "log_type_a_frozen_backend.txt")
+        self.assertEqual(result["type"], "frozen_backend")
+        self.assertEqual(result["details"]["unanswered_client_ids"], [102])
+        self.assertEqual(result["details"]["client_ids_count"], 3)
+        self.assertEqual(result["details"]["server_ids_count"], 2)
+
+    def test_type_b_frozen_ui_rendering_real_fixture(self):
+        """Fixture reelle 2026-05-05 : DC repond a tous les client ids (236-260),
+        Claude Desktop n'envoie plus de nouvelles requetes pendant 23 min.
+        Verdict attendu : frozen_ui_rendering, bonus signals tous a True."""
+        result = app._classify_dc_log_freeze_type(self.fixtures_dir / "log_type_b_ui_rendering.txt")
+        self.assertEqual(result["type"], "frozen_ui_rendering")
+        self.assertEqual(result["details"]["unanswered_client_ids"], [])
+        # Bonus signals attendus (cf. header de la fixture) :
+        self.assertTrue(result["details"]["duplicate_read_file"],
+                        "4 read_file identiques sur SKILL.md devraient declencher duplicate_read_file")
+        self.assertTrue(result["details"]["large_payload"],
+                        "Reponse SKILL.md > 25k chars devrait declencher large_payload>20k")
+        self.assertTrue(result["details"]["track_ui_event_burst"],
+                        "14 track_ui_event en quelques secondes devraient declencher burst")
+
+    def test_graceful_shutdown_detection(self):
+        """Fixture reelle 2026-05-06 17:21 : DC s'est arrete proprement
+        (Server transport closed intentional). _log_shows_graceful_shutdown
+        doit retourner True."""
+        path = self.fixtures_dir / "log_graceful_shutdown.txt"
+        self.assertTrue(app._log_shows_graceful_shutdown(path))
+
+    def test_type_b_fixture_does_not_show_graceful_shutdown(self):
+        """Anti-regression : le log Type B est full d'activite, pas de
+        marqueur de shutdown. _log_shows_graceful_shutdown doit retourner
+        False."""
+        path = self.fixtures_dir / "log_type_b_ui_rendering.txt"
+        self.assertFalse(app._log_shows_graceful_shutdown(path))
+
+    def test_inconclusive_when_log_empty(self):
+        """Edge case : log vide ou sans Message from client/server -> on
+        ne classe pas (verdict inconclusive)."""
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write("just some random log lines\nno protocol here\n")
+            path = f.name
+        try:
+            result = app._classify_dc_log_freeze_type(path)
+            self.assertEqual(result["type"], "inconclusive")
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,23 @@
+# Fixture Type A : DC backend gele - id client sans reponse server matching
+#
+# Synthetique (fabriquee par Claude Code, pas extraite d'un log reel).
+# Pattern minimal :
+# - 3 requetes client (ids 100, 101, 102)
+# - Server repond uniquement aux ids 100 et 101
+# - L'id 102 reste sans reponse (DC backend gele apres avoir traite 101)
+#
+# Verdict attendu du classifier :
+#   type = frozen_backend (Type A)
+#   details.unanswered_client_ids = [102]
+#   details.client_ids_count = 3
+#   details.server_ids_count = 2
+
+2026-05-06T10:00:00.100Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/foo.txt"}},"jsonrpc":"2.0","id":100} { metadata: undefined }
+2026-05-06T10:00:00.150Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"file content here"}]},"jsonrpc":"2.0","id":100} { metadata: undefined }
+2026-05-06T10:00:01.100Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/Users/USER/bar.txt"}},"jsonrpc":"2.0","id":101} { metadata: undefined }
+2026-05-06T10:00:01.180Z [Desktop Commander] [info] Message from server: {"result":{"content":[{"type":"text","text":"more content"}]},"jsonrpc":"2.0","id":101} { metadata: undefined }
+2026-05-06T10:00:02.100Z [Desktop Commander] [info] Message from client: {"method":"tools/call","params":{"name":"start_process","arguments":{"command":"sleep 1000"}},"jsonrpc":"2.0","id":102} { metadata: undefined }
+
+# === DC BACKEND BLOQUE ICI ===
+# Aucune reponse server pour l'id 102. Pas de log subsequent.
+# C'est ce signal "id client sans reponse server" qui declenche Type A.
