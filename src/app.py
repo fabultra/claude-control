@@ -2867,7 +2867,22 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </div>
 <div id="presets-list" class="space-y-1.5"></div>
 </div>
-<div id="mcps" class="space-y-2"></div>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+<div>
+<div class="flex items-baseline justify-between mb-2 px-1">
+<h3 class="text-sm font-semibold text-green-700"><span class="inline-block w-2 h-2 rounded-full bg-green-600 mr-1.5 align-middle"></span><span data-i18n="mcp_col_running">En cours d'execution</span></h3>
+<span id="mcps-running-count" class="text-xs text-stone-400"></span>
+</div>
+<div id="mcps-running" class="space-y-2"></div>
+</div>
+<div>
+<div class="flex items-baseline justify-between mb-2 px-1">
+<h3 class="text-sm font-semibold text-stone-600"><span class="inline-block w-2 h-2 rounded-full bg-stone-400 mr-1.5 align-middle"></span><span data-i18n="mcp_col_stopped">Inactifs</span></h3>
+<span id="mcps-stopped-count" class="text-xs text-stone-400"></span>
+</div>
+<div id="mcps-stopped" class="space-y-2"></div>
+</div>
+</div>
 </section>
 <section class="card p-6 mt-6">
 <button onclick="toggleDiagExt()" class="w-full flex items-center justify-between text-left">
@@ -3254,6 +3269,11 @@ fr: {
   banner_pattern_too_short: "Pattern trop court (>= 2 caractères)",
   ext_badge: "ext",
   btn_restart_mcp: "Redémarrer ce MCP (sans toucher à Claude)",
+  btn_restart_mcp_short: "Redémarrer",
+  mcp_col_running: "En cours d'execution",
+  mcp_col_stopped: "Inactifs",
+  mcp_col_running_empty: "Aucun MCP en cours d'execution",
+  mcp_col_stopped_empty: "Tous les MCPs tournent",
   skill_filter_mine: "Mes skills",
   skill_filter_plugins: "Plugins",
   skill_filter_all: "Tous",
@@ -3459,6 +3479,11 @@ en: {
   banner_pattern_too_short: "Pattern too short (>= 2 characters)",
   ext_badge: "ext",
   btn_restart_mcp: "Restart this MCP (without touching Claude)",
+  btn_restart_mcp_short: "Restart",
+  mcp_col_running: "Running",
+  mcp_col_stopped: "Stopped",
+  mcp_col_running_empty: "No MCP currently running",
+  mcp_col_stopped_empty: "All MCPs are running",
   skill_filter_mine: "My skills",
   skill_filter_plugins: "Plugins",
   skill_filter_all: "All",
@@ -3546,14 +3571,40 @@ let CURRENT_STATE = {mcps:[], skills:[]};
 async function loadState(){
   const s = await (await fetch('/api/state')).json();
   CURRENT_STATE = s;
-  document.getElementById('mcps').innerHTML = s.mcps.length===0 ? `<p class="text-stone-400 text-sm">${tr('no_mcp')}</p>` : s.mcps.map(m=>{
+  // v1.7.1 - rendu en 2 colonnes : running a gauche, inactifs a droite.
+  // Chaque ligne expose un bouton "Redemarrer" texte+icone (visible sans hover)
+  // qui appelle restart_mcp/restart_extension cote backend (kill PID + toggle
+  // settings -> Claude Desktop respawn via FSEvents, sans le redemarrer).
+  function _renderMcpRow(m){
     const isExt = m.type === 'extension';
     const extBadge = isExt ? `<span class="text-[10px] font-mono text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded" title="Desktop Extension">${tr('ext_badge')}</span>` : '';
     const versionBadge = isExt && m.version ? `<span class="text-[10px] text-stone-400 font-mono">v${escAttr(m.version)}</span>` : '';
     const toggleFn = isExt ? `toggleExtension('${m.name}', this.checked)` : `toggleMcp('${m.name}')`;
-    const deleteBtn = isExt ? '' : `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>`;
-    return `<label class="group flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-3 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="${toggleFn}" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${extBadge}${versionBadge}${m.running?`<span class="text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full running-dot">${tr('running_label')}</span>`:(m.active && !isExt?`<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`:'')}</div><button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="text-amber-700 hover:text-amber-900 hover:bg-amber-50 rounded px-2 py-1 text-base leading-none shrink-0">&#x21bb;</button>${deleteBtn}</label>`;
-  }).join('');
+    const deleteBtn = isExt ? '' : `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" class="text-xs text-stone-400 hover:text-red-700 hover:underline shrink-0">${tr('btn_delete')}</button>`;
+    const whyBtn = (m.active && !m.running && !isExt)
+      ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`
+      : '';
+    const restartBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="inline-flex items-center gap-1 text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 hover:bg-amber-100 rounded-md px-2 py-1 shrink-0">&#x21bb; <span>${tr('btn_restart_mcp_short')}</span></button>`;
+    return `<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-2 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="${toggleFn}" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${extBadge}${versionBadge}${whyBtn}</div><div class="flex items-center gap-2 shrink-0">${restartBtn}${deleteBtn}</div></label>`;
+  }
+  const running = s.mcps.filter(m=>m.running);
+  const stopped = s.mcps.filter(m=>!m.running);
+  const elRun = document.getElementById('mcps-running');
+  const elStop = document.getElementById('mcps-stopped');
+  const elRunCnt = document.getElementById('mcps-running-count');
+  const elStopCnt = document.getElementById('mcps-stopped-count');
+  if(elRun){
+    elRun.innerHTML = running.length === 0
+      ? `<p class="text-stone-400 text-sm italic px-3">${tr('mcp_col_running_empty')}</p>`
+      : running.map(_renderMcpRow).join('');
+  }
+  if(elStop){
+    elStop.innerHTML = stopped.length === 0
+      ? `<p class="text-stone-400 text-sm italic px-3">${tr('mcp_col_stopped_empty')}</p>`
+      : stopped.map(_renderMcpRow).join('');
+  }
+  if(elRunCnt) elRunCnt.textContent = String(running.length);
+  if(elStopCnt) elStopCnt.textContent = String(stopped.length);
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
   loadDcStatus();
