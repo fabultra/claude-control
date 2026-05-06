@@ -1,0 +1,27 @@
+# Fixture log MCPB en standby legitime
+#
+# Source : pattern typique d'une extension MCPB qui s'est connectee au
+# demarrage de Claude Desktop puis n'a recu aucun appel (silence
+# legitime de plusieurs minutes ou heures entre 2 sollicitations).
+#
+# Pattern :
+# - Quelques lignes d'init au demarrage
+# - Server connected successfully
+# - Pas d'appel client/server depuis
+# - PAS de marqueurs de shutdown gracieux (l'extension est toujours
+#   chargee, juste idle)
+#
+# Verdict UI attendu (v1.8.3 Bug D) :
+#   running = True (chargee et prete a etre appelee)
+#
+# Verdict watchdog (si cible monitoree) :
+#   peut declarer freeze si log_age > seuil ET cible critique
+#   (mais ce critere ne s'applique PAS a l'affichage UI)
+
+2026-05-06T15:19:42.122Z [filesystem] [info] Initializing server...
+2026-05-06T15:19:42.156Z [filesystem] [info] Server started and connected successfully
+2026-05-06T15:19:42.157Z [filesystem] [info] Message from client: {"method":"initialize","params":{"protocolVersion":"2025-06-18"},"jsonrpc":"2.0","id":0} { metadata: undefined }
+2026-05-06T15:19:42.158Z [filesystem] [info] Message from server: {"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"server-filesystem","version":"0.7.5"}},"jsonrpc":"2.0","id":0} { metadata: undefined }
+2026-05-06T15:19:42.159Z [filesystem] [info] Message from client: {"method":"notifications/initialized","jsonrpc":"2.0"} { metadata: undefined }
+2026-05-06T15:19:42.160Z [filesystem] [info] Message from client: {"method":"tools/list","params":{},"jsonrpc":"2.0","id":1} { metadata: undefined }
+2026-05-06T15:19:42.165Z [filesystem] [info] Message from server: {"result":{"tools":[]},"jsonrpc":"2.0","id":1} { metadata: undefined }
