@@ -1579,8 +1579,191 @@ _DC_REMEDIATION_STATE = {
 }
 
 
+_DC_GRACEFUL_SHUTDOWN_MARKERS = (
+    "server transport closed (intentional shutdown)",
+    "shutting down server",
+    "process exited gracefully",
+)
+
+
+def _read_log_tail(path, max_lines=200):
+    """v1.8.0 - Lit les `max_lines` dernieres lignes d'un fichier log de
+    facon raisonnable. On lit le fichier en entier (plus simple que un seek
+    inverse fragile pour des logs Claude qui font typiquement < 10 Mo).
+    Retourne la liste des lignes (sans CR/LF). Tolerant aux erreurs.
+    """
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+    if max_lines and len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return [ln.rstrip("\r\n") for ln in lines]
+
+
+def _log_shows_graceful_shutdown(path, max_lines=20):
+    """v1.8.0 - Retourne True si la queue du log indique un shutdown
+    gracieux (transport closed intentional, shutting down server, ...).
+    Apprentissage 2026-05-06 : un log avec mtime recent peut refleter
+    le shutdown lui-meme, pas une activite en cours. Ne pas classer
+    comme 'idle_legitimate' dans ce cas.
+    """
+    tail = _read_log_tail(path, max_lines=max_lines)
+    if not tail:
+        return False
+    blob = "\n".join(tail).lower()
+    return any(m in blob for m in _DC_GRACEFUL_SHUTDOWN_MARKERS)
+
+
+def _classify_dc_log_freeze_type(path, max_lines=200):
+    """v1.8.0 - Distingue Type A (backend frozen) vs Type B (UI rendering
+    frozen) en parcourant les `max_lines` dernieres lignes du log Claude.
+
+    Type A : le client a envoye une requete et le serveur n'a JAMAIS
+    repondu (id client sans server response matching). DC backend gele.
+
+    Type B : DC a repondu a tout, mais le client n'envoie plus de
+    nouvelles requetes (silence cote Claude Desktop). UI rendering gele,
+    backend en bonne sante.
+
+    Signaux bonus (n'affectent pas la decision Type A/B mais loggees
+    dans details pour l'observabilite) :
+      - duplicate_read_file : meme path lu 2+ fois en < 5s
+      - large_payload : reponse server > 20 000 chars
+      - track_ui_event_burst : > 10 track_ui_event en < 5s
+
+    Retourne dict {type, details}. Le type peut etre :
+      'frozen_backend' (Type A), 'frozen_ui_rendering' (Type B), ou
+      'inconclusive' (pas assez de donnees parsables).
+    """
+    lines = _read_log_tail(path, max_lines=max_lines)
+    if not lines:
+        return {"type": "inconclusive", "details": {"reason": "empty_log"}}
+
+    client_re = re.compile(r"Message from client:\s*(\{.*?\})\s*\{ metadata")
+    server_re = re.compile(r"Message from server:\s*(\{.*?\})\s*\{ metadata")
+    ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)")
+
+    client_ids = []
+    server_ids = []
+    read_file_paths = []  # liste de (ts_str, path)
+    track_ui_events = []  # liste de ts_str
+    max_payload_size = 0
+
+    for line in lines:
+        ts_match = ts_re.match(line)
+        ts_str = ts_match.group(1) if ts_match else None
+        cm = client_re.search(line)
+        if cm:
+            try:
+                payload = json.loads(cm.group(1))
+                cid = payload.get("id")
+                if cid is not None:
+                    client_ids.append(cid)
+                params = payload.get("params") or {}
+                tool_name = params.get("name")
+                args = params.get("arguments") or {}
+                if tool_name == "read_file":
+                    p = args.get("path")
+                    if p:
+                        read_file_paths.append((ts_str, p))
+                if tool_name == "track_ui_event":
+                    track_ui_events.append(ts_str)
+            except Exception:
+                pass
+            continue
+        sm = server_re.search(line)
+        if sm:
+            try:
+                payload = json.loads(sm.group(1))
+                sid = payload.get("id")
+                if sid is not None and ("result" in payload or "error" in payload):
+                    server_ids.append(sid)
+                # Estimation taille payload : longueur JSON + reconstitution si
+                # le contenu a ete tronque (marqueur '[N chars truncated]').
+                size = len(sm.group(1))
+                trunc_match = re.search(r"\[(\d+) chars truncated\]", line)
+                if trunc_match:
+                    size += int(trunc_match.group(1))
+                if size > max_payload_size:
+                    max_payload_size = size
+            except Exception:
+                pass
+
+    unanswered = sorted(set(client_ids) - set(server_ids))
+
+    # Bonus : duplicate read_file en < 5s. Compare timestamps si dispo.
+    duplicate_read_file = False
+    by_path = {}
+    for ts_str, p in read_file_paths:
+        by_path.setdefault(p, []).append(ts_str)
+    for p, ts_list in by_path.items():
+        if len(ts_list) < 2:
+            continue
+        # Si 2+ occurrences avec timestamps parsables et span < 5s -> duplicate.
+        parsed = []
+        for t in ts_list:
+            if not t:
+                continue
+            try:
+                parsed.append(datetime.fromisoformat(t.replace("Z", "+00:00")))
+            except Exception:
+                pass
+        if len(parsed) >= 2:
+            span = (max(parsed) - min(parsed)).total_seconds()
+            if span <= 5.0:
+                duplicate_read_file = True
+                break
+        elif len(ts_list) >= 2:
+            # Sans timestamps fiables, on flagge quand meme si 2+ duplicates
+            # consecutifs sur le meme path (cas du log type B).
+            duplicate_read_file = True
+            break
+
+    # Bonus : burst de track_ui_event >= 10 events dans une fenetre <= 5s.
+    # Sliding window 10 events / 5s : conservateur mais matche un burst typique
+    # (apprentissage 2026-05-05 : 14 events en 6.2s avec 10 events en 4.25s).
+    track_ui_event_burst = False
+    if len(track_ui_events) >= 10:
+        parsed = []
+        for t in track_ui_events:
+            if not t:
+                continue
+            try:
+                parsed.append(datetime.fromisoformat(t.replace("Z", "+00:00")))
+            except Exception:
+                pass
+        if len(parsed) >= 10:
+            parsed.sort()
+            for i in range(len(parsed) - 9):
+                if (parsed[i + 9] - parsed[i]).total_seconds() <= 5.0:
+                    track_ui_event_burst = True
+                    break
+        else:
+            track_ui_event_burst = True  # 10+ events, ts non parsable -> burst probable
+
+    large_payload = max_payload_size > 20000
+
+    details = {
+        "client_ids_count": len(client_ids),
+        "server_ids_count": len(server_ids),
+        "unanswered_client_ids": unanswered[:10],
+        "duplicate_read_file": duplicate_read_file,
+        "large_payload": large_payload,
+        "track_ui_event_burst": track_ui_event_burst,
+        "max_payload_chars": max_payload_size,
+    }
+
+    if not client_ids:
+        return {"type": "inconclusive", "details": details}
+    if unanswered:
+        return {"type": "frozen_backend", "details": details}
+    return {"type": "frozen_ui_rendering", "details": details}
+
+
 def _dc_freeze_classify(cfg, now=None):
-    """v1.7.0 - Retourne un dict classifiant l'etat actuel de DC :
+    """v1.7.0 + v1.8.0 - Retourne un dict classifiant l'etat actuel de DC :
       verdict in {
         'no_dc',              # DC pas installe
         'cooldown',           # cooldown actif suite a un dismiss/toggle recent
@@ -1588,8 +1771,10 @@ def _dc_freeze_classify(cfg, now=None):
         'dialog_in_flight',   # dialog deja ouvert quelque part
         'idle_legitimate',    # DC + Claude responsive + log frais (rien a faire)
         'global_freeze',      # Claude Desktop unresponsive (pas DC isole, ne pas agir)
-        'no_log',             # DC enabled mais pas de log file (ne pas agir)
-        'frozen_isolated',    # critere ET satisfait : freeze DC isole, agir
+        'no_log',             # DC enabled mais pas de log file (ou shutdown gracieux)
+        'frozen_isolated',    # legacy alias (Type A non distingue) - garde pour retro-compat
+        'frozen_backend',     # v1.8.0 Type A : DC backend gele (id client sans reponse)
+        'frozen_ui_rendering',# v1.8.0 Type B : DC backend OK, Claude Desktop UI gele
       }
     Donnees brutes incluses pour les events watchdog.
     """
@@ -1612,11 +1797,34 @@ def _dc_freeze_classify(cfg, now=None):
     if log_path is None or log_age is None:
         return {"verdict": "no_log", "dc": dc}
     if log_age <= threshold:
+        # v1.8.0 P1 - filtre shutdown gracieux : si la queue du log montre un
+        # transport closed intentionnel, l'instance s'est arretee (mtime
+        # trompeur) - on classe no_log plutot que idle_legitimate.
+        try:
+            if _log_shows_graceful_shutdown(log_path):
+                return {"verdict": "no_log", "dc": dc, "log_age": log_age,
+                        "graceful_shutdown": True}
+        except Exception:
+            pass
         return {"verdict": "idle_legitimate", "dc": dc, "log_age": log_age, "threshold": threshold}
     if not _claude_responsive(timeout=2):
         return {"verdict": "global_freeze", "dc": dc, "log_age": log_age, "threshold": threshold}
-    return {"verdict": "frozen_isolated", "dc": dc, "log_age": log_age, "threshold": threshold,
-            "log_path": log_path}
+    # v1.8.0 P0 - distinguer Type A (frozen_backend) vs Type B (frozen_ui_rendering)
+    # par parsing des correspondances client_ids <-> server_ids dans le log.
+    try:
+        type_info = _classify_dc_log_freeze_type(log_path)
+    except Exception as e:
+        type_info = {"type": "inconclusive", "details": {"error": str(e)}}
+    if type_info["type"] == "frozen_backend":
+        verdict = "frozen_backend"
+    elif type_info["type"] == "frozen_ui_rendering":
+        verdict = "frozen_ui_rendering"
+    else:
+        # Pas assez de donnees pour distinguer - on garde l'ancien comportement
+        # (Type A par defaut) pour ne pas regresser le watchdog DC.
+        verdict = "frozen_isolated"
+    return {"verdict": verdict, "dc": dc, "log_age": log_age, "threshold": threshold,
+            "log_path": log_path, "type_details": type_info.get("details", {})}
 
 
 def _dc_toggle_settings_remediation(dc_info):
@@ -1650,13 +1858,27 @@ def _dc_dialog_prompt_restart_async(reason_detail):
 
     def _run():
         try:
-            text = (
-                "Desktop Commander semble fige (log silencieux et le toggle "
-                "settings n'a pas suffi).\n\nDeux choix :\n"
-                "* Redemarrer Claude Desktop maintenant (ferme les "
-                "conversations en cours)\n"
-                "* Plus tard ({}s de cooldown)"
-            ).format(cooldown)
+            # v1.8.0 - message specifique selon le type de freeze :
+            # - frozen_ui_rendering : DC repond, c'est l'UI Claude qui gele.
+            # - autre (toggle_failed, toggle_io_error) : DC backend gele.
+            if reason_detail == "frozen_ui_rendering":
+                text = (
+                    "Claude Desktop UI semble bloquee (Desktop Commander "
+                    "repond normalement). Le toggle settings ne reveillerait "
+                    "pas l'UI - seule la relance complete fonctionne.\n\n"
+                    "Deux choix :\n"
+                    "* Redemarrer Claude Desktop maintenant (ferme les "
+                    "conversations en cours)\n"
+                    "* Plus tard ({}s de cooldown)"
+                ).format(cooldown)
+            else:
+                text = (
+                    "Desktop Commander semble fige (log silencieux et le toggle "
+                    "settings n'a pas suffi).\n\nDeux choix :\n"
+                    "* Redemarrer Claude Desktop maintenant (ferme les "
+                    "conversations en cours)\n"
+                    "* Plus tard ({}s de cooldown)"
+                ).format(cooldown)
             safe_text = text.replace('"', '\\"').replace('\\', '\\\\')
             script = (
                 'display dialog "' + safe_text + '" '
@@ -1746,14 +1968,36 @@ def _dc_auto_remediation_step(cfg):
     cls = _dc_freeze_classify(cfg, now=now)
     verdict = cls.get("verdict")
 
-    if verdict == "frozen_isolated":
+    # v1.8.0 P0 - Type B (Claude Desktop UI gele, DC backend OK) : skip toggle
+    # qui ne sert a rien dans ce cas, escalade directe au dialog avec un
+    # message specifique. La remediation toggle ne reveille jamais l'UI Claude.
+    if verdict == "frozen_ui_rendering":
+        dc = cls["dc"]
+        details = cls.get("type_details", {})
+        signals = []
+        if details.get("duplicate_read_file"): signals.append("duplicate_read_file")
+        if details.get("large_payload"): signals.append("large_payload>20k")
+        if details.get("track_ui_event_burst"): signals.append("track_ui_event_burst>10")
+        sig_str = ", ".join(signals) if signals else "no_bonus_signals"
+        _watchdog_event(
+            "dc_freeze_ui_rendering",
+            f"Claude Desktop UI semble gele (DC backend OK, "
+            f"client_ids={details.get('client_ids_count', 0)} answered, "
+            f"bonus={sig_str}) -> dialog direct restart Claude Desktop"
+        )
+        _dc_dialog_prompt_restart_async("frozen_ui_rendering")
+        return
+
+    if verdict in ("frozen_isolated", "frozen_backend"):
         dc = cls["dc"]
         log_age = cls["log_age"]
         threshold = cls["threshold"]
+        details = cls.get("type_details", {})
+        unanswered = details.get("unanswered_client_ids", [])
         _watchdog_event(
             "dc_freeze_detected",
-            f"DC log inactif {log_age}s > seuil {threshold}s, "
-            f"Claude Desktop responsive -> tentative toggle settings"
+            f"DC backend gele - log inactif {log_age}s > seuil {threshold}s, "
+            f"unanswered client_ids={unanswered[:5]} -> tentative toggle settings"
         )
         try:
             cur_mtime = Path(dc["log_path"]).stat().st_mtime if dc.get("log_path") else 0.0
