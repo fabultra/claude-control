@@ -254,22 +254,27 @@ def get_state():
         + [{"name": n, "active": False, "running": False, "type": "classic"} for n in sorted(disabled.keys())]
     )
     extensions = _list_extensions()
-    now = time.time()
     for e in extensions:
-        # v1.7.4 - meme strategie que dc_status() en v1.6.6 : sur Claude Desktop
-        # moderne, les extensions tournent dans des Helper Nodes anonymes
-        # (node.mojom.NodeService) impossibles a matcher par PID. _extension_pids
-        # echoue silencieusement et l'extension apparait alors comme 'pas
-        # demarre' dans la Vue d'ensemble. Fallback log mtime : si le fichier
-        # log a ete touche dans les 120 dernieres secondes, l'extension tourne
-        # probablement.
+        # v1.8.3 - critere "running" pour AFFICHAGE UI : permissif sans
+        # seuil mtime court. Bug D 2026-05-06 : 8 extensions MCPB en
+        # standby legitime (Filesystem, Control Chrome, Word, etc.) ont
+        # ete classees "Inactifs" parce que leur log mtime depassait 120s
+        # (silence entre 2 appels agent, ce qui est normal pour des MCPs
+        # peu sollicites). Ce seuil a un sens pour le watchdog (detecter
+        # un freeze sur cible monitoree) mais pas pour l'UI (statut
+        # "chargee et prete a etre appelee").
+        # Critere UI permissif :
+        #   1. PIDs trouves via fingerprint -> running (rare pour les
+        #      Helper Nodes anonymes, mais valide quand applicable)
+        #   2. Sinon, log file existe ET pas de shutdown gracieux dans
+        #      la queue -> running (extension chargee, en standby)
+        #   3. Sinon -> not running
         running_ext = bool(_extension_pids(e["name"]))
         if not running_ext:
             try:
                 log = _find_mcp_log(e["name"])
-                if log and log.exists():
-                    if (now - log.stat().st_mtime) <= 120:
-                        running_ext = True
+                if log and log.exists() and not _log_shows_graceful_shutdown(log):
+                    running_ext = True
             except Exception:
                 pass
         mcps_list.append({
@@ -1603,8 +1608,20 @@ def diagnose_extensions():
         top_version = ext.get("version") or ""
 
         warnings = []
+        main_log_hints = None
         if ext["enabled"] and not log:
             warnings.append("enabled_but_no_log")
+            # v1.8.3 Bug E - scan main.log pour comprendre pourquoi cette
+            # extension cochee n'a pas de log file (jamais demarree).
+            # Hypothese principale : allowlist dxt: qui bloque silencieusement
+            # (ajoute par Anthropic apres la faille Ace of Aces 2026-02).
+            try:
+                main_log_hints = (
+                    _scan_main_log_for_extension_failures(name)
+                    or _scan_main_log_for_extension_failures(ext_id)
+                )
+            except Exception:
+                main_log_hints = None
         if log and log_mtime_age is not None and log_mtime_age > 300:
             warnings.append("log_inactive_5min")
         if log and log_mtime_age is not None and log_mtime_age <= 300 and not pids:
@@ -1630,6 +1647,7 @@ def diagnose_extensions():
             "pids": pids,
             "pid_method": pid_method,
             "warnings": warnings,
+            "main_log_hints": main_log_hints,  # v1.8.3 Bug E - lignes main.log si jamais demarre
         })
 
     with_warnings = sum(1 for e in out if e["warnings"])
@@ -1857,20 +1875,80 @@ _DC_GRACEFUL_SHUTDOWN_MARKERS = (
 )
 
 
-def _read_log_tail(path, max_lines=200):
-    """v1.8.0 - Lit les `max_lines` dernieres lignes d'un fichier log de
-    facon raisonnable. On lit le fichier en entier (plus simple que un seek
-    inverse fragile pour des logs Claude qui font typiquement < 10 Mo).
+def _read_log_tail(path, max_lines=200, max_bytes=64_000):
+    """v1.8.3 - Lit les `max_lines` dernieres lignes en seekant depuis la
+    fin du fichier (max `max_bytes` bytes lus). Defensive contre les gros
+    logs : main.log Claude Desktop peut faire des dizaines de Mo, et
+    f.readlines() chargerait tout en memoire (et l'apprentissage du
+    freeze Type B nous a appris a ne pas lire de blob > 25k chars sans
+    raison). On jette la premiere ligne potentiellement tronquee a
+    mi-chemin par le seek.
     Retourne la liste des lignes (sans CR/LF). Tolerant aux erreurs.
     """
     try:
-        with open(path, "r", errors="replace") as f:
-            lines = f.readlines()
+        path_obj = Path(path)
+        if not path_obj.exists():
+            return []
+        with open(path_obj, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            offset = max(0, size - max_bytes)
+            f.seek(offset)
+            blob = f.read(max_bytes)
+        text = blob.decode("utf-8", errors="replace")
+        # Si on n'a pas lu depuis le debut, jeter la premiere ligne
+        # (probablement coupee a mi-chemin par le seek).
+        if offset > 0 and "\n" in text:
+            text = text.split("\n", 1)[1]
+        lines = text.splitlines()
     except Exception:
         return []
     if max_lines and len(lines) > max_lines:
         lines = lines[-max_lines:]
-    return [ln.rstrip("\r\n") for ln in lines]
+    return lines
+
+
+def _scan_main_log_for_extension_failures(name_or_id, max_lines=200, max_bytes=128_000):
+    """v1.8.3 - Scan tail de Claude Desktop main.log pour des erreurs liees
+    a une extension qui n'a JAMAIS demarre (pas de mcp-server-X.log).
+    Bug E observe 2026-05-06 : Stripe avait isEnabled:true dans son
+    settings mais aucun log -> CD ne tente meme pas de la demarrer.
+    Hypothese : allowlist dxt: qui bloque silencieusement.
+
+    Cherche dans le tail :
+      - le nom de l'extension (case-insensitive et normalise)
+      - + un keyword d'echec : error, failed, rejected, blocked, denied,
+        allowlist, not allowed, unable to load
+
+    Retourne :
+      - None si main.log absent ou aucun match
+      - list[str] (max 3 dernieres lignes matchant) sinon
+
+    Defensive : utilise _read_log_tail (seek-based, 128 KB cap par
+    defaut, jette la 1ere ligne potentiellement tronquee). Pas de
+    risque de freeze meme si main.log fait 100+ Mo.
+    """
+    main_log = CLAUDE_LOGS_DIR / "main.log"
+    if not main_log.exists() or not name_or_id:
+        return None
+    name_lc = str(name_or_id).lower()
+    norm = re.sub(r"[^a-z0-9]", "", name_lc)
+    if not norm or len(norm) < 3:
+        return None
+    tail = _read_log_tail(main_log, max_lines=max_lines, max_bytes=max_bytes)
+    failure_kws = ("error", "failed", "rejected", "blocked", "denied",
+                   "allowlist", "not allowed", "unable to load",
+                   "cannot load", "not started")
+    matches = []
+    for line in tail:
+        line_lc = line.lower()
+        line_norm = re.sub(r"[^a-z0-9]", "", line_lc)
+        if norm in line_norm or name_lc in line_lc:
+            if any(kw in line_lc for kw in failure_kws):
+                matches.append(line.strip()[:300])
+    if matches:
+        return matches[-3:]
+    return None
 
 
 def _log_shows_graceful_shutdown(path, max_lines=20):
@@ -5125,8 +5203,14 @@ async function loadDiagExt(){
       const warns = e.warnings.length === 0
         ? '<span class="text-stone-300">&mdash;</span>'
         : e.warnings.map(w=>`<div class="text-xs text-amber-800">${tr('mcp_diag_warn_'+w) || w}</div>`).join('');
+      // v1.8.3 Bug E - extension cochee mais jamais demarree : on affiche
+      // sous les warnings les lignes pertinentes de main.log si scan a
+      // trouve quelque chose (allowlist, error, blocked, ...).
+      const hints = (e.main_log_hints && e.main_log_hints.length)
+        ? `<div class="mt-1 p-2 bg-red-50 border border-red-200 rounded text-[11px] font-mono text-red-800 leading-tight">${e.main_log_hints.map(l=>`<div class="truncate" title="${escAttr(l)}">${escAttr(l)}</div>`).join('')}</div>`
+        : '';
       const meta = `<div class="text-[10px] text-stone-400 font-mono mt-0.5">${escAttr(e.id)}${e.log_match_method && e.log_match_method !== 'none' ? ' &middot; '+escAttr(e.log_match_method) : ''}${e.pid_method && e.pid_method !== 'none' ? ' &middot; '+escAttr(e.pid_method) : ''}</div>`;
-      return `<tr class="border-t border-stone-100"><td class="py-2 pr-3 align-top"><div class="text-sm font-medium text-stone-800">${escAttr(e.name)}</div>${meta}</td><td class="py-2 pr-3 align-top">${status}</td><td class="py-2 align-top">${warns}</td></tr>`;
+      return `<tr class="border-t border-stone-100"><td class="py-2 pr-3 align-top"><div class="text-sm font-medium text-stone-800">${escAttr(e.name)}</div>${meta}</td><td class="py-2 pr-3 align-top">${status}</td><td class="py-2 align-top">${warns}${hints}</td></tr>`;
     }).join('');
     out.innerHTML = head + `<table class="w-full text-sm"><thead><tr class="text-xs uppercase tracking-wide text-stone-500"><th class="text-left pb-2 pr-3">${tr('mcp_diag_col_name')}</th><th class="text-left pb-2 pr-3">${tr('mcp_diag_col_status')}</th><th class="text-left pb-2">${tr('mcp_diag_col_warnings')}</th></tr></thead><tbody>${rows}</tbody></table>`;
   } catch(e){
