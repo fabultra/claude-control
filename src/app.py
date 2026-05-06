@@ -3967,21 +3967,24 @@ async function loadState(){
     const extBadge = isExt ? `<span class="text-[10px] font-mono text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded" title="Desktop Extension">${tr('ext_badge')}</span>` : '';
     const versionBadge = isExt && m.version ? `<span class="text-[10px] text-stone-400 font-mono">v${escAttr(m.version)}</span>` : '';
     const toggleFn = isExt ? `toggleExtension('${m.name}', this.checked)` : `toggleMcp('${m.name}')`;
+    // v1.7.9 - 'pas demarre · pourquoi ?' compacte en simple '?' amber
+    // (le pill complet faisait wrap sur 3 lignes en layout 2-colonnes).
     const whyBtn = (m.active && !m.running && !isExt)
-      ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`
+      ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-[11px] font-bold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-full w-5 h-5 inline-flex items-center justify-center shrink-0" title="${tr('not_started_label')} - ${tr('why_title')}">?</button>`
       : '';
-    // v1.7.6 - bouton run-control contextuel : Stop si en cours, Demarrer si
-    // actif dans le config mais pas en cours d'execution. Si inactif (checkbox
-    // off), pas de bouton (l'utilisateur doit cocher d'abord).
+    // v1.7.9 - boutons icon-only (avec title tooltip) : libere ~200px par ligne
+    // pour que les noms ne soient plus tronques a 1-2 lettres en layout
+    // 2-colonnes. Sémantique des icônes universelle (▶ ⏹ ↻ 🗑) + tooltip clair.
+    const iconBtnCls = (theme) => `inline-flex items-center justify-center w-7 h-7 text-sm rounded-md border shrink-0 ${theme}`;
     let runCtlBtn = '';
     if (m.running){
-      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();stopMcp('${m.name}')" title="${tr('btn_stop_mcp_title')}" class="inline-flex items-center gap-1 text-xs font-medium text-stone-700 bg-stone-50 border border-stone-200 hover:bg-stone-100 rounded-md px-2 py-1 shrink-0">&#9209; <span>${tr('btn_stop_mcp_short')}</span></button>`;
+      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();stopMcp('${m.name}')" title="${tr('btn_stop_mcp_short')} - ${tr('btn_stop_mcp_title')}" class="${iconBtnCls('text-stone-700 bg-stone-50 border-stone-200 hover:bg-stone-100')}" aria-label="${tr('btn_stop_mcp_short')}">&#9209;</button>`;
     } else if (m.active){
-      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();startMcp('${m.name}')" title="${tr('btn_start_mcp_title')}" class="inline-flex items-center gap-1 text-xs font-medium text-green-800 bg-green-50 border border-green-200 hover:bg-green-100 rounded-md px-2 py-1 shrink-0">&#9654; <span>${tr('btn_start_mcp_short')}</span></button>`;
+      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();startMcp('${m.name}')" title="${tr('btn_start_mcp_short')} - ${tr('btn_start_mcp_title')}" class="${iconBtnCls('text-green-800 bg-green-50 border-green-200 hover:bg-green-100')}" aria-label="${tr('btn_start_mcp_short')}">&#9654;</button>`;
     }
-    const restartBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="inline-flex items-center gap-1 text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 hover:bg-amber-100 rounded-md px-2 py-1 shrink-0">&#x21bb; <span>${tr('btn_restart_mcp_short')}</span></button>`;
+    const restartBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp_short')} - ${tr('btn_restart_mcp')}" class="${iconBtnCls('text-amber-800 bg-amber-50 border-amber-200 hover:bg-amber-100')}" aria-label="${tr('btn_restart_mcp_short')}">&#x21bb;</button>`;
     const deleteFn = isExt ? `deleteExtension('${m.name}')` : `deleteMcp('${m.name}')`;
-    const deleteBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();${deleteFn}" title="${tr('btn_delete_mcp_title')}" class="inline-flex items-center gap-1 text-xs font-medium text-red-700 bg-red-50 border border-red-200 hover:bg-red-100 rounded-md px-2 py-1 shrink-0">&#128465; <span>${tr('btn_delete')}</span></button>`;
+    const deleteBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();${deleteFn}" title="${tr('btn_delete')} - ${tr('btn_delete_mcp_title')}" class="${iconBtnCls('text-red-700 bg-red-50 border-red-200 hover:bg-red-100')}" aria-label="${tr('btn_delete')}">&#128465;</button>`;
     const checkboxTitle = tr('mcp_checkbox_title');
     return `<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-2 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="${toggleFn}" title="${checkboxTitle}" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${extBadge}${versionBadge}${whyBtn}</div><div class="flex items-center gap-1.5 shrink-0">${runCtlBtn}${restartBtn}${deleteBtn}</div></label>`;
   }
