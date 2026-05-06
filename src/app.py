@@ -2797,8 +2797,28 @@ def restart_self():
     return True, "Redemarrage en cours..."
 
 
+# v1.7.2 - favicon SVG inline pour eviter le 404 /favicon.ico et donner une
+# identite visuelle dans l'onglet du navigateur. Mirror la charte du .app :
+# squircle vert degrade (#2C5F3F -> #14301F) + monogramme C blanc + accent
+# orange Sekoia (#D97757). Pas de PNG/ICO commit (stdlib-only, pas de Pillow).
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
+    '<stop offset="0" stop-color="#2C5F3F"/>'
+    '<stop offset="1" stop-color="#14301F"/>'
+    '</linearGradient></defs>'
+    '<rect x="0" y="0" width="64" height="64" rx="14" ry="14" fill="url(#g)"/>'
+    '<text x="32" y="44" text-anchor="middle" '
+    'font-family="-apple-system,system-ui,sans-serif" '
+    'font-size="38" font-weight="700" fill="#fff">C</text>'
+    '<circle cx="50" cy="14" r="6" fill="#D97757"/>'
+    '</svg>'
+)
+
+
 HTML = r"""<!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8"><title>Claude Control</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cdefs%3E%3ClinearGradient%20id%3D%22g%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%220%22%20y2%3D%221%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%232C5F3F%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%2314301F%22%2F%3E%3C%2FlinearGradient%3E%3C%2Fdefs%3E%3Crect%20x%3D%220%22%20y%3D%220%22%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214%22%20ry%3D%2214%22%20fill%3D%22url(%23g)%22%2F%3E%3Ctext%20x%3D%2232%22%20y%3D%2244%22%20text-anchor%3D%22middle%22%20font-family%3D%22-apple-system%2Csystem-ui%2Csans-serif%22%20font-size%3D%2238%22%20font-weight%3D%22700%22%20fill%3D%22%23fff%22%3EC%3C%2Ftext%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2214%22%20r%3D%226%22%20fill%3D%22%23D97757%22%2F%3E%3C%2Fsvg%3E"/>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
 body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
@@ -4473,6 +4493,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/favicon.ico":
+            # v1.7.2 - fallback pour Safari et navigateurs qui ignorent le
+            # <link rel="icon"> et bypass-fetch /favicon.ico. On sert le meme
+            # SVG (Content-Type image/svg+xml) ; les navigateurs modernes
+            # acceptent ca, ICO strict est rare et ne justifie pas un binaire
+            # commit dans le repo (philosophie stdlib-only).
+            body = FAVICON_SVG.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.send_header("Cache-Control", "public, max-age=86400")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
