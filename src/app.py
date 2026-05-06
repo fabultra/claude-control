@@ -599,7 +599,7 @@ PROJECTS_LOGS_DIR = HOME / ".claude/projects"
 WATCHDOG_FILE = HOME / ".claude/claude-control-watchdog.json"
 _WATCHDOG_EVENTS = []
 _WATCHDOG_EVENTS_LOCK = threading.Lock()
-_WATCHDOG_MAX_EVENTS = 30
+_WATCHDOG_MAX_EVENTS = 100  # v1.7.0 - tab Watchdog affiche 50 events recents
 
 
 def _watchdog_event(action, detail=""):
@@ -619,6 +619,15 @@ _DEFAULT_WATCHDOG = {
     "freeze_timeout": 5,
     "target": "claude_desktop",
     "target_pattern": "",
+    # v1.7.0 - DC auto-remediation (orthogonal au target principal). Opt-in.
+    # Detecte un freeze isole de Desktop Commander (log silencieux >N s ET
+    # Claude Desktop responsive) puis tente une remediation graduee :
+    # 1. toggle settings off/on (best-effort, sans kill PID)
+    # 2. si echec apres N s, dialog macOS proposant restart Claude Desktop
+    "dc_auto_remediation": False,
+    "dc_inactivity_threshold_seconds": 120,
+    "dc_verify_after_toggle_seconds": 30,
+    "dc_cooldown_after_dismiss_seconds": 300,
 }
 
 
@@ -648,6 +657,11 @@ def save_watchdog_config(updates):
     cfg["freeze_detection"] = bool(cfg["freeze_detection"])
     cfg["target"] = (cfg.get("target") or "claude_desktop").strip()
     cfg["target_pattern"] = (cfg.get("target_pattern") or "").strip()
+    # v1.7.0 - bornes prudentes pour DC auto-remediation (faux positif >> faux negatif)
+    cfg["dc_auto_remediation"] = bool(cfg.get("dc_auto_remediation", False))
+    cfg["dc_inactivity_threshold_seconds"] = max(60, int(cfg.get("dc_inactivity_threshold_seconds", 120) or 120))
+    cfg["dc_verify_after_toggle_seconds"] = max(10, int(cfg.get("dc_verify_after_toggle_seconds", 30) or 30))
+    cfg["dc_cooldown_after_dismiss_seconds"] = max(120, int(cfg.get("dc_cooldown_after_dismiss_seconds", 300) or 300))
     WATCHDOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(WATCHDOG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
@@ -1281,7 +1295,9 @@ def get_watchdog_status():
         pids = _mcp_pids(target)
         target_label = target
     with _WATCHDOG_EVENTS_LOCK:
-        events = list(_WATCHDOG_EVENTS[-10:][::-1])
+        # v1.7.0 - 50 derniers events pour la tab Watchdog. Le widget compact
+        # n'utilise toujours que les 3 premiers, donc pas de regression.
+        events = list(_WATCHDOG_EVENTS[-50:][::-1])
     return {
         "config": cfg,
         "claude_running": len(pids) > 0,
@@ -1292,11 +1308,237 @@ def get_watchdog_status():
     }
 
 
+# v1.7.0 - state machine de la remediation DC. Garde en memoire le dernier
+# verdict pour eviter le spam : "Plus tard" -> cooldown long, toggle reussi
+# -> cooldown court de stabilisation, toggle echoue -> escalade dialog.
+# Tout est in-memory : si l'app redemarre, on repart d'une page blanche.
+_DC_REMEDIATION_STATE = {
+    "last_action_ts": 0.0,
+    "cooldown_until_ts": 0.0,
+    "last_toggle_log_mtime": 0.0,
+    "pending_verify_until_ts": 0.0,
+    "dialog_in_flight": False,
+    "dialog_lock": threading.Lock(),
+}
+
+
+def _dc_freeze_classify(cfg, now=None):
+    """v1.7.0 - Retourne un dict classifiant l'etat actuel de DC :
+      verdict in {
+        'no_dc',              # DC pas installe
+        'cooldown',           # cooldown actif suite a un dismiss/toggle recent
+        'pending_verify',     # toggle vient d'etre fait, on attend verify
+        'dialog_in_flight',   # dialog deja ouvert quelque part
+        'idle_legitimate',    # DC + Claude responsive + log frais (rien a faire)
+        'global_freeze',      # Claude Desktop unresponsive (pas DC isole, ne pas agir)
+        'no_log',             # DC enabled mais pas de log file (ne pas agir)
+        'frozen_isolated',    # critere ET satisfait : freeze DC isole, agir
+      }
+    Donnees brutes incluses pour les events watchdog.
+    """
+    now = now if now is not None else time.time()
+    threshold = cfg.get("dc_inactivity_threshold_seconds", 120)
+    state = _DC_REMEDIATION_STATE
+    if now < state["cooldown_until_ts"]:
+        return {"verdict": "cooldown", "cooldown_remaining": int(state["cooldown_until_ts"] - now)}
+    if state["dialog_in_flight"]:
+        return {"verdict": "dialog_in_flight"}
+    if now < state["pending_verify_until_ts"]:
+        return {"verdict": "pending_verify",
+                "pending_remaining": int(state["pending_verify_until_ts"] - now)}
+
+    dc = dc_status()
+    if not dc:
+        return {"verdict": "no_dc"}
+    log_path = dc.get("log_path")
+    log_age = dc.get("log_age_seconds")
+    if log_path is None or log_age is None:
+        return {"verdict": "no_log", "dc": dc}
+    if log_age <= threshold:
+        return {"verdict": "idle_legitimate", "dc": dc, "log_age": log_age, "threshold": threshold}
+    if not _claude_responsive(timeout=2):
+        return {"verdict": "global_freeze", "dc": dc, "log_age": log_age, "threshold": threshold}
+    return {"verdict": "frozen_isolated", "dc": dc, "log_age": log_age, "threshold": threshold,
+            "log_path": log_path}
+
+
+def _dc_toggle_settings_remediation(dc_info):
+    """v1.7.0 - Etape 1 : toggle off/on des settings DC. Best-effort, NE
+    KILL AUCUN PID (le bug pre-v1.6.6 ne doit pas revenir). Renvoie (ok, msg).
+    """
+    target_id = dc_info["id"]
+    target_name = dc_info["name"]
+    settings = _load_extension_settings(target_id)
+    was_enabled = bool(settings.get("enabled", True))
+    settings["enabled"] = False
+    try:
+        _save_extension_settings(target_id, settings)
+        time.sleep(1.5)
+        settings["enabled"] = was_enabled
+        _save_extension_settings(target_id, settings)
+    except Exception as e:
+        return False, f"Erreur toggle settings : {e}"
+    _LAST_RESTARTS[target_name] = datetime.now().isoformat(timespec="seconds")
+    return True, f"Toggle settings DC effectue (was_enabled={was_enabled})"
+
+
+def _dc_dialog_prompt_restart_async(reason_detail):
+    """v1.7.0 - Etape 2 : dialog macOS avec 2 boutons. Tourne dans un thread
+    pour ne pas bloquer la boucle watchdog (display dialog est sync). Sur
+    'Redemarrer maintenant' -> restart_claude_desktop(). Sur 'Plus tard' ou
+    timeout -> cooldown.
+    """
+    cfg = load_watchdog_config()
+    cooldown = cfg.get("dc_cooldown_after_dismiss_seconds", 300)
+
+    def _run():
+        try:
+            text = (
+                "Desktop Commander semble fige (log silencieux et le toggle "
+                "settings n'a pas suffi).\n\nDeux choix :\n"
+                "* Redemarrer Claude Desktop maintenant (ferme les "
+                "conversations en cours)\n"
+                "* Plus tard ({}s de cooldown)"
+            ).format(cooldown)
+            safe_text = text.replace('"', '\\"').replace('\\', '\\\\')
+            script = (
+                'display dialog "' + safe_text + '" '
+                'with title "Claude Control - DC fige" '
+                'buttons {"Plus tard", "Redemarrer Claude Desktop"} '
+                'default button "Plus tard" '
+                'with icon caution '
+                'giving up after 60'
+            )
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=75
+            )
+            chose_restart = (
+                r.returncode == 0
+                and "Redemarrer Claude Desktop" in (r.stdout or "")
+                and "gave up:true" not in (r.stdout or "")
+            )
+            if chose_restart:
+                _watchdog_event(
+                    "dc_user_chose_restart",
+                    f"User accepte restart Claude Desktop (reason={reason_detail})"
+                )
+                ok, msg = restart_claude_desktop()
+                _watchdog_event("dc_restart_claude_result", msg if ok else f"failed: {msg}")
+                _DC_REMEDIATION_STATE["cooldown_until_ts"] = time.time() + cooldown
+            else:
+                _watchdog_event(
+                    "dc_user_dismissed",
+                    f"User differe (reason={reason_detail}), cooldown {cooldown}s"
+                )
+                _DC_REMEDIATION_STATE["cooldown_until_ts"] = time.time() + cooldown
+        except Exception as e:
+            _watchdog_event("dc_dialog_error", str(e))
+            _DC_REMEDIATION_STATE["cooldown_until_ts"] = time.time() + cooldown
+        finally:
+            _DC_REMEDIATION_STATE["dialog_in_flight"] = False
+
+    with _DC_REMEDIATION_STATE["dialog_lock"]:
+        if _DC_REMEDIATION_STATE["dialog_in_flight"]:
+            return False
+        _DC_REMEDIATION_STATE["dialog_in_flight"] = True
+    threading.Thread(target=_run, name="dc-remediation-dialog", daemon=True).start()
+    return True
+
+
+def _dc_auto_remediation_step(cfg):
+    """v1.7.0 - Une iteration de la remediation DC. Appelee depuis le
+    watchdog loop. Idempotente : si rien a faire, retourne sans bruit."""
+    state = _DC_REMEDIATION_STATE
+    now = time.time()
+
+    # Cas particulier : on attend la verification post-toggle.
+    if now < state["pending_verify_until_ts"]:
+        # Verifie si le log a bouge depuis le toggle.
+        dc = dc_status()
+        if dc and dc.get("log_path"):
+            try:
+                cur_mtime = Path(dc["log_path"]).stat().st_mtime
+            except Exception:
+                cur_mtime = 0.0
+            if cur_mtime > state["last_toggle_log_mtime"]:
+                _watchdog_event(
+                    "dc_toggle_success",
+                    f"Log a bouge apres toggle (age={dc.get('log_age_seconds')}s)"
+                )
+                state["pending_verify_until_ts"] = 0.0
+                state["cooldown_until_ts"] = now + 120  # stabilisation 2 min
+                return
+        # Pas encore expire, on patiente.
+        return
+
+    # Si on vient d'expirer la fenetre de verify, le toggle a echoue.
+    if state["pending_verify_until_ts"] > 0 and now >= state["pending_verify_until_ts"]:
+        state["pending_verify_until_ts"] = 0.0
+        _watchdog_event(
+            "dc_toggle_failed",
+            "Log toujours silencieux apres verify_after_toggle_seconds"
+        )
+        # Escalade -> dialog
+        dc = dc_status()
+        if dc:
+            _dc_dialog_prompt_restart_async("toggle_failed")
+        return
+
+    # Cas normal : classifier la situation.
+    cls = _dc_freeze_classify(cfg, now=now)
+    verdict = cls.get("verdict")
+
+    if verdict == "frozen_isolated":
+        dc = cls["dc"]
+        log_age = cls["log_age"]
+        threshold = cls["threshold"]
+        _watchdog_event(
+            "dc_freeze_detected",
+            f"DC log inactif {log_age}s > seuil {threshold}s, "
+            f"Claude Desktop responsive -> tentative toggle settings"
+        )
+        try:
+            cur_mtime = Path(dc["log_path"]).stat().st_mtime if dc.get("log_path") else 0.0
+        except Exception:
+            cur_mtime = 0.0
+        ok, msg = _dc_toggle_settings_remediation(dc)
+        if not ok:
+            _watchdog_event("dc_toggle_error", msg)
+            # Aller direct au dialog si le toggle ne s'est meme pas fait.
+            _dc_dialog_prompt_restart_async("toggle_io_error")
+            return
+        _watchdog_event("dc_toggle_attempted", msg)
+        state["last_toggle_log_mtime"] = cur_mtime
+        state["last_action_ts"] = now
+        state["pending_verify_until_ts"] = now + cfg.get("dc_verify_after_toggle_seconds", 30)
+        return
+
+    if verdict == "global_freeze":
+        # Pas notre probleme - le watchdog Claude Desktop principal s'en occupe.
+        # On log juste une fois par cycle pour la trace, sans agir.
+        _watchdog_event(
+            "dc_global_freeze_skipped",
+            f"Claude Desktop ne repond pas - freeze global, pas DC isole, no-op"
+        )
+        return
+
+    # Tous les autres verdicts (idle_legitimate, no_dc, no_log, cooldown,
+    # pending_verify, dialog_in_flight) -> rien a faire, on n'inonde pas le log.
+
+
 def _watchdog_loop():
     while True:
         try:
             cfg = load_watchdog_config()
             interval = cfg["interval_seconds"]
+            # v1.7.0 - DC auto-remediation tourne orthogonalement au target principal.
+            # Active independamment ; ne kill aucun PID ; n'agit que si DC isole.
+            if cfg.get("dc_auto_remediation"):
+                try:
+                    _dc_auto_remediation_step(cfg)
+                except Exception as e:
+                    _watchdog_event("dc_remediation_error", str(e))
             if cfg["enabled"]:
                 target = cfg.get("target", "claude_desktop")
                 if target == "claude_desktop":
@@ -2593,6 +2835,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="skills" onclick="setMainTab('skills')" data-i18n="skills">Skills</button>
 <button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="plugins" onclick="setMainTab('plugins')" data-i18n="plugins">Plugins</button>
 <button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="commands" onclick="setMainTab('commands')" data-i18n="commands">Commands</button>
+<button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="watchdog" onclick="setMainTab('watchdog')" data-i18n="tab_watchdog">Watchdog</button>
 <button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="advanced" onclick="setMainTab('advanced')" data-i18n="tab_advanced">Avancé</button>
 </nav>
 <div data-main-tab="overview">
@@ -2674,6 +2917,18 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <h2 class="text-lg font-semibold mb-1" data-i18n="commands">Commands</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="commands_help">Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs</p>
 <div id="commands" class="space-y-2 max-h-[700px] overflow-y-auto"></div>
+</section>
+</div>
+<div data-main-tab="watchdog" class="hidden">
+<section class="card p-6 mb-6">
+<h2 class="text-lg font-semibold mb-1" data-i18n="watchdog_tab_title">Watchdog</h2>
+<p class="text-xs text-stone-500 mb-4" data-i18n="watchdog_tab_help">Surveillance Claude Desktop, MCPs et Desktop Commander. Tous les declenchements sont logges dans le journal en bas.</p>
+<div class="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800"><strong>&#9888;</strong> <span data-i18n="watchdog_dc_explainer">Le mode auto-remediation DC tente d'abord un toggle settings (sans kill PID), puis te demande l'autorisation de redemarrer Claude Desktop si necessaire. Il ne kille jamais directement de process et ne s'active que si DC est silencieux ET Claude Desktop reste responsive (freeze isole).</span></div>
+<div id="watchdog-tab-config" class="space-y-3"></div>
+</section>
+<section class="card p-6">
+<h3 class="text-base font-semibold mb-3" data-i18n="watchdog_events_title">Journal d'evenements</h3>
+<div id="watchdog-tab-events" class="space-y-1 max-h-[500px] overflow-y-auto text-xs font-mono"></div>
 </section>
 </div>
 <div data-main-tab="advanced" class="hidden">
@@ -2978,6 +3233,17 @@ fr: {
   watchdog_enable: "Surveiller Claude Desktop",
   watchdog_crash: "Redémarrer si crash",
   watchdog_freeze: "Détecter freeze + redémarrer",
+  tab_watchdog: "Watchdog",
+  watchdog_tab_title: "Watchdog",
+  watchdog_tab_help: "Surveillance Claude Desktop, MCPs et Desktop Commander. Tous les declenchements sont logges dans le journal en bas.",
+  watchdog_dc_explainer: "Le mode auto-remediation DC tente d'abord un toggle settings (sans kill PID), puis te demande l'autorisation de redemarrer Claude Desktop si necessaire. Il ne kille jamais directement de process et ne s'active que si DC est silencieux ET Claude Desktop reste responsive (freeze isole).",
+  watchdog_dc_auto_label: "Auto-remediation Desktop Commander",
+  watchdog_dc_auto_help: "Detecte un freeze isole de DC, tente un toggle settings, puis propose un restart Claude Desktop avec consentement.",
+  watchdog_dc_threshold_label: "Seuil d'inactivite log (s)",
+  watchdog_dc_verify_label: "Verification post-toggle (s)",
+  watchdog_dc_cooldown_label: "Cooldown apres dismiss (s)",
+  watchdog_events_title: "Journal d'evenements",
+  watchdog_no_events: "Aucun evenement enregistre.",
   watchdog_target_label: "Cible",
   watchdog_custom_target: "Pattern personnalisé",
   watchdog_pattern_placeholder: "ex : desktop-commander, /chemin/vers/binaire, package-name",
@@ -3172,6 +3438,17 @@ en: {
   watchdog_enable: "Watch Claude Desktop",
   watchdog_crash: "Restart on crash",
   watchdog_freeze: "Detect freeze + restart",
+  tab_watchdog: "Watchdog",
+  watchdog_tab_title: "Watchdog",
+  watchdog_tab_help: "Monitors Claude Desktop, MCPs and Desktop Commander. Every trigger is logged in the journal below.",
+  watchdog_dc_explainer: "DC auto-remediation first tries a settings toggle (no PID kill), then asks for your consent to restart Claude Desktop if needed. It never kills processes directly and only activates when DC is silent AND Claude Desktop remains responsive (isolated freeze).",
+  watchdog_dc_auto_label: "Desktop Commander auto-remediation",
+  watchdog_dc_auto_help: "Detects an isolated DC freeze, tries a settings toggle, then prompts for Claude Desktop restart with consent.",
+  watchdog_dc_threshold_label: "Log inactivity threshold (s)",
+  watchdog_dc_verify_label: "Post-toggle verification (s)",
+  watchdog_dc_cooldown_label: "Cooldown after dismiss (s)",
+  watchdog_events_title: "Event journal",
+  watchdog_no_events: "No event recorded.",
   watchdog_target_label: "Target",
   watchdog_custom_target: "Custom pattern",
   watchdog_pattern_placeholder: "e.g.: desktop-commander, /path/to/binary, package-name",
@@ -3674,6 +3951,54 @@ async function updateWatchdog(updates){
   const j = await api('/api/watchdog-config', updates);
   if(!j.success){banner('red', j.message || 'erreur');return;}
   loadWatchdog();
+  loadWatchdogTab();
+}
+function _watchdogEventColor(action){
+  const a = String(action || '');
+  if(a.indexOf('error') >= 0 || a.indexOf('failed') >= 0) return 'text-red-700';
+  if(a.indexOf('detected') >= 0 || a.indexOf('attempted') >= 0 || a.indexOf('restart') >= 0) return 'text-amber-700';
+  if(a.indexOf('success') >= 0 || a.indexOf('user_chose_restart') >= 0) return 'text-green-700';
+  if(a.indexOf('skipped') >= 0 || a.indexOf('dismissed') >= 0) return 'text-stone-500';
+  return 'text-stone-700';
+}
+async function loadWatchdogTab(){
+  const cfgEl = document.getElementById('watchdog-tab-config');
+  const evEl = document.getElementById('watchdog-tab-events');
+  if(!cfgEl || !evEl) return;
+  try{
+    const r = await fetch('/api/watchdog');
+    if(!r.ok){evEl.innerHTML = `<div class="text-red-700">HTTP ${r.status}</div>`;return;}
+    const d = await r.json();
+    const cfg = d.config || {};
+    cfgEl.innerHTML = `
+<label class="flex items-center justify-between gap-3 p-3 rounded-lg border border-stone-200 cursor-pointer hover:bg-stone-50">
+  <div>
+    <div class="font-medium text-sm">${tr('watchdog_dc_auto_label')}</div>
+    <div class="text-xs text-stone-500 mt-0.5">${tr('watchdog_dc_auto_help')}</div>
+  </div>
+  <input type="checkbox" ${cfg.dc_auto_remediation?'checked':''} onchange="updateWatchdog({dc_auto_remediation:this.checked})" class="w-5 h-5 rounded accent-green-700 shrink-0"/>
+</label>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs ${cfg.dc_auto_remediation?'':'opacity-60'}">
+  <label class="block"><span class="block text-stone-500 mb-1">${tr('watchdog_dc_threshold_label')}</span>
+    <input type="number" min="60" value="${cfg.dc_inactivity_threshold_seconds||120}" ${cfg.dc_auto_remediation?'':'disabled'} onchange="updateWatchdog({dc_inactivity_threshold_seconds:parseInt(this.value)||120})" class="w-full px-2 py-1 border border-stone-200 rounded"/>
+  </label>
+  <label class="block"><span class="block text-stone-500 mb-1">${tr('watchdog_dc_verify_label')}</span>
+    <input type="number" min="10" value="${cfg.dc_verify_after_toggle_seconds||30}" ${cfg.dc_auto_remediation?'':'disabled'} onchange="updateWatchdog({dc_verify_after_toggle_seconds:parseInt(this.value)||30})" class="w-full px-2 py-1 border border-stone-200 rounded"/>
+  </label>
+  <label class="block"><span class="block text-stone-500 mb-1">${tr('watchdog_dc_cooldown_label')}</span>
+    <input type="number" min="120" value="${cfg.dc_cooldown_after_dismiss_seconds||300}" ${cfg.dc_auto_remediation?'':'disabled'} onchange="updateWatchdog({dc_cooldown_after_dismiss_seconds:parseInt(this.value)||300})" class="w-full px-2 py-1 border border-stone-200 rounded"/>
+  </label>
+</div>`;
+    const events = (d.events || []).slice(0, 50);
+    if(events.length === 0){
+      evEl.innerHTML = `<div class="text-stone-400 italic font-sans">${tr('watchdog_no_events')}</div>`;
+    } else {
+      evEl.innerHTML = events.map(ev=>{
+        const color = _watchdogEventColor(ev.action);
+        return `<div class="flex gap-2 py-0.5 border-b border-stone-100"><span class="text-stone-400 shrink-0">${escAttr((ev.ts||'').slice(11,19))}</span><span class="${color} shrink-0 font-semibold">${escAttr(ev.action||'')}</span><span class="text-stone-600 truncate" title="${escAttr(ev.detail||'')}">${escAttr(ev.detail||'')}</span></div>`;
+      }).join('');
+    }
+  }catch(e){console.error(e); evEl.innerHTML = `<div class="text-red-700 font-sans">${escAttr(String(e))}</div>`;}
 }
 async function saveWatchdogPattern(){
   const p = document.getElementById('watchdog-pattern').value.trim();
@@ -4078,7 +4403,7 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
 function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
-applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(loadWatchdog,10000);setInterval(checkUpdate,3600000);
+applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();loadWatchdogTab();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(loadWatchdog,10000);setInterval(loadWatchdogTab,10000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
 
