@@ -2871,12 +2871,6 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </section>
 </div>
 <div data-main-tab="mcps" class="hidden">
-<section id="dc-quick-section" class="card p-6 mb-6 border-l-4 border-amber-500" style="display:none">
-<div class="flex items-center justify-between mb-3">
-<h2 class="text-lg font-semibold flex items-center gap-2"><span class="text-amber-600">⚡</span><span data-i18n="dc_quick_title">Action rapide</span></h2>
-</div>
-<div id="dc-quick-card"><p class="text-xs text-stone-400">Chargement...</p></div>
-</section>
 <section class="card p-6">
 <h2 class="text-lg font-semibold mb-1" data-i18n="mcp_section">Serveurs MCP</h2>
 <p class="text-xs text-stone-500 mb-4" data-i18n="mcp_help">Coché = chargé au démarrage de Claude Desktop</p>
@@ -2960,6 +2954,15 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <p class="text-xs text-stone-500 mb-4" data-i18n="watchdog_tab_help">Surveillance Claude Desktop, MCPs et Desktop Commander. Tous les declenchements sont logges dans le journal en bas.</p>
 <div class="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800"><strong>&#9888;</strong> <span data-i18n="watchdog_dc_explainer">Le mode auto-remediation DC tente d'abord un toggle settings (sans kill PID), puis te demande l'autorisation de redemarrer Claude Desktop si necessaire. Il ne kille jamais directement de process et ne s'active que si DC est silencieux ET Claude Desktop reste responsive (freeze isole).</span></div>
 <div id="watchdog-tab-config" class="space-y-3"></div>
+<div class="mt-6 pt-4 border-t border-stone-200">
+<div class="flex items-baseline justify-between mb-2 gap-3 flex-wrap">
+<div>
+<h3 class="text-sm font-semibold text-stone-700" data-i18n="watchdog_nuclear_title">Option nucleaire</h3>
+<p class="text-xs text-stone-500 mt-0.5" data-i18n="watchdog_nuclear_help">Redemarre Claude Desktop entier. Ferme toutes les conversations en cours. Garantie de debloquer n'importe quelle extension figee.</p>
+</div>
+<button data-restart-cd-btn onclick="restartClaudeDesktop()" class="text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-md px-3 py-2 shrink-0"><span class="mr-1">&#128260;</span><span data-i18n="watchdog_nuclear_btn">Redemarrer Claude Desktop</span></button>
+</div>
+</div>
 </section>
 <section class="card p-6">
 <h3 class="text-base font-semibold mb-3" data-i18n="watchdog_events_title">Journal d'evenements</h3>
@@ -3272,6 +3275,10 @@ fr: {
   watchdog_tab_title: "Watchdog",
   watchdog_tab_help: "Surveillance Claude Desktop, MCPs et Desktop Commander. Tous les declenchements sont logges dans le journal en bas.",
   watchdog_dc_explainer: "Le mode auto-remediation DC tente d'abord un toggle settings (sans kill PID), puis te demande l'autorisation de redemarrer Claude Desktop si necessaire. Il ne kille jamais directement de process et ne s'active que si DC est silencieux ET Claude Desktop reste responsive (freeze isole).",
+  watchdog_nuclear_title: "Option nucleaire",
+  watchdog_nuclear_help: "Redemarre Claude Desktop entier. Ferme toutes les conversations en cours. Garantie de debloquer n'importe quelle extension figee.",
+  watchdog_nuclear_btn: "Redemarrer Claude Desktop",
+  confirm_restart_claude_desktop: "Redemarrer Claude Desktop ?\n\nToutes tes conversations en cours seront fermees. Tous les MCPs et extensions seront reinitialises. Claude Desktop reapparaitra dans 5-10 secondes.\n\nCONFIRMER ?",
   watchdog_dc_auto_label: "Auto-remediation Desktop Commander",
   watchdog_dc_auto_help: "Detecte un freeze isole de DC, tente un toggle settings, puis propose un restart Claude Desktop avec consentement.",
   watchdog_dc_threshold_label: "Seuil d'inactivite log (s)",
@@ -3482,6 +3489,10 @@ en: {
   watchdog_tab_title: "Watchdog",
   watchdog_tab_help: "Monitors Claude Desktop, MCPs and Desktop Commander. Every trigger is logged in the journal below.",
   watchdog_dc_explainer: "DC auto-remediation first tries a settings toggle (no PID kill), then asks for your consent to restart Claude Desktop if needed. It never kills processes directly and only activates when DC is silent AND Claude Desktop remains responsive (isolated freeze).",
+  watchdog_nuclear_title: "Nuclear option",
+  watchdog_nuclear_help: "Restarts the whole Claude Desktop. Closes all in-progress conversations. Guaranteed to unfreeze any frozen extension.",
+  watchdog_nuclear_btn: "Restart Claude Desktop",
+  confirm_restart_claude_desktop: "Restart Claude Desktop?\n\nAll in-progress conversations will be closed. All MCPs and extensions will be reset. Claude Desktop will reappear in 5-10 seconds.\n\nCONFIRM?",
   watchdog_dc_auto_label: "Desktop Commander auto-remediation",
   watchdog_dc_auto_help: "Detects an isolated DC freeze, tries a settings toggle, then prompts for Claude Desktop restart with consent.",
   watchdog_dc_threshold_label: "Log inactivity threshold (s)",
@@ -3627,155 +3638,27 @@ async function loadState(){
   if(elStopCnt) elStopCnt.textContent = String(stopped.length);
   document.getElementById('skills').innerHTML = renderSkills(s.skills);
   filterSkills();
-  loadDcStatus();
 }
 
-async function loadDcStatus(){
-  try {
-    const r = await fetch('/api/dc-status');
-    const d = await r.json();
-    const section = document.getElementById('dc-quick-section');
-    const card = document.getElementById('dc-quick-card');
-    if (!section || !card) return;
-    if (!d || d.installed === false || !d.name){
-      section.style.display = 'none';
-      return;
-    }
-    section.style.display = '';
-    const running = d.running;
-    const dot = running
-      ? '<span class="inline-block w-2.5 h-2.5 rounded-full bg-green-500"></span>'
-      : '<span class="inline-block w-2.5 h-2.5 rounded-full bg-red-500"></span>';
-    const statusText = running
-      ? '<span class="text-green-700 font-medium">Running</span>'
-      : '<span class="text-red-700 font-medium">Down</span>';
-    let logActivity = '';
-    if (d.log_age_seconds !== null && d.log_age_seconds !== undefined){
-      const a = d.log_age_seconds;
-      const lbl = a < 60 ? a + 's' : (a < 3600 ? Math.floor(a/60) + ' min' : Math.floor(a/3600) + ' h');
-      const cls = a > 60 ? 'text-amber-700' : 'text-stone-600';
-      logActivity = `<span class="${cls}">log ecrit il y a ${lbl}</span>`;
-    }
-    const pidsLabel = d.pids && d.pids.length
-      ? `${d.pids.length} process (PID ${d.pids.join(', ')})`
-      : '<span class="text-red-700">aucun process</span>';
-    let restartLine;
-    if (d.last_restart_age_seconds !== null && d.last_restart_age_seconds !== undefined){
-      const a = d.last_restart_age_seconds;
-      const lbl = a < 60 ? a + 's' : (a < 3600 ? Math.floor(a/60) + ' min' : Math.floor(a/3600) + ' h');
-      restartLine = `<div class="text-xs text-stone-500 mt-1">Dernier restart : il y a ${lbl}</div>`;
-    } else {
-      restartLine = `<div class="text-xs text-stone-400 mt-1">Dernier restart : jamais (cette session)</div>`;
-    }
-    card.innerHTML = `
-      <div class="flex items-start justify-between gap-4 flex-wrap">
-        <div class="flex-1 min-w-0">
-          <div class="flex items-center gap-2 mb-1.5">
-            <span class="font-semibold text-base">${escAttr(d.name)}</span>
-            ${d.version ? `<span class="text-xs text-stone-400 font-mono">v${escAttr(d.version)}</span>` : ''}
-          </div>
-          <div class="text-sm text-stone-600 flex items-center gap-2 flex-wrap">
-            ${dot}${statusText}
-            ${logActivity ? '<span class="text-stone-300">·</span>' + logActivity : ''}
-            ${d.running_by_log && !d.running_by_pid ? '<span class="text-[10px] text-stone-400" title="Statut inferre via mtime du log">via log</span>' : ''}
-          </div>
-          ${restartLine}
-        </div>
-        <div class="flex flex-col gap-2 shrink-0">
-          <button id="dc-restart-btn" onclick="restartDc()"
-            class="bg-amber-600 hover:bg-amber-700 active:bg-amber-800 text-white font-medium px-5 py-2.5 rounded-lg flex items-center gap-2 shadow-sm justify-center">
-            <span class="text-lg">&#x21bb;</span><span>Toggle settings DC</span>
-          </button>
-          <button id="dc-restart-claude-btn" onclick="restartClaudeDesktop()"
-            class="bg-stone-100 hover:bg-red-50 hover:text-red-700 border border-stone-300 hover:border-red-300 text-stone-700 font-medium px-5 py-2 rounded-lg flex items-center gap-2 text-sm justify-center">
-            <span>&#128260;</span><span>Redemarrer Claude Desktop</span>
-          </button>
-        </div>
-      </div>
-      <div class="mt-3 p-3 bg-amber-50/50 border border-amber-100 rounded text-xs text-stone-600 leading-relaxed">
-        <strong class="text-amber-900">Note :</strong> sur Claude Desktop moderne, DC tourne dans un Helper Node embarque. Le toggle settings est best-effort - il peut ou non forcer le respawn. Si DC reste freeze apres 30s, utilise <strong>Redemarrer Claude Desktop</strong> (option garantie mais ferme tes chats en cours).
-      </div>
-    `;
-  } catch(e) {
-    console.error('loadDcStatus failed', e);
-  }
-}
-
+// v1.7.3 - Restart Claude Desktop nucleaire, deplace de l'ancienne carte
+// 'Action rapide' (supprimee) vers la tab Watchdog ou il a sa place logique
+// a cote de l'auto-remediation DC. Confirme avant action puis appelle
+// /api/restart-claude-desktop. Fonction generique : pas de reference a un
+// bouton precis, le caller fournit son propre 'data-restart-cd-btn'.
 async function restartClaudeDesktop(){
-  const btn = document.getElementById('dc-restart-claude-btn');
-  if (!btn) return;
-  if (!confirm('Redemarrer Claude Desktop ?\n\nToutes tes conversations en cours seront fermees. Tous les MCPs et extensions seront reinitialises. Claude Desktop reapparaitra dans 5-10 secondes.\n\nCONFIRMER ?')) return;
-  const orig = btn.innerHTML;
-  btn.disabled = true;
-  btn.classList.add('opacity-70');
-  btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span><span>Redemarrage...</span>';
+  const btn = document.querySelector('[data-restart-cd-btn]');
+  if(!confirm(tr('confirm_restart_claude_desktop'))) return;
+  if(btn){ btn.disabled = true; btn.classList.add('opacity-70'); }
   try {
     const r = await fetch('/api/restart-claude-desktop', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({})
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
     });
     const j = await r.json();
-    if (j.success){
-      btn.innerHTML = '<span>&#10003;</span><span>Claude Desktop relance</span>';
-      banner('green', j.message);
-    } else {
-      btn.disabled = false;
-      btn.classList.remove('opacity-70');
-      btn.innerHTML = orig;
-      banner('red', 'Echec : ' + (j.message || 'inconnu'));
-    }
+    banner(j.success ? 'green' : 'red', j.message || (j.success ? 'OK' : 'Echec'));
   } catch(e) {
-    btn.disabled = false;
-    btn.classList.remove('opacity-70');
-    btn.innerHTML = orig;
     banner('red', 'Erreur reseau : ' + e.message);
-  }
-}
-
-async function restartDc(){
-  const btn = document.getElementById('dc-restart-btn');
-  if (!btn) return;
-  const orig = btn.innerHTML;
-  btn.disabled = true;
-  btn.classList.add('opacity-70');
-  btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span><span>Redemarrage...</span>';
-  try {
-    const r = await fetch('/api/restart-mcp', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: 'Desktop Commander'})
-    });
-    const j = await r.json();
-    if (j.success){
-      btn.innerHTML = '<span>&#10003;</span><span>Redemarre</span>';
-      btn.classList.remove('bg-amber-600', 'hover:bg-amber-700');
-      btn.classList.add('bg-green-600');
-      setTimeout(() => {
-        btn.disabled = false;
-        btn.classList.remove('opacity-70', 'bg-green-600');
-        btn.classList.add('bg-amber-600', 'hover:bg-amber-700');
-        btn.innerHTML = orig;
-        loadDcStatus();
-        loadState();
-      }, 2000);
-    } else {
-      btn.innerHTML = '<span>&#10007;</span><span>Echec</span>';
-      btn.classList.remove('bg-amber-600');
-      btn.classList.add('bg-red-600');
-      setTimeout(() => {
-        btn.disabled = false;
-        btn.classList.remove('opacity-70', 'bg-red-600');
-        btn.classList.add('bg-amber-600', 'hover:bg-amber-700');
-        btn.innerHTML = orig;
-      }, 3000);
-      banner('red', 'Erreur restart DC : ' + (j.message || 'inconnue'));
-    }
-  } catch(e) {
-    btn.disabled = false;
-    btn.classList.remove('opacity-70');
-    btn.innerHTML = orig;
-    banner('red', 'Erreur reseau : ' + e.message);
+  } finally {
+    if(btn){ btn.disabled = false; btn.classList.remove('opacity-70'); }
   }
 }
 
