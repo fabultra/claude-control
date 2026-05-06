@@ -412,6 +412,174 @@ def restart_mcp(name):
     return True, f"MCP '{name}' inactif : {killed} process killed, rien d'autre à faire"
 
 
+def start_mcp(name):
+    """v1.7.6 - Demarrage a chaud sans toucher a Claude Desktop : si le MCP
+    est actif dans le config mais pas en cours d'execution, on toggle son
+    entree off->on (avec backup) pour que Claude Desktop le respawn via
+    FSEvents. Pas de kill (rien a tuer). Pour les extensions : toggle
+    settings off->on de la meme maniere.
+    """
+    if not name:
+        return False, "Nom MCP requis"
+    config = load_config()
+    is_active = name in config.get("mcpServers", {})
+    is_disabled = name in config.get("_disabledMcps", {})
+    if is_active:
+        active = config.setdefault("mcpServers", {})
+        disabled = config.setdefault("_disabledMcps", {})
+        disabled[name] = active.pop(name)
+        save_config(config)
+        time.sleep(1.5)
+        config = load_config()
+        active = config.setdefault("mcpServers", {})
+        disabled = config.setdefault("_disabledMcps", {})
+        if name in disabled:
+            active[name] = disabled.pop(name)
+            save_config(config)
+        return True, f"MCP '{name}' demarre a chaud (config togglee off->on, Claude Desktop respawn via FSEvents)"
+    if is_disabled:
+        return False, f"MCP '{name}' est dans _disabledMcps - coche-le d'abord pour l'activer"
+    extensions = _list_extensions()
+    target = next((e for e in extensions if e["name"] == name or e["id"] == name), None)
+    if target:
+        if not target["enabled"]:
+            return False, f"Extension '{name}' est desactivee - active-la d'abord"
+        settings = _load_extension_settings(target["id"])
+        was_enabled = bool(settings.get("enabled", True))
+        settings["enabled"] = False
+        try:
+            _save_extension_settings(target["id"], settings)
+            time.sleep(1.5)
+            settings["enabled"] = was_enabled
+            _save_extension_settings(target["id"], settings)
+        except Exception as e:
+            return False, f"Erreur toggle settings : {e}"
+        return True, f"Extension '{name}' demarree a chaud (settings togglee off->on)"
+    return False, f"MCP / Extension '{name}' introuvable"
+
+
+def stop_mcp(name):
+    """v1.7.6 - Arret a chaud sans toucher au config : kill les PIDs du
+    process MCP / Extension. Le config reste intact (le checkbox 'actif au
+    prochain restart' reste coche). Claude Desktop ne respawn pas tant que
+    le config ne change pas, donc le MCP reste stoppe jusqu'au prochain
+    redemarrage CD ou jusqu'au prochain Restart manuel.
+
+    Pour les extensions : v1.6.6 a documente que les Helper Nodes sont
+    anonymes - kill PID peut ne rien faire (no PIDs trouves). Dans ce cas
+    on retourne un message honnete plutot qu'un faux succes.
+    """
+    if not name:
+        return False, "Nom MCP requis"
+    config = load_config()
+    is_classic = name in config.get("mcpServers", {}) or name in config.get("_disabledMcps", {})
+    if is_classic:
+        pids = _mcp_pids(name) if "_mcp_pids" in globals() else []
+        my_pid = os.getpid()
+        killed = 0
+        for pid in pids:
+            if pid == my_pid:
+                continue
+            try:
+                os.kill(pid, 9)
+                killed += 1
+            except Exception:
+                pass
+        if killed == 0:
+            return True, f"MCP '{name}' : aucun process en cours d'execution (deja stoppe ?)"
+        return True, f"MCP '{name}' stoppe ({killed} process tue) - config intact, sera relance au prochain Redemarrer ou prochain demarrage Claude Desktop"
+    extensions = _list_extensions()
+    target = next((e for e in extensions if e["name"] == name or e["id"] == name), None)
+    if target:
+        pids = _extension_pids(name)
+        my_pid = os.getpid()
+        killed = 0
+        for pid in pids:
+            if pid == my_pid:
+                continue
+            try:
+                os.kill(pid, 9)
+                killed += 1
+            except Exception:
+                pass
+        if killed == 0:
+            return True, (f"Extension '{name}' : aucun PID identifiable (Helper Node anonyme - "
+                          f"limitation Claude Desktop moderne, cf. v1.6.6). "
+                          f"Pour stopper vraiment l'extension, decoche-la (config off) ou redemarre Claude Desktop.")
+        return True, f"Extension '{name}' stoppee ({killed} process tue) - settings intacts"
+    return False, f"MCP / Extension '{name}' introuvable"
+
+
+def delete_extension(name):
+    """v1.7.6 - Supprimer une Desktop Extension : retire l'entree de
+    extensions-installations.json + supprime le dossier d'install + le
+    fichier de settings. Backup zip de l'install dir avant suppression.
+
+    Note : si l'extension est managee par Claude Desktop / Anthropic
+    (PowerPoint, Word, Control Mac, etc.), Claude Desktop peut la
+    re-installer automatiquement au prochain restart. C'est documente
+    dans le message de retour pour que l'utilisateur soit avertit.
+    """
+    if not name:
+        return False, "Nom requis"
+    extensions = _list_extensions()
+    target = next((e for e in extensions if e["name"] == name or e["id"] == name), None)
+    if not target:
+        return False, f"Extension '{name}' introuvable"
+    ext_id = target["id"]
+    install_dir = HOME / "Library/Application Support/Claude/Claude Extensions" / ext_id
+    settings_file = EXTENSIONS_SETTINGS_DIR / f"{ext_id}.json"
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_id = re.sub(r'[^a-zA-Z0-9_\-.]', '_', ext_id)
+    if install_dir.exists() and install_dir.is_dir():
+        try:
+            _zip_dir(install_dir, BACKUP_DIR / f"deleted-extension-{safe_id}-{ts}.zip")
+        except Exception as e:
+            return False, f"Backup install dir echoue : {e}"
+        try:
+            shutil.rmtree(install_dir)
+        except Exception as e:
+            return False, f"Suppression install dir echouee : {e}"
+    if settings_file.exists():
+        try:
+            shutil.copy2(settings_file, BACKUP_DIR / f"deleted-extension-settings-{safe_id}-{ts}.json")
+            settings_file.unlink()
+        except Exception:
+            pass
+    # Retire l'entree de extensions-installations.json
+    if EXTENSIONS_INSTALL_FILE.exists():
+        try:
+            data = json.loads(EXTENSIONS_INSTALL_FILE.read_text(errors="replace"))
+            shutil.copy2(EXTENSIONS_INSTALL_FILE, BACKUP_DIR / f"extensions-installations.{ts}.json")
+            changed = False
+            if isinstance(data, list):
+                new_list = [e for e in data if not (isinstance(e, dict) and e.get("id") == ext_id)]
+                if len(new_list) != len(data):
+                    data = new_list
+                    changed = True
+            elif isinstance(data, dict):
+                for key in ("installations", "extensions"):
+                    if isinstance(data.get(key), list):
+                        new_list = [e for e in data[key] if not (isinstance(e, dict) and e.get("id") == ext_id)]
+                        if len(new_list) != len(data[key]):
+                            data[key] = new_list
+                            changed = True
+                    elif isinstance(data.get(key), dict) and ext_id in data[key]:
+                        del data[key][ext_id]
+                        changed = True
+                if ext_id in data:
+                    del data[ext_id]
+                    changed = True
+            if changed:
+                EXTENSIONS_INSTALL_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        except Exception as e:
+            return False, f"Suppression registry echouee : {e}"
+    return True, (f"Extension '{name}' supprimee (backup zip de l'install dir + json registry). "
+                  f"Note : si Claude Desktop la re-installe automatiquement au prochain restart "
+                  f"(cas des extensions Anthropic-managed), desinstalle-la via Settings -> Extensions de Claude Desktop.")
+
+
 def delete_mcp(name):
     if not name:
         return False, "Nom requis"
@@ -3368,6 +3536,15 @@ fr: {
   ext_badge: "ext",
   btn_restart_mcp: "Redémarrer ce MCP (sans toucher à Claude)",
   btn_restart_mcp_short: "Redémarrer",
+  btn_stop_mcp_short: "Stopper",
+  btn_stop_mcp_title: "Arrêter le process maintenant sans toucher à la config (le checkbox 'actif au prochain démarrage' reste tel quel)",
+  btn_start_mcp_short: "Démarrer",
+  btn_start_mcp_title: "Démarrer le process maintenant à chaud (toggle config off→on, Claude Desktop respawn via FSEvents, sans redémarrage CD)",
+  banner_starting: "Démarrage en cours...",
+  btn_delete_mcp_title: "Supprimer ce MCP / cette extension (popup de confirmation)",
+  mcp_checkbox_title: "Coché = chargé au prochain démarrage de Claude Desktop. Décoché ne stoppe pas immédiatement le process en cours, utilise Stopper pour ça.",
+  confirm_stop_mcp: "Stopper le MCP « {name} » à chaud ?\\n\\n• Le process en cours est tué immédiatement\\n• La config reste intacte (le checkbox ne change pas)\\n• Au prochain redémarrage de Claude Desktop, il sera relancé automatiquement\\n• Pour désactiver durablement, décoche la case en plus\\n\\nCONFIRMER ?",
+  confirm_delete_extension: "Supprimer l'extension « {name} » ?\\n\\n• Le dossier d'install est zippé en backup puis supprimé\\n• Le fichier de settings est sauvegardé puis supprimé\\n• L'entrée disparaît de extensions-installations.json\\n\\nNote : si Claude Desktop la ré-installe automatiquement (cas des extensions Anthropic-managed comme PowerPoint, Word, Control Mac), désinstalle-la via Settings → Extensions de Claude Desktop.\\n\\nCONFIRMER ?",
   mcp_col_running: "En cours d'execution",
   mcp_col_stopped: "Inactifs",
   mcp_col_running_empty: "Aucun MCP en cours d'execution",
@@ -3585,6 +3762,15 @@ en: {
   ext_badge: "ext",
   btn_restart_mcp: "Restart this MCP (without touching Claude)",
   btn_restart_mcp_short: "Restart",
+  btn_stop_mcp_short: "Stop",
+  btn_stop_mcp_title: "Stop the process now without touching the config (the 'active at next start' checkbox stays the same)",
+  btn_start_mcp_short: "Start",
+  btn_start_mcp_title: "Start the process now hot (config toggle off→on, Claude Desktop respawns via FSEvents, no CD restart)",
+  banner_starting: "Starting...",
+  btn_delete_mcp_title: "Delete this MCP / extension (confirmation popup)",
+  mcp_checkbox_title: "Checked = loaded at next Claude Desktop start. Unchecking does NOT immediately stop the running process; use Stop for that.",
+  confirm_stop_mcp: 'Stop MCP "{name}" hot?\\n\\n• The running process is killed immediately\\n• The config stays intact (checkbox unchanged)\\n• At next Claude Desktop start, it will be respawned automatically\\n• To disable persistently, uncheck the box too\\n\\nCONFIRM?',
+  confirm_delete_extension: 'Delete extension "{name}"?\\n\\n• The install dir is zip-backed up then deleted\\n• The settings file is backed up then deleted\\n• The entry is removed from extensions-installations.json\\n\\nNote: if Claude Desktop re-installs it automatically (case of Anthropic-managed extensions like PowerPoint, Word, Control Mac), uninstall it via Settings → Extensions in Claude Desktop.\\n\\nCONFIRM?',
   mcp_col_running: "Running",
   mcp_col_stopped: "Stopped",
   mcp_col_running_empty: "No MCP currently running",
@@ -3680,17 +3866,33 @@ async function loadState(){
   // Chaque ligne expose un bouton "Redemarrer" texte+icone (visible sans hover)
   // qui appelle restart_mcp/restart_extension cote backend (kill PID + toggle
   // settings -> Claude Desktop respawn via FSEvents, sans le redemarrer).
+  // v1.7.6 - 3 actions explicites par MCP : Stop (kill PID a chaud sans
+  // toucher au config), Redemarrer (kill + toggle config), Supprimer
+  // (avec confirm popup detaille). La checkbox a une nouvelle semantique
+  // verbalisee dans son title : 'Coche = charge au prochain demarrage de
+  // Claude Desktop' (persistance config), distinct du Stop a chaud.
   function _renderMcpRow(m){
     const isExt = m.type === 'extension';
     const extBadge = isExt ? `<span class="text-[10px] font-mono text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded" title="Desktop Extension">${tr('ext_badge')}</span>` : '';
     const versionBadge = isExt && m.version ? `<span class="text-[10px] text-stone-400 font-mono">v${escAttr(m.version)}</span>` : '';
     const toggleFn = isExt ? `toggleExtension('${m.name}', this.checked)` : `toggleMcp('${m.name}')`;
-    const deleteBtn = isExt ? '' : `<button type="button" onclick="event.preventDefault();event.stopPropagation();deleteMcp('${m.name}')" class="text-xs text-stone-400 hover:text-red-700 hover:underline shrink-0">${tr('btn_delete')}</button>`;
     const whyBtn = (m.active && !m.running && !isExt)
       ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-xs text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded-full cursor-pointer" title="${tr('why_title')}">${tr('not_started_label')}</button>`
       : '';
+    // v1.7.6 - bouton run-control contextuel : Stop si en cours, Demarrer si
+    // actif dans le config mais pas en cours d'execution. Si inactif (checkbox
+    // off), pas de bouton (l'utilisateur doit cocher d'abord).
+    let runCtlBtn = '';
+    if (m.running){
+      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();stopMcp('${m.name}')" title="${tr('btn_stop_mcp_title')}" class="inline-flex items-center gap-1 text-xs font-medium text-stone-700 bg-stone-50 border border-stone-200 hover:bg-stone-100 rounded-md px-2 py-1 shrink-0">&#9209; <span>${tr('btn_stop_mcp_short')}</span></button>`;
+    } else if (m.active){
+      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();startMcp('${m.name}')" title="${tr('btn_start_mcp_title')}" class="inline-flex items-center gap-1 text-xs font-medium text-green-800 bg-green-50 border border-green-200 hover:bg-green-100 rounded-md px-2 py-1 shrink-0">&#9654; <span>${tr('btn_start_mcp_short')}</span></button>`;
+    }
     const restartBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp')}" class="inline-flex items-center gap-1 text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 hover:bg-amber-100 rounded-md px-2 py-1 shrink-0">&#x21bb; <span>${tr('btn_restart_mcp_short')}</span></button>`;
-    return `<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-2 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="${toggleFn}" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${extBadge}${versionBadge}${whyBtn}</div><div class="flex items-center gap-2 shrink-0">${restartBtn}${deleteBtn}</div></label>`;
+    const deleteFn = isExt ? `deleteExtension('${m.name}')` : `deleteMcp('${m.name}')`;
+    const deleteBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();${deleteFn}" title="${tr('btn_delete_mcp_title')}" class="inline-flex items-center gap-1 text-xs font-medium text-red-700 bg-red-50 border border-red-200 hover:bg-red-100 rounded-md px-2 py-1 shrink-0">&#128465; <span>${tr('btn_delete')}</span></button>`;
+    const checkboxTitle = tr('mcp_checkbox_title');
+    return `<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-2 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="${toggleFn}" title="${checkboxTitle}" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${extBadge}${versionBadge}${whyBtn}</div><div class="flex items-center gap-1.5 shrink-0">${runCtlBtn}${restartBtn}${deleteBtn}</div></label>`;
   }
   const running = s.mcps.filter(m=>m.running);
   const stopped = s.mcps.filter(m=>!m.running);
@@ -3889,11 +4091,29 @@ async function restartMcp(name){
   banner(j.success?'green':'red', j.message);
   if(j.success){loadState();}
 }
+async function stopMcp(name){
+  if(!confirm(tr('confirm_stop_mcp').split('{name}').join(name)))return;
+  const j = await api('/api/stop-mcp', {name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadState();}
+}
+async function startMcp(name){
+  banner('blue', tr('banner_starting'));
+  const j = await api('/api/start-mcp', {name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){setTimeout(loadState, 2000);}
+}
 async function deleteMcp(name){
   if(!confirm(tr('confirm_delete_mcp').split('{name}').join(name)))return;
   const j = await api('/api/delete-mcp', {name:name});
   banner(j.success?'green':'red', j.message);
   if(j.success){loadState();loadOverview();loadPresets();}
+}
+async function deleteExtension(name){
+  if(!confirm(tr('confirm_delete_extension').split('{name}').join(name)))return;
+  const j = await api('/api/delete-extension', {name:name});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){loadState();loadOverview();}
 }
 async function deletePlugin(fn){
   const msg = tr('confirm_delete_plugin').split('{name}').join(fn);
@@ -4572,7 +4792,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
             "/api/delete-user-skill-duplicates": lambda: delete_user_skill_duplicates(),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
+            "/api/delete-extension": lambda: delete_extension(data.get("name", "")),
             "/api/restart-mcp": lambda: restart_mcp(data.get("name", "")),
+            "/api/stop-mcp": lambda: stop_mcp(data.get("name", "")),
+            "/api/start-mcp": lambda: start_mcp(data.get("name", "")),
             "/api/restart-claude-desktop": lambda: restart_claude_desktop(),
             "/api/toggle-extension": lambda: toggle_extension(data.get("name", ""), data.get("enabled")),
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
