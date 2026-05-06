@@ -475,12 +475,12 @@ def start_mcp(name):
         if not target["enabled"]:
             return False, f"Extension '{name}' est desactivee - active-la d'abord"
         settings = _load_extension_settings(target["id"])
-        was_enabled = bool(settings.get("enabled", True))
-        settings["enabled"] = False
+        was_enabled = _read_extension_enabled(settings)
+        _set_extension_enabled(settings, False)
         try:
             _save_extension_settings(target["id"], settings)
             time.sleep(1.5)
-            settings["enabled"] = was_enabled
+            _set_extension_enabled(settings, was_enabled)
             _save_extension_settings(target["id"], settings)
         except Exception as e:
             return False, f"Erreur toggle settings : {e}"
@@ -957,15 +957,25 @@ def _find_mcp_log(name, return_method=False):
     name_lc = re.sub(r'[^a-z0-9]', '', str(name).lower())
     if not name_lc:
         return _r(None, "none")
+    # v1.8.2 - bug observe 2026-05-06 : si plusieurs fichiers log normalisent
+    # vers le meme nom (ex. 'desktop-commander' npx legacy + 'Desktop Commander'
+    # MCPB extension recent, tous deux -> 'desktopcommander'), l'ancienne logique
+    # retournait le PREMIER match dans glob (ordre filesystem). Si c'etait le
+    # log obsolete, le mtime check echouait -> running_by_log = False ->
+    # extension affichee a tort en 'Inactifs'. Fix : collecter tous les exact
+    # matches et retourner le plus recent par mtime.
+    exacts = []
     fuzzy = []
     for f in CLAUDE_LOGS_DIR.glob("mcp-server-*.log"):
         stem = f.stem
         log_name = stem[len("mcp-server-"):] if stem.startswith("mcp-server-") else stem
         log_name_lc = re.sub(r'[^a-z0-9]', '', log_name.lower())
         if log_name_lc == name_lc:
-            return _r(f, "exact_match")
-        if log_name_lc and (name_lc in log_name_lc or log_name_lc in name_lc):
+            exacts.append(f)
+        elif log_name_lc and (name_lc in log_name_lc or log_name_lc in name_lc):
             fuzzy.append(f)
+    if exacts:
+        return _r(max(exacts, key=lambda f: f.stat().st_mtime), "exact_match")
     if fuzzy:
         return _r(max(fuzzy, key=lambda f: f.stat().st_mtime), "fuzzy_in")
     return _r(None, "none")
@@ -1107,6 +1117,49 @@ def _load_extension_settings(ext_id):
         return {}
 
 
+def _set_extension_enabled(settings, value):
+    """v1.8.2 - Helper qui ecrit isEnabled (canonique) ET enabled (legacy)
+    sur le dict in-memory pour qu'aucun consumer ne soit surpris quel que
+    soit la cle qu'il lit. _save_extension_settings le fait aussi sur
+    disque, mais on synchronise aussi en memoire pour que les fonctions
+    qui lisent settings entre les writes voient une valeur coherente.
+    """
+    if not isinstance(settings, dict):
+        return
+    settings["isEnabled"] = bool(value)
+    settings["enabled"] = bool(value)
+
+
+def _read_extension_enabled(settings, fallback_entry=None):
+    """v1.8.2 - Lit le statut enabled d'une extension en respectant le
+    schema heterogene Anthropic : 'isEnabled' est le NOUVEAU nom canonique
+    (extensions recentes), 'enabled' est l'ancien (legacy). Certains
+    fichiers ont les 2 (anciens migres), d'autres seulement isEnabled
+    (recents), d'autres rien (defaults).
+
+    Bug observe 2026-05-06 : Filesystem et Stripe avaient {'isEnabled':
+    false} mais Claude Control regardait 'enabled' (absent) -> tombait
+    sur le fallback (status != disabled) -> True -> UI affiche 'cochee'
+    -> Claude Desktop lit 'isEnabled: false' et ne lance pas l'extension.
+    Resultat : reboot CD ne demarre pas l'extension.
+
+    Priorite : isEnabled > enabled > fallback_entry (d'extensions-
+    installations.json) > status != 'disabled' > True.
+    """
+    if not isinstance(settings, dict):
+        settings = {}
+    if "isEnabled" in settings:
+        return bool(settings["isEnabled"])
+    if "enabled" in settings:
+        return bool(settings["enabled"])
+    if isinstance(fallback_entry, dict):
+        if "enabled" in fallback_entry:
+            return bool(fallback_entry["enabled"])
+        if fallback_entry.get("status") == "disabled":
+            return False
+    return True
+
+
 def _save_extension_settings(ext_id, settings):
     f = _extension_settings_file(ext_id)
     if f.exists():
@@ -1117,9 +1170,24 @@ def _save_extension_settings(ext_id, settings):
             shutil.copy2(f, BACKUP_DIR / f"ext-settings-{safe}.{ts}.json")
         except Exception:
             pass
+    # v1.8.2 - le schema Anthropic a migre 'enabled' -> 'isEnabled'.
+    # Pour eviter la desync, on synchronise les 2 cles : si l'appelant a
+    # passe l'une OU l'autre OU les deux, le fichier final aura la meme
+    # valeur dans isEnabled ET enabled. Claude Desktop lit isEnabled
+    # (canonique), donc c'est le seul qui compte pour le runtime ; on
+    # garde enabled en sync pour la retro-compat des outils tiers.
+    out = dict(settings) if isinstance(settings, dict) else {}
+    canonical = None
+    if "isEnabled" in out:
+        canonical = bool(out["isEnabled"])
+    elif "enabled" in out:
+        canonical = bool(out["enabled"])
+    if canonical is not None:
+        out["isEnabled"] = canonical
+        out["enabled"] = canonical
     f.parent.mkdir(parents=True, exist_ok=True)
-    with open(f, "w") as out:
-        json.dump(settings, out, indent=2)
+    with open(f, "w") as out_f:
+        json.dump(out, out_f, indent=2)
 
 
 def _list_extensions():
@@ -1168,7 +1236,8 @@ def _list_extensions():
         )
         version = str(e.get("version") or e.get("manifestVersion") or manifest.get("version") or "")
         settings = _load_extension_settings(ext_id)
-        enabled = bool(settings.get("enabled", e.get("enabled", e.get("status") != "disabled")))
+        # v1.8.2 - lit isEnabled en priorite (cf. _read_extension_enabled).
+        enabled = _read_extension_enabled(settings, fallback_entry=e)
         env_keys = list(settings.get("env", {}).keys()) if isinstance(settings.get("env"), dict) else []
         items.append({
             "id": ext_id,
@@ -1291,7 +1360,7 @@ def _detect_mcp_conflicts():
             "norm_name": _normalize_mcp_name(display),
             "norm_id_slug": _normalize_mcp_name(str(eid).split(".")[-1]),
             "packages": _extract_npm_packages(manifest) | _extract_npm_packages(e),
-            "enabled": bool(_load_extension_settings(eid).get("enabled", True)),
+            "enabled": _read_extension_enabled(_load_extension_settings(eid), fallback_entry=e),
         })
 
     conflicts = []
@@ -1370,8 +1439,10 @@ def toggle_extension(name, enabled=None):
         return False, f"Extension '{name}' introuvable"
     settings = _load_extension_settings(target["id"])
     if enabled is None:
-        enabled = not bool(settings.get("enabled", True))
-    settings["enabled"] = bool(enabled)
+        enabled = not _read_extension_enabled(settings)
+    # v1.8.2 - ecrit isEnabled (canonique). _save_extension_settings
+    # synchronise enabled = isEnabled pour la retro-compat.
+    _set_extension_enabled(settings, enabled)
     try:
         _save_extension_settings(target["id"], settings)
     except Exception as e:
@@ -1584,12 +1655,12 @@ def restart_extension(name):
         except Exception:
             pass
     settings = _load_extension_settings(target["id"])
-    was_enabled = bool(settings.get("enabled", True))
-    settings["enabled"] = False
+    was_enabled = _read_extension_enabled(settings)
+    _set_extension_enabled(settings, False)
     try:
         _save_extension_settings(target["id"], settings)
         time.sleep(1.5)
-        settings["enabled"] = was_enabled
+        _set_extension_enabled(settings, was_enabled)
         _save_extension_settings(target["id"], settings)
     except Exception as e:
         return False, f"Erreur toggle settings : {e}"
@@ -1720,6 +1791,28 @@ def _custom_target_pids(pattern):
 def get_watchdog_status():
     cfg = load_watchdog_config()
     target = cfg.get("target", "claude_desktop")
+    # v1.8.2 - bug observe 2026-05-06 : Fabien a retire 'desktop-commander'
+    # de claude_desktop_config.json, mais le bandeau watchdog continuait
+    # d'afficher 'desktop-commander - Claude arrete' 1h apres. Le watchdog
+    # ne re-validait pas que sa cible existait toujours dans la config MCP.
+    # Fix : si la cible n'est plus dans _list_known_mcps() ni dans les
+    # extensions installees ET ce n'est pas claude_desktop/custom, on
+    # auto-reset a 'claude_desktop' et on log un event pour la trace.
+    if target not in ("claude_desktop", "custom"):
+        known = set(_list_known_mcps())
+        try:
+            ext_names = {e["name"] for e in _list_extensions()}
+        except Exception:
+            ext_names = set()
+        if target not in known and target not in ext_names:
+            _watchdog_event(
+                "target_auto_reset",
+                f"Cible '{target}' disparue (plus dans claude_desktop_config.json "
+                f"ni dans les extensions). Auto-reset vers 'claude_desktop'."
+            )
+            save_watchdog_config({"target": "claude_desktop"})
+            cfg = load_watchdog_config()
+            target = "claude_desktop"
     if target == "claude_desktop":
         pids = _claude_pids()
         target_label = "Claude Desktop"
@@ -2012,12 +2105,12 @@ def _dc_toggle_settings_remediation(dc_info):
     target_id = dc_info["id"]
     target_name = dc_info["name"]
     settings = _load_extension_settings(target_id)
-    was_enabled = bool(settings.get("enabled", True))
-    settings["enabled"] = False
+    was_enabled = _read_extension_enabled(settings)
+    _set_extension_enabled(settings, False)
     try:
         _save_extension_settings(target_id, settings)
         time.sleep(1.5)
-        settings["enabled"] = was_enabled
+        _set_extension_enabled(settings, was_enabled)
         _save_extension_settings(target_id, settings)
     except Exception as e:
         return False, f"Erreur toggle settings : {e}"
