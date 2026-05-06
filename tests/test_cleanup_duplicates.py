@@ -84,5 +84,57 @@ class CleanupDuplicateUserSkillsTests(unittest.TestCase):
         self.assertTrue(d.exists())
 
 
+class DeleteSkillNameValidationTests(unittest.TestCase):
+    """v1.7.8 - regression : delete_skill rejetait les noms commencant par
+    '_' (ex. '_archived-fireflies-setup') alors que c'est une convention
+    utilisateur legitime. On garde les vraies protections path-traversal."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        root = Path(self.tmpdir.name)
+        self.skills_dir = root / "skills"
+        self.disabled_dir = root / "skills-disabled"
+        self.backup_dir = root / "backup"
+        self.skills_dir.mkdir(parents=True)
+        self.disabled_dir.mkdir(parents=True)
+        self.backup_dir.mkdir(parents=True)
+        self._orig = (app.SKILLS_DIR, app.SKILLS_DISABLED_DIR, app.BACKUP_DIR)
+        app.SKILLS_DIR = self.skills_dir
+        app.SKILLS_DISABLED_DIR = self.disabled_dir
+        app.BACKUP_DIR = self.backup_dir
+
+    def tearDown(self):
+        app.SKILLS_DIR, app.SKILLS_DISABLED_DIR, app.BACKUP_DIR = self._orig
+        self.tmpdir.cleanup()
+
+    def _write_skill(self, name):
+        d = self.skills_dir / name
+        d.mkdir()
+        (d / "SKILL.md").write_text("---\nname: x\n---")
+
+    def test_underscore_prefix_is_now_allowed(self):
+        """C'est le coeur du fix v1.7.8 : '_archived-X' est un nom legitime."""
+        self._write_skill("_archived-fireflies-setup")
+        ok, msg = app.delete_skill("_archived-fireflies-setup")
+        self.assertTrue(ok, msg)
+        self.assertFalse((self.skills_dir / "_archived-fireflies-setup").exists())
+
+    def test_dot_prefix_still_rejected(self):
+        ok, msg = app.delete_skill(".hidden")
+        self.assertFalse(ok)
+        self.assertIn("invalide", msg)
+
+    def test_path_traversal_still_rejected(self):
+        for evil in ("../etc", "foo/bar", "..\\windows", "../../passwd"):
+            ok, msg = app.delete_skill(evil)
+            self.assertFalse(ok, f"Should reject: {evil}")
+
+    def test_empty_name_rejected(self):
+        ok, _ = app.delete_skill("")
+        self.assertFalse(ok)
+        ok, _ = app.delete_skill(None)
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()
