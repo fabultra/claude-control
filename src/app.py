@@ -332,7 +332,10 @@ def _zip_dir(folder, zip_path):
 
 
 def delete_skill(name):
-    if not name or "/" in name or name.startswith(".") or name.startswith("_"):
+    # v1.7.8 - on autorise le prefixe underscore (ex. '_archived-...') qui est
+    # une convention utilisateur legitime. On garde les vraies protections
+    # path-traversal : '/', '\\', '..', et le prefixe '.' (fichiers caches).
+    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
         return False, "Nom de skill invalide"
     target = None
     for base in (SKILLS_DIR, SKILLS_DISABLED_DIR):
