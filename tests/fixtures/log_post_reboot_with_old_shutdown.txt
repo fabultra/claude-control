@@ -1,0 +1,29 @@
+# Fixture : log MCPB apres reboot Claude Desktop
+#
+# Le log persiste au redemarrage de Claude Desktop. Apres reboot, le
+# tail contient typiquement les markers de shutdown de l'ancienne
+# instance PUIS les markers d'init/activite de la nouvelle.
+#
+# Source : log Filesystem de Fabien le 2026-05-06 19:56-19:57 UTC
+# (anonymise, simplifie).
+#
+# Bug observe en v1.8.3 : _log_shows_graceful_shutdown retournait True
+# parce que 'Shutting down server' apparaissait dans le tail. Resultat :
+# Filesystem (et 6 autres MCPs MCPB) classees 'Inactifs' alors qu'elles
+# tournaient en standby legitime apres reboot.
+#
+# Verdict attendu en v1.8.4 :
+#   _log_shows_graceful_shutdown(path) = False
+#   (le dernier marker chronologique est 'Message from server' = activity,
+#    pas 'Shutting down server'. Le shutdown est ANTERIEUR au reboot.)
+
+2026-05-06T19:56:57.242Z [Filesystem] [info] Client transport closed { metadata: undefined }
+2026-05-06T19:56:56.967Z [Filesystem] [info] Shutting down server... { metadata: undefined }
+2026-05-06T19:57:07.075Z [Filesystem] [info] Initializing server...
+2026-05-06T19:57:07.085Z [Filesystem] [info] Using built-in Node.js for MCP server: Filesystem
+2026-05-06T19:57:07.102Z [Filesystem] [info] Server started and connected successfully
+2026-05-06T19:57:09.781Z [Filesystem] [info] Message from client: {"method":"initialize","params":{"protocolVersion":"2025-11-25"},"jsonrpc":"2.0","id":0} { metadata: undefined }
+2026-05-06T19:57:09.786Z [Filesystem] [info] Message from server: {"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"secure-filesystem-server","version":"0.2.0"}},"jsonrpc":"2.0","id":0} { metadata: undefined }
+2026-05-06T19:57:10.054Z [Filesystem] [info] Message from client: {"method":"notifications/initialized","jsonrpc":"2.0"} { metadata: undefined }
+2026-05-06T19:57:10.055Z [Filesystem] [info] Message from client: {"method":"tools/list","params":{},"jsonrpc":"2.0","id":1} { metadata: undefined }
+2026-05-06T19:57:10.059Z [Filesystem] [info] Message from server: {"result":{"tools":[]},"jsonrpc":"2.0","id":1} { metadata: undefined }

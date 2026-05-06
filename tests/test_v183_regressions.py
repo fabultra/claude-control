@@ -36,6 +36,34 @@ class BugDStandbyMcpRunningTests(unittest.TestCase):
         path = self.fixtures_dir / "log_graceful_shutdown.txt"
         self.assertTrue(app._log_shows_graceful_shutdown(path))
 
+    def test_post_reboot_log_with_old_shutdown_is_alive(self):
+        """v1.8.4 fix critique : un log persiste au reboot Claude Desktop.
+        Apres reboot, le tail contient l'ancien shutdown PUIS le nouvel
+        init / activity. _log_shows_graceful_shutdown doit retourner
+        False (le dernier marker chronologique est 'Message from server' =
+        activity, pas un shutdown).
+
+        Sans ce fix, 7/14 MCPs MCPB en standby legitime sont classees
+        'Inactifs' apres reboot CD."""
+        path = self.fixtures_dir / "log_post_reboot_with_old_shutdown.txt"
+        self.assertFalse(app._log_shows_graceful_shutdown(path))
+
+    def test_shutdown_only_at_end_is_detected(self):
+        """Anti-regression : un log qui se termine REELLEMENT par un
+        shutdown (sans nouvel init apres) est bien detecte. Inline pour
+        eviter une fixture supplementaire."""
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write("Initializing server...\n")
+            f.write("Server started and connected successfully\n")
+            f.write("Message from client: foo\n")
+            f.write("Shutting down server...\n")
+            f.write("Client transport closed\n")
+            path = f.name
+        try:
+            self.assertTrue(app._log_shows_graceful_shutdown(path))
+        finally:
+            os.unlink(path)
+
 
 class ReadLogTailEfficientTests(unittest.TestCase):
     """v1.8.3 - Anti-regression sur le seek-based _read_log_tail :
