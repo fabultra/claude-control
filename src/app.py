@@ -1791,9 +1791,19 @@ def skill_optimization_suggestions():
             "message_fr": "Descriptions très courtes (<30 caractères) — peu de chance que Claude les déclenche correctement, enrichis-les.",
             "message_en": "Very short descriptions (<30 chars) — Claude is unlikely to auto-trigger them; enrich them.",
         })
+    # v1.7.5 - bug fix : auparavant on calculait user_names & plugin_names a
+    # partir de state['skills'], mais get_state() dedoublonne deja en SKIPPANT
+    # les plugin skills dont le nom existe deja cote user (cf. _list_plugin_skills
+    # iteration). Resultat : l'intersection etait toujours vide et le suggestion
+    # 'duplicate' ne tirait jamais. On lit directement les sources reelles.
     user_names = {s["name"] for s in skills if s["source"] == "user"}
-    plugin_names = {s["name"] for s in skills if s["source"] != "user"}
-    duplicates = sorted(user_names & plugin_names)
+    plugin_names_all = set()
+    try:
+        for it in _list_plugin_skills():
+            plugin_names_all.add(it["name"])
+    except Exception:
+        plugin_names_all = {s["name"] for s in skills if s["source"] != "user"}
+    duplicates = sorted(user_names & plugin_names_all)
     if 0 < len(duplicates) <= 5:
         suggestions.append({
             "kind": "duplicate",
@@ -1847,13 +1857,12 @@ def get_overview():
     # 'no_description' (meme set de skills, deux warnings cote a cote dans la
     # Vue d'ensemble). Le suggestion 'no_description' est plus actionable et
     # localise mieux le probleme - on garde uniquement celui-la.
+    # v1.7.5 - les doublons skill/plugin sont maintenant remontes UNIQUEMENT
+    # via skill_optimization_suggestions (kind:duplicate / duplicate_many) qui
+    # porte le bouton d'action 'Supprimer les versions utilisateur en doublon'.
+    # On ne renvoie plus duplicate_names dans health pour eviter le warning
+    # double sans action.
     skill_issues = []
-    skill_names = {sk["name"] for sk in state["skills"]}
-    plugin_skill_names = set()
-    for p in plugins:
-        for s in (p.get("contents", {}).get("skills") or []):
-            plugin_skill_names.add(s)
-    duplicates = sorted(skill_names & plugin_skill_names)
     mcps_active = [m for m in state["mcps"] if m["active"]]
     mcps_running = [m for m in mcps_active if m["running"]]
     mcps_failing = [m["name"] for m in mcps_active if not m["running"]]
@@ -1889,7 +1898,6 @@ def get_overview():
             "plugin_orphans": plugin_orphans,
             "mcps_failing": mcps_failing,
             "skill_issues": skill_issues,
-            "duplicate_names": duplicates,
         },
     }
 
@@ -4159,12 +4167,10 @@ async function loadOverview(){
       if(h.plugin_orphans && h.plugin_orphans.length){
         issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded text-white" style="background:linear-gradient(135deg,#D97757,#C15F3C)"><span>&#9888;</span><span><strong>${h.plugin_orphans.length}</strong> ${tr('issue_orphans')} : ${h.plugin_orphans.map(o=>`${escAttr(o.plugin)} v${escAttr(o.version)}`).join(', ')}</span></div>`);
       }
-      if(h.duplicate_names && h.duplicate_names.length){
-        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-stone-100 border border-stone-200 text-stone-700"><span>&#8505;</span><span><strong>${h.duplicate_names.length}</strong> ${tr('issue_duplicates')} : ${h.duplicate_names.map(n=>`<span class="font-mono">${escAttr(n)}</span>`).join(', ')}</span></div>`);
-      }
-      if(h.skill_issues && h.skill_issues.length){
-        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-stone-50 border border-stone-200 text-stone-600"><span>&#8505;</span><span><strong>${h.skill_issues.length}</strong> ${tr('issue_skill_no_frontmatter')} : ${h.skill_issues.map(s=>`<span class="font-mono">${escAttr(s.name)}</span>`).join(', ')}</span></div>`);
-      }
+      // v1.7.5 - duplicate_names retire de health (etait du bruit sans action).
+      // Les doublons sont maintenant exclusivement remontes via les suggestions
+      // skill (kind:duplicate / duplicate_many) qui portent le bouton de
+      // cleanup. Idem skill_issues, redondant avec le suggestion no_description.
       healthEl.innerHTML = issues.length ? `<div class="space-y-2">${issues.join('')}</div>` : `<div class="text-xs text-green-700 bg-green-50 border border-green-200 rounded p-2 flex items-center gap-2"><span>&#9989;</span><span>${tr('health_all_good')}</span></div>`;
     }
   }catch(e){console.error(e);}
