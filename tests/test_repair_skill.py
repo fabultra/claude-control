@@ -1,16 +1,13 @@
-"""v1.9.0 - Tests pour la feature 'Reparer un skill' :
+"""v1.9.0 / v1.9.3 - Tests pour la feature 'Reparer un skill' :
 - _update_skill_frontmatter (parse + update + preserve)
 - repair_skill (backup + ecriture frontmatter + creation si absent)
-- suggest_skill_description (mock urlopen pour ne jamais appeler la
-  vraie API Anthropic dans les tests)
+- suggest_skill_description (v1.9.3 : mock _call_claude_cli au lieu
+  d'urlopen, le subprocess CLI remplace l'API HTTP)
 """
-import io
-import json
 import os
 import sys
 import tempfile
 import unittest
-import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -122,8 +119,8 @@ class RepairSkillTests(unittest.TestCase):
 
 
 class SuggestSkillDescriptionTests(unittest.TestCase):
-    """Mock urllib.request.urlopen pour ne jamais appeler la vraie API
-    Anthropic dans les tests."""
+    """v1.9.3 - Mock _call_claude_cli (pas urlopen). Le CLI est un
+    subprocess externe, on patch directement la fonction qui l'appelle."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -143,106 +140,92 @@ class SuggestSkillDescriptionTests(unittest.TestCase):
         app.SKILLS_DIR, app.SKILLS_DISABLED_DIR = self._orig
         self.tmpdir.cleanup()
 
-    def test_returns_error_when_no_api_key(self):
-        with patch.dict(os.environ, {}, clear=True):
-            with patch.object(app, "HOME", Path(self.tmpdir.name) / "fake_home"):
-                ok, msg = app.suggest_skill_description("demo")
-                self.assertFalse(ok)
-                self.assertIn("ANTHROPIC_API_KEY", msg)
+    def test_returns_error_when_cli_missing(self):
+        """Si Claude Code CLI n'est pas dans le PATH, on retourne une erreur
+        claire avec instruction d'installation."""
+        with patch.object(app, "_claude_cli_path", lambda: None):
+            ok, msg = app.suggest_skill_description("demo")
+        self.assertFalse(ok)
+        self.assertIn("Claude Code CLI", msg)
 
-    def test_calls_anthropic_api_with_skill_content(self):
-        fake_response = json.dumps({
-            "content": [{"type": "text", "text": "Use this skill when handling invoice processing."}]
-        }).encode("utf-8")
+    def test_calls_cli_with_skill_content(self):
+        """Le prompt envoye au CLI doit contenir le system prompt + le nom
+        du skill + le content du SKILL.md."""
         captured = {}
 
-        class FakeResp:
-            def __enter__(self_): return self_
-            def __exit__(self_, *a): pass
-            def read(self_): return fake_response
+        def fake_call(prompt, timeout=60):
+            captured["prompt"] = prompt
+            return "Use this skill when handling invoice processing."
 
-        def fake_urlopen(req, timeout=20):
-            captured["url"] = req.full_url
-            captured["headers"] = dict(req.headers)
-            captured["body"] = json.loads(req.data.decode("utf-8"))
-            return FakeResp()
-
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key"}):
-            with patch.object(urllib.request, "urlopen", fake_urlopen):
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with patch.object(app, "_call_claude_cli", fake_call):
                 ok, payload = app.suggest_skill_description("demo")
 
         self.assertTrue(ok, payload)
         self.assertEqual(payload["suggestion"],
                          "Use this skill when handling invoice processing.")
-        self.assertEqual(captured["url"], "https://api.anthropic.com/v1/messages")
-        # Header keys can be lowercased in some Python versions; case-insensitive lookup
-        headers_lower = {k.lower(): v for k, v in captured["headers"].items()}
-        self.assertEqual(headers_lower.get("x-api-key"), "sk-test-key")
-        self.assertIn("invoices", captured["body"]["messages"][0]["content"])
+        self.assertEqual(payload["source"], "claude_cli")
+        # Verifie que le system prompt + content sont dans le prompt envoye
+        self.assertIn("descriptions for Claude Code skills", captured["prompt"])
+        self.assertIn("invoices", captured["prompt"])
+        self.assertIn("Skill name (folder): demo", captured["prompt"])
 
     def test_returns_error_for_unknown_skill(self):
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key"}):
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
             ok, msg = app.suggest_skill_description("does-not-exist")
             self.assertFalse(ok)
             self.assertIn("introuvable", msg)
 
-    def _stub_api(self, response_text):
-        """v1.9.2 - helper pour stubber la reponse API et tester le
-        sanitizer."""
-        fake = json.dumps({"content": [{"type": "text", "text": response_text}]}).encode("utf-8")
-        class FakeResp:
-            def __enter__(s): return s
-            def __exit__(s, *a): pass
-            def read(s): return fake
-        def fake_urlopen(req, timeout=20):
-            return FakeResp()
-        return patch.object(urllib.request, "urlopen", fake_urlopen)
+    def _stub_cli(self, response_text):
+        """v1.9.3 - helper pour stubber le CLI et tester le sanitizer."""
+        return patch.object(app, "_call_claude_cli", lambda prompt, timeout=60: response_text)
 
     def test_sanitizes_markdown_header_prefix(self):
-        """Bug observe v1.9.0/1.9.1 : Haiku retourne parfois '## Use this
+        """Bug observe v1.9.0/1.9.1 : le LLM retourne parfois '## Use this
         skill when...' au lieu du texte brut. Le sanitizer doit nettoyer."""
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
-            with self._stub_api("## Use this skill when handling invoices"):
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with self._stub_cli("## Use this skill when handling invoices"):
                 ok, payload = app.suggest_skill_description("demo")
         self.assertTrue(ok, payload)
         self.assertEqual(payload["suggestion"], "Use this skill when handling invoices")
 
     def test_sanitizes_description_prefix(self):
-        """Sanitizer strip 'Description:', 'Here is the description:', etc."""
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
-            with self._stub_api("Description: Use this skill for X"):
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with self._stub_cli("Description: Use this skill for X"):
                 ok, payload = app.suggest_skill_description("demo")
         self.assertTrue(ok)
         self.assertEqual(payload["suggestion"], "Use this skill for X")
 
     def test_sanitizes_quotes_and_backticks(self):
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
-            with self._stub_api('"Use this skill for Y"'):
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with self._stub_cli('"Use this skill for Y"'):
                 ok, payload = app.suggest_skill_description("demo")
         self.assertTrue(ok)
         self.assertEqual(payload["suggestion"], "Use this skill for Y")
 
     def test_sanitizes_multiline_keeps_first_meaningful(self):
-        """Si la reponse contient plusieurs lignes (preamble + description),
-        on garde la 1ere ligne non-vide apres sanitization."""
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
-            with self._stub_api("Sure! Here's the description:\n\nUse this skill for Z\n\nHope this helps."):
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with self._stub_cli("Sure! Here's the description:\n\nUse this skill for Z\n\nHope this helps."):
                 ok, payload = app.suggest_skill_description("demo")
         self.assertTrue(ok)
-        # Apres strip prefix 'Sure!' (pas dans la liste mais multiline -> 1ere ligne)
-        # Le 1er token est 'Sure! Here's the description:' qui matche le prefix
-        # Ensuite split lines, 1ere non-vide = 'Use this skill for Z'
         self.assertIn("Use this skill for Z", payload["suggestion"])
 
-    def test_returns_error_when_api_returns_empty(self):
-        """Cas observe par utilisateur : API retourne quelque chose qui se
-        sanitize en vide (juste des caracteres markdown). Le backend doit
-        retourner une erreur claire avec le raw response."""
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
-            with self._stub_api("###"):
+    def test_returns_error_when_cli_returns_empty(self):
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with self._stub_cli("###"):
                 ok, msg = app.suggest_skill_description("demo")
         self.assertFalse(ok)
         self.assertIn("vide", msg)
+
+    def test_handles_cli_timeout(self):
+        import subprocess
+        def boom(prompt, timeout=60):
+            raise subprocess.TimeoutExpired("claude", timeout)
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with patch.object(app, "_call_claude_cli", boom):
+                ok, msg = app.suggest_skill_description("demo")
+        self.assertFalse(ok)
+        self.assertIn("Timeout", msg)
 
 
 if __name__ == "__main__":
