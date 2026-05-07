@@ -396,8 +396,9 @@ def suggest_skill_description(name, body_max_chars=4000):
         f"SKILL.md content:\n```\n{content}\n```\n\n"
         f"Generate the description string."
     )
+    _log(f"suggest_skill_description: name={name} chars_sent={len(content)}")
     try:
-        suggestion = _call_anthropic_messages(
+        raw_response = _call_anthropic_messages(
             api_key, _SUGGEST_SYSTEM_PROMPT, user_msg,
         )
     except urllib.error.HTTPError as e:
@@ -405,16 +406,60 @@ def suggest_skill_description(name, body_max_chars=4000):
             err_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             err_body = ""
+        _log(f"suggest_skill_description: HTTP {e.code} body={err_body[:500]}")
         return False, f"API Anthropic HTTP {e.code} : {err_body[:300]}"
     except Exception as e:
-        return False, f"Erreur appel API : {e}"
-    suggestion = suggestion.strip().strip('"').strip("'").strip()
+        _log(f"suggest_skill_description: exception {type(e).__name__} : {e}")
+        return False, f"Erreur appel API ({type(e).__name__}) : {e}"
+    _log(f"suggest_skill_description: raw response len={len(raw_response or '')} preview={(raw_response or '')[:200]!r}")
+    # v1.9.2 - sanitize plus agressif. Haiku peut retourner :
+    # - du markdown (## prefix, **bold**, > quote, * list)
+    # - des prefixes 'Description:', 'Here is the description:'
+    # - des quotes triple ou single
+    # - du preamble multi-ligne ('Sure! Here is...\n\nUse this skill for X')
+    # On nettoie chaque ligne puis on prend la plus longue / la plus
+    # substantive (heuristique : la 'vraie' description est generalement
+    # la ligne la plus longue dans la reponse).
+    def _strip_line(s):
+        s = s.strip()
+        while s and s[0] in '#>*-':
+            s = s.lstrip('#>*- ').strip()
+        for prefix in ("Description:", "description:", "Here's the description:",
+                       "Here is the description:", "Suggested description:"):
+            if s.lower().startswith(prefix.lower()):
+                s = s[len(prefix):].strip()
+        s = s.strip('"').strip("'").strip("`").strip()
+        return s
+
+    raw = (raw_response or "")
+    cleaned_lines = [_strip_line(ln) for ln in raw.splitlines()]
+    cleaned_lines = [ln for ln in cleaned_lines if ln]
+    if cleaned_lines:
+        # Heuristique : prefer lines that don't end with ':' (preamble) and
+        # don't start with 'Sure', 'Here', 'Of course' (filler). Sort by
+        # (is_preamble ASC, length DESC) -> first non-preamble + longest.
+        preamble_starts = ("sure", "here", "of course", "absolutely",
+                           "certainly", "yes,", "let me", "i'll", "let's")
+        def _is_preamble(line):
+            ll = line.lower().strip()
+            if ll.endswith(":"):
+                return True
+            for p in preamble_starts:
+                if ll.startswith(p):
+                    return True
+            return False
+        cleaned_lines.sort(key=lambda ln: (_is_preamble(ln), -len(ln)))
+        suggestion = cleaned_lines[0].strip()
+    else:
+        suggestion = _strip_line(raw)
     if not suggestion:
-        return False, "API a retourne une suggestion vide"
+        _log(f"suggest_skill_description: empty after sanitization (raw was {raw_response[:200]!r})")
+        return False, f"API a retourne une suggestion vide ou non parsable. Raw : {(raw_response or '')[:150]!r}"
     return True, {
         "suggestion": suggestion,
         "model": "claude-haiku-4-5-20251001",
         "chars_sent": len(content),
+        "raw_chars": len(raw_response or ""),
     }
 
 
@@ -5408,27 +5453,47 @@ async function suggestSkillDescription(){
   const btn = document.getElementById('repair-skill-suggest-btn');
   if (btn.disabled) return;
   const orig = btn.innerHTML;
+  const meta = document.getElementById('repair-skill-suggest-meta');
+  // v1.9.2 - status persistant dans la modal (le banner global se dismiss
+  // trop vite et l'utilisateur croit que rien ne s'est passe). On affiche
+  // dans le meta : success + model+chars OU error en rouge persistant.
+  function setMeta(html, color){
+    meta.innerHTML = html;
+    meta.className = 'text-[10px] mt-1 ' + (color === 'red' ? 'text-red-700' : (color === 'green' ? 'text-green-700' : 'text-stone-500'));
+    meta.classList.remove('hidden');
+  }
   btn.disabled = true;
   btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span> ' + tr('repair_skill_suggesting');
+  setMeta(tr('repair_skill_suggesting'), 'gray');
   try {
     const r = await fetch('/api/suggest-skill-description', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name: CURRENT_REPAIR_SKILL}),
     });
     const j = await r.json();
+    console.log('[repair] suggest response:', j);  // debug visibility
     if (!j.success) {
-      banner('red', j.message || 'Suggestion failed');
+      const msg = j.message || 'Suggestion failed (no message)';
+      setMeta('<strong>&#9888; ' + escAttr(msg) + '</strong>', 'red');
+      banner('red', msg);
     } else {
+      const suggestion = (j.suggestion || '').trim();
+      if (!suggestion) {
+        setMeta('<strong>&#9888; API returned empty suggestion (response: ' + escAttr(JSON.stringify(j).substring(0, 200)) + ')</strong>', 'red');
+        banner('red', 'API returned empty suggestion');
+        return;
+      }
       const ta = document.getElementById('repair-skill-desc');
-      ta.value = j.suggestion || '';
+      ta.value = suggestion;
       document.getElementById('repair-skill-desc-count').textContent = String(ta.value.length);
-      const meta = document.getElementById('repair-skill-suggest-meta');
-      meta.textContent = tr('repair_skill_suggested_via').split('{model}').join(j.model || '?').split('{n}').join(j.chars_sent || 0);
-      meta.classList.remove('hidden');
+      setMeta(tr('repair_skill_suggested_via').split('{model}').join(j.model || '?').split('{n}').join(j.chars_sent || 0), 'green');
       ta.focus();
     }
   } catch(e){
-    banner('red', 'Erreur reseau : ' + e.message);
+    console.error('[repair] suggest error:', e);
+    const msg = 'Erreur reseau : ' + e.message;
+    setMeta('<strong>&#9888; ' + escAttr(msg) + '</strong>', 'red');
+    banner('red', msg);
   } finally {
     btn.disabled = false;
     btn.innerHTML = orig;
