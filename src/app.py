@@ -5311,6 +5311,16 @@ function _hasActiveSkillFilters(){
     || (SKILL_CAT_FILTER && SKILL_CAT_FILTER !== '');
 }
 function _skillCat(sk){ return sk.category || sk.auto_category || tr('general_category'); }
+// v1.10.6 - case-insensitive grouping. Bug observe : 'Workflow' et
+// 'workflow' apparaissaient comme 2 categories distinctes parce que
+// 2 SKILL.md ont ecrit la valeur avec des casses differentes. On groupe
+// sur la version lowercase, et on capitalize pour l'affichage.
+function _skillCatKey(sk){ return _skillCat(sk).toLowerCase().trim(); }
+function _skillCatDisplay(label){
+  // Capitalize first letter of each word, garde le reste tel quel
+  if(!label) return label;
+  return label.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
 function _qualityClass(q){
   if(q==='excellent') return {bg:'bg-green-50', text:'text-green-700', border:'border-green-200', dot:'bg-green-500', label:tr('quality_excellent')};
   if(q==='enrich')    return {bg:'bg-amber-50', text:'text-amber-700', border:'border-amber-200', dot:'bg-amber-500', label:tr('quality_enrich')};
@@ -5331,7 +5341,7 @@ function _applySkillFilters(skills){
   }
   if(SKILL_SOURCE_FILTER==='user')     f = f.filter(s=>s.source==='user');
   else if(SKILL_SOURCE_FILTER==='plugin') f = f.filter(s=>s.source!=='user');
-  if(SKILL_CAT_FILTER)                 f = f.filter(s=>_skillCat(s)===SKILL_CAT_FILTER);
+  if(SKILL_CAT_FILTER)                 f = f.filter(s=>_skillCatKey(s)===SKILL_CAT_FILTER.toLowerCase());
   if(SKILL_USAGE_FILTER==='never')     f = f.filter(s=>(s.usage_count||0)===0);
   else if(SKILL_USAGE_FILTER==='recent') f = f.filter(s=>(s.usage_count||0)>0);
   else if(SKILL_USAGE_FILTER==='top'){
@@ -5403,7 +5413,7 @@ function _filterSkillsExcept(skills, exclude){
     else if(SKILL_SOURCE_FILTER==='plugin') f = f.filter(s=>s.source!=='user');
   }
   if(exclude !== 'cat'){
-    if(SKILL_CAT_FILTER)                 f = f.filter(s=>_skillCat(s)===SKILL_CAT_FILTER);
+    if(SKILL_CAT_FILTER)                 f = f.filter(s=>_skillCatKey(s)===SKILL_CAT_FILTER.toLowerCase());
   }
   if(exclude !== 'usage'){
     if(SKILL_USAGE_FILTER==='never')     f = f.filter(s=>(s.usage_count||0)===0);
@@ -5457,12 +5467,19 @@ function _renderFiltersSidebar(skills){
   const pluginCount = baseSource.filter(s=>s.source!=='user').length;
   const sourceAll = baseSource.length;
 
+  // v1.10.6 - groupage case-insensitive. Bug : 'Workflow' et 'workflow'
+  // dans 2 SKILL.md differents creaient 2 categories distinctes. On
+  // groupe sur la version lowercase et on capitalize pour l'affichage.
   const allCats = {};
-  baseCat.forEach(s=>{ const c=_skillCat(s); allCats[c]=(allCats[c]||0)+1; });
+  baseCat.forEach(s=>{
+    const k = _skillCatKey(s);
+    if(!allCats[k]) allCats[k] = {count: 0, display: _skillCatDisplay(_skillCat(s))};
+    allCats[k].count++;
+  });
   const catEntries = Object.entries(allCats).sort((a,b)=>{
-    if(a[0]===tr('general_category')) return 1;
-    if(b[0]===tr('general_category')) return -1;
-    return a[0].localeCompare(b[0]);
+    if(a[1].display===tr('general_category')) return 1;
+    if(b[1].display===tr('general_category')) return -1;
+    return a[1].display.localeCompare(b[1].display);
   });
   const catAll = baseCat.length;
 
@@ -5511,10 +5528,12 @@ function _renderFiltersSidebar(skills){
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('category_filter')}</div>
       <button onclick="setSkillCatFilter('')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${!SKILL_CAT_FILTER?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${tr('skill_filter_all_cats')}</span><span class="text-xs ${!SKILL_CAT_FILTER?'opacity-80':'text-stone-400'}">${catAll}</span></button>
-      ${catEntries.map(([c,n])=>{
-        const isActive = SKILL_CAT_FILTER===c;
+      ${catEntries.map(([key,data])=>{
+        const display = data.display;
+        const n = data.count;
+        const isActive = (SKILL_CAT_FILTER || '').toLowerCase() === key;
         const isZero = n === 0 && !isActive;
-        return `<button onclick="setSkillCatFilter('${escAttr(c)}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="truncate">${escAttr(c)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'} ml-2 shrink-0">${n}</span></button>`;
+        return `<button onclick="setSkillCatFilter('${escAttr(display)}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="truncate">${escAttr(display)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'} ml-2 shrink-0">${n}</span></button>`;
       }).join('')}
     </div>
   `;
