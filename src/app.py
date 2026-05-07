@@ -3068,6 +3068,15 @@ def get_overview():
             "mcps_failing": len(mcps_failing),
             "skills_total": len(state["skills"]),
             "skills_active": sum(1 for s in state["skills"] if s["active"]),
+            # v1.10.2 - cohérence avec le Health banner de la tab Skills :
+            # 'prets a se declencher' = quality excellent. Fournit aussi
+            # le compte broken+enrich pour permettre a l'UI de signaler
+            # les skills a corriger meme depuis la Vue d'ensemble.
+            "skills_excellent": sum(1 for s in state["skills"] if s.get("quality") == "excellent"),
+            "skills_broken": sum(1 for s in state["skills"]
+                                  if s.get("quality") == "broken" and s.get("source") == "user"),
+            "skills_enrich": sum(1 for s in state["skills"]
+                                  if s.get("quality") == "enrich" and s.get("source") == "user"),
             "plugins_total": len(plugins),
             "plugins_enabled": plugins_enabled,
             "commands_total": len(commands),
@@ -4538,7 +4547,7 @@ fr: {
   active_preset: "Preset actif",
   presets_label: "preset(s)",
   stat_mcps_running: "MCPs running",
-  stat_skills: "Skills actifs",
+  stat_skills: "Skills prêts",
   stat_plugins: "Plugins actifs",
   stat_commands: "Commands user + plugin",
   issue_mcps_not_running: "MCP(s) actifs mais non démarrés",
@@ -4831,7 +4840,7 @@ en: {
   active_preset: "Active preset",
   presets_label: "preset(s)",
   stat_mcps_running: "MCPs running",
-  stat_skills: "Active skills",
+  stat_skills: "Skills ready",
   stat_plugins: "Active plugins",
   stat_commands: "Commands user + plugin",
   issue_mcps_not_running: "active MCP(s) not running",
@@ -6188,7 +6197,14 @@ async function loadOverview(){
     if(stats){
       stats.innerHTML =
         statBox(`${s.mcps_running}/${s.mcps_active}`, tr('stat_mcps_running'), s.mcps_failing>0?'border-amber-200 bg-amber-50':'border-green-200 bg-green-50') +
-        statBox(`${s.skills_active}/${s.skills_total}`, tr('stat_skills'), 'border-stone-200 bg-stone-50') +
+        // v1.10.2 - 'Skills prets' (quality excellent) au lieu de 'Skills
+        // actifs' (toutes les skills enabled). Coherent avec le Health
+        // banner de la tab Skills. Border ambre si quelques broken/enrich
+        // a corriger.
+        statBox(`${s.skills_excellent||0}/${s.skills_total}`, tr('stat_skills'),
+                ((s.skills_broken||0)+(s.skills_enrich||0)) > 0
+                  ? 'border-amber-200 bg-amber-50'
+                  : 'border-green-200 bg-green-50') +
         statBox(`${s.plugins_enabled}/${s.plugins_total}`, tr('stat_plugins'), 'border-stone-200 bg-stone-50') +
         statBox(`${s.commands_user}+${s.commands_total - s.commands_user}`, tr('stat_commands'), 'border-stone-200 bg-stone-50');
     }
