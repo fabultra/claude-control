@@ -2865,6 +2865,7 @@ def get_skill_usage(days=30):
     """
     counts = {}
     tool_name_counts = {}
+    event_type_counts = {}  # v1.10.5 - diag : compte tous les obj.type
     sessions_seen = set()
     files_scanned = 0
     lines_scanned = 0
@@ -2907,6 +2908,9 @@ def get_skill_usage(days=30):
                 sid = obj.get("sessionId")
                 if sid:
                     sessions_seen.add(sid)
+                # v1.10.5 - track tous les obj.type pour diag
+                ot = obj.get("type", "_no_type")
+                event_type_counts[ot] = event_type_counts.get(ot, 0) + 1
                 if obj.get("type") != "assistant":
                     continue
                 assistant_msgs += 1
@@ -2950,6 +2954,9 @@ def get_skill_usage(days=30):
         "assistant_msgs": assistant_msgs,
         "tool_use_blocks": tool_use_blocks,
         "tool_name_counts": dict(tool_ranked),
+        # v1.10.5 - event types pour comprendre la structure JSONL
+        "event_type_counts": dict(sorted(event_type_counts.items(),
+                                         key=lambda kv: (-kv[1], kv[0]))[:15]),
     }
 
 
@@ -3114,6 +3121,7 @@ def get_overview():
             "assistant_msgs": usage.get("assistant_msgs", 0),
             "tool_use_blocks": usage.get("tool_use_blocks", 0),
             "tool_name_counts": usage.get("tool_name_counts", {}),
+            "event_type_counts": usage.get("event_type_counts", {}),
         },
         "health": {
             "plugin_orphans": plugin_orphans,
