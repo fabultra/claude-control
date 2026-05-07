@@ -4676,9 +4676,9 @@ fr: {
   loading: "Chargement...",
   saving: "Sauvegarde...",
   filter_usage: "Usage (30j)",
-  filter_usage_top: "Top 10",
-  filter_usage_recent: "Utilisés",
-  filter_usage_never: "Jamais utilisés",
+  filter_usage_top: "Top 10 (les + déclenchés)",
+  filter_usage_recent: "Déclenchés au moins 1 fois",
+  filter_usage_never: "Jamais déclenchés en 30j",
   filter_source: "Source",
   filter_all: "Tous",
   toggle_skill_title: "Activer / désactiver le skill",
@@ -4969,9 +4969,9 @@ en: {
   loading: "Loading...",
   saving: "Saving...",
   filter_usage: "Usage (30d)",
-  filter_usage_top: "Top 10",
-  filter_usage_recent: "Used",
-  filter_usage_never: "Never used",
+  filter_usage_top: "Top 10 (most triggered)",
+  filter_usage_recent: "Triggered at least once",
+  filter_usage_never: "Never triggered in 30d",
   filter_source: "Source",
   filter_all: "All",
   toggle_skill_title: "Enable / disable the skill",
@@ -5303,7 +5303,12 @@ function _applySkillFilters(skills){
   if(SKILL_USAGE_FILTER==='never')     f = f.filter(s=>(s.usage_count||0)===0);
   else if(SKILL_USAGE_FILTER==='recent') f = f.filter(s=>(s.usage_count||0)>0);
   else if(SKILL_USAGE_FILTER==='top'){
-    const top = [...skills].sort((a,b)=>(b.usage_count||0)-(a.usage_count||0)).slice(0,10).map(s=>s.name);
+    // v1.10.3 - Top 10 = top 10 des skills DECLENCHES (count > 0). Sans
+    // ce garde-fou, quand aucun usage n'est detecte (cas observe : 0
+    // invocations sur 18 fichiers JSONL), 'Top 10' affichait les 10
+    // premiers skills par ordre alphabetique avec count=0 = trompeur.
+    const used = skills.filter(s=>(s.usage_count||0)>0);
+    const top = [...used].sort((a,b)=>(b.usage_count||0)-(a.usage_count||0)).slice(0,10).map(s=>s.name);
     const set = new Set(top);
     f = f.filter(s=>set.has(s.name));
   }
@@ -5409,7 +5414,11 @@ function _renderFiltersSidebar(skills){
   const usageAll = baseUsage.length;
   // 'top' : top 10 du set TOUT (pas du filtre), c'est conceptuellement le
   // top 10 absolu. On compte combien de ceux-la passent les autres filtres.
-  const top10Names = new Set([...skills].sort((a,b)=>(b.usage_count||0)-(a.usage_count||0)).slice(0,10).map(s=>s.name));
+  // v1.10.3 - Top 10 = top 10 des skills DECLENCHES uniquement. Sans
+  // filtre count > 0, sort etait stable et retournait les 10 premiers
+  // alphabetiques quand tous count=0 -> 'Top 10 = 10' visuel alors que
+  // Utilises = 0. Incoherent.
+  const top10Names = new Set([...skills].filter(s=>(s.usage_count||0)>0).sort((a,b)=>(b.usage_count||0)-(a.usage_count||0)).slice(0,10).map(s=>s.name));
   const usageTopCount = baseUsage.filter(s=>top10Names.has(s.name)).length;
 
   const userCount = baseSource.filter(s=>s.source==='user').length;
