@@ -294,6 +294,24 @@ def _claude_cli_path():
     return shutil.which("claude")
 
 
+def open_terminal_claude_login():
+    """v1.9.5 - Ouvre Terminal.app et pre-tape 'claude /login' (sans
+    presser Enter, l'utilisateur garde le controle final). osascript
+    utilise 'tell application Terminal' qui marche sur stock macOS.
+    """
+    script = (
+        'tell application "Terminal"\n'
+        '  activate\n'
+        '  do script "claude /login"\n'
+        'end tell'
+    )
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+        return True, "Terminal ouvert avec la commande 'claude /login'. Suis les instructions pour t'authentifier."
+    except Exception as e:
+        return False, f"Erreur ouverture Terminal : {e}. Lance manuellement 'claude /login'."
+
+
 def _diagnose_claude_cli():
     """v1.9.4 - Sanity check : lance 'claude --version' pour verifier que
     le CLI est non seulement present mais aussi fonctionnel. Retourne dict :
@@ -318,12 +336,19 @@ def _diagnose_claude_cli():
                 "error": f"{type(e).__name__}: {e}"}
 
 
-def _call_claude_cli(prompt, timeout=60):
-    """v1.9.3 / v1.9.4 - Invoque le CLI Claude Code en mode print.
+class ClaudeCliNotLoggedIn(Exception):
+    """v1.9.5 - Cas specifique : le CLI Claude Code repond mais signale
+    'Not logged in'. C'est un setup utilisateur (une seule fois) : il
+    doit run 'claude /login' dans un terminal pour s'authentifier."""
 
-    v1.9.4 : meilleur error reporting. Inclut stdout + stderr + exit code
-    + commande complete dans l'exception. Logge la commande dans le log
-    central pour le debug post-mortem.
+
+def _call_claude_cli(prompt, timeout=60):
+    """v1.9.3 / v1.9.4 / v1.9.5 - Invoque le CLI Claude Code en mode print.
+
+    v1.9.5 : detecte specifiquement le cas 'Not logged in' (cas reel
+    observe sur la machine de Fabien) et leve ClaudeCliNotLoggedIn pour
+    qu'on puisse afficher une instruction claire cote UI plutot qu'un
+    message generique.
     """
     cli_path = _claude_cli_path()
     if not cli_path:
@@ -331,11 +356,17 @@ def _call_claude_cli(prompt, timeout=60):
     cmd = [cli_path, "-p", prompt, "--output-format", "text"]
     _log(f"_call_claude_cli: argv={cmd[:2]} prompt_len={len(prompt)}")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    stdout = (r.stdout or "").strip()
+    stderr = (r.stderr or "").strip()
     if r.returncode != 0:
-        stdout = (r.stdout or "").strip()
-        stderr = (r.stderr or "").strip()
         _log(f"_call_claude_cli: exit={r.returncode} stdout={stdout[:300]!r} stderr={stderr[:300]!r}")
-        # v1.9.4 - message clair selon le contexte
+        # v1.9.5 - cas 'Not logged in' detecte par pattern
+        combined = (stdout + " " + stderr).lower()
+        if "not logged in" in combined or "please run /login" in combined or "please log in" in combined:
+            raise ClaudeCliNotLoggedIn(
+                "Claude Code CLI n'est pas authentifie sur ce systeme. "
+                "Ouvre un terminal et lance la commande : claude /login"
+            )
         if not stdout and not stderr:
             hint = (
                 "Sortie vide. Causes possibles : (1) le CLI necessite une "
@@ -350,7 +381,7 @@ def _call_claude_cli(prompt, timeout=60):
         if stderr: details.append(f"stderr: {stderr[:300]}")
         if stdout: details.append(f"stdout: {stdout[:300]}")
         raise RuntimeError(f"claude CLI exit {r.returncode}. " + " | ".join(details))
-    return (r.stdout or "").strip()
+    return stdout
 
 
 _SUGGEST_SYSTEM_PROMPT = (
@@ -412,6 +443,17 @@ def suggest_skill_description(name, body_max_chars=4000):
     _log(f"suggest_skill_description: name={name} chars_sent={len(content)}")
     try:
         raw_response = _call_claude_cli(prompt)
+    except ClaudeCliNotLoggedIn as e:
+        # v1.9.5 - cas specifique 'Not logged in' : on retourne un code
+        # error_code que l'UI peut utiliser pour afficher des instructions
+        # ciblees + un bouton 'Copier la commande' au lieu d'un dump
+        # technique.
+        _log(f"suggest_skill_description: CLI not logged in")
+        return False, {
+            "error": str(e),
+            "error_code": "cli_not_logged_in",
+            "fix_command": "claude /login",
+        }
     except subprocess.TimeoutExpired:
         _log("suggest_skill_description: claude CLI timeout 60s")
         return False, "Timeout : le CLI Claude n'a pas repondu en 60s"
@@ -4604,6 +4646,11 @@ fr: {
   skills_cli_banner_body: "Installe le CLI Claude Code pour utiliser le bouton « Suggerer via Claude Code » dans la modal de reparation. Pas de cle API requise, le CLI utilise ton abonnement Claude Code existant.",
   repair_skill_diag_btn: "Diagnostiquer le CLI Claude Code",
   repair_skill_diag_title: "Diagnostic CLI Claude Code",
+  repair_skill_not_logged_in_title: "Connexion Claude Code requise",
+  repair_skill_not_logged_in_body: "Lance cette commande dans un terminal pour t'authentifier (une seule fois) :",
+  btn_copy: "Copier",
+  btn_open_terminal: "Ouvrir Terminal",
+  copied: "Commande copiee",
   repair_skill_preview_label: "Apercu actuel du SKILL.md",
   loading: "Chargement...",
   filter_usage: "Usage (30j)",
@@ -4885,6 +4932,11 @@ en: {
   skills_cli_banner_body: "Install the Claude Code CLI to use the 'Suggest via Claude Code' button in the repair modal. No API key required, the CLI uses your existing Claude Code subscription.",
   repair_skill_diag_btn: "Diagnose Claude Code CLI",
   repair_skill_diag_title: "Claude Code CLI diagnostic",
+  repair_skill_not_logged_in_title: "Claude Code login required",
+  repair_skill_not_logged_in_body: "Run this command in a terminal to authenticate (one time only):",
+  btn_copy: "Copy",
+  btn_open_terminal: "Open Terminal",
+  copied: "Command copied",
   repair_skill_preview_label: "Current SKILL.md preview",
   loading: "Loading...",
   filter_usage: "Usage (30d)",
@@ -5495,6 +5547,12 @@ function closeRepairSkill(){
   document.getElementById('repair-skill-modal').classList.add('hidden');
   CURRENT_REPAIR_SKILL = null;
 }
+async function openTerminalForLogin(){
+  // v1.9.5 - ouvre Terminal.app en pre-tapant 'claude /login' via le
+  // backend (osascript). L'utilisateur n'a qu'a appuyer sur Enter.
+  const j = await api('/api/open-terminal-claude-login', {});
+  banner(j.success ? 'green' : 'red', j.message);
+}
 async function diagClaudeCli(){
   // v1.9.4 - diag du CLI Claude Code, expose path + version + sanity check
   // pour aider l'utilisateur a comprendre pourquoi le CLI echoue.
@@ -5537,18 +5595,39 @@ async function suggestSkillDescription(){
     const j = await r.json();
     console.log('[repair] suggest response:', j);  // debug visibility
     if (!j.success) {
-      const msg = j.message || 'Suggestion failed (no message)';
-      // v1.9.4 - quand le CLI echoue, on affiche un bouton diag pour
-      // l'utilisateur (path + version + sanity check), histoire qu'il puisse
-      // voir pourquoi sans plonger dans les logs.
-      setMeta(
-        '<strong>&#9888; ' + escAttr(msg) + '</strong>'
-        + '<div class="mt-2"><button onclick="diagClaudeCli()" '
-        + 'class="text-[10px] underline text-stone-600 hover:text-stone-900">'
-        + tr('repair_skill_diag_btn') + '</button></div>',
-        'red'
-      );
-      banner('red', msg);
+      const msg = j.error || j.message || 'Suggestion failed (no message)';
+      // v1.9.5 - cas specifique 'cli_not_logged_in' : UI dediee avec
+      // commande copiable + bouton open-terminal au lieu d'un dump
+      // technique. Plus actionnable pour l'utilisateur.
+      if (j.error_code === 'cli_not_logged_in') {
+        const fixCmd = j.fix_command || 'claude /login';
+        setMeta(
+          '<strong>&#128274; ' + tr('repair_skill_not_logged_in_title') + '</strong>'
+          + '<p class="mt-1">' + tr('repair_skill_not_logged_in_body') + '</p>'
+          + '<div class="mt-2 flex items-center gap-2">'
+          + '<code class="text-[11px] bg-stone-900 text-stone-100 px-2 py-1 rounded font-mono">' + escAttr(fixCmd) + '</code>'
+          + '<button onclick="navigator.clipboard.writeText(\'' + escAttr(fixCmd) + '\').then(()=>banner(\'green\', \'' + escAttr(tr('copied')) + '\'))" '
+          + 'class="text-[10px] underline text-stone-600 hover:text-stone-900">'
+          + tr('btn_copy') + '</button>'
+          + '<button onclick="openTerminalForLogin()" '
+          + 'class="text-[10px] underline text-stone-600 hover:text-stone-900">'
+          + tr('btn_open_terminal') + '</button>'
+          + '</div>',
+          'red'
+        );
+        banner('red', tr('repair_skill_not_logged_in_title'));
+      } else {
+        // v1.9.4 - quand le CLI echoue (autre cause), on affiche un bouton
+        // diag pour l'utilisateur (path + version + sanity check).
+        setMeta(
+          '<strong>&#9888; ' + escAttr(msg) + '</strong>'
+          + '<div class="mt-2"><button onclick="diagClaudeCli()" '
+          + 'class="text-[10px] underline text-stone-600 hover:text-stone-900">'
+          + tr('repair_skill_diag_btn') + '</button></div>',
+          'red'
+        );
+        banner('red', msg);
+      }
     } else {
       const suggestion = (j.suggestion || '').trim();
       if (!suggestion) {
@@ -6331,6 +6410,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/stop-mcp": lambda: stop_mcp(data.get("name", "")),
             "/api/start-mcp": lambda: start_mcp(data.get("name", "")),
             "/api/restart-claude-desktop": lambda: restart_claude_desktop(),
+            "/api/open-terminal-claude-login": lambda: open_terminal_claude_login(),
             "/api/toggle-extension": lambda: toggle_extension(data.get("name", ""), data.get("enabled")),
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),

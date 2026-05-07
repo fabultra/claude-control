@@ -227,6 +227,25 @@ class SuggestSkillDescriptionTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Timeout", msg)
 
+    def test_detects_not_logged_in(self):
+        """v1.9.5 - cas reel observe : le CLI exit 1 avec stdout
+        'Not logged in / Please run /login'. On detecte ce pattern et
+        on retourne un error_code dedie pour que l'UI affiche une
+        instruction claire avec 'claude /login' a copier."""
+        def fake(prompt, timeout=60):
+            raise app.ClaudeCliNotLoggedIn(
+                "Claude Code CLI n'est pas authentifie. claude /login"
+            )
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with patch.object(app, "_call_claude_cli", fake):
+                ok, payload = app.suggest_skill_description("demo")
+        self.assertFalse(ok)
+        # Le payload doit etre un dict avec error_code = 'cli_not_logged_in'
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["error_code"], "cli_not_logged_in")
+        self.assertEqual(payload["fix_command"], "claude /login")
+        self.assertIn("authentifie", payload["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
