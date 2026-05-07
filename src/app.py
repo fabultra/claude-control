@@ -4,6 +4,7 @@ import http.server, io, json, os, re, shutil, socketserver, subprocess, sys, tem
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+import urllib.request, urllib.error
 
 MAX_ZIP_SIZE = 50 * 1024 * 1024  # 50 Mo
 
@@ -150,6 +151,271 @@ def read_skill_meta(skill_dir):
         if m:
             meta["tags"] = [t.strip().strip('"').strip("'") for t in m.group(1).split(",") if t.strip()]
     return meta
+
+
+def _yaml_quote_value(s):
+    """v1.9.0 - Encode une valeur de string YAML en double-quoted JSON-compat
+    (json.dumps produit toujours une string YAML-valide). On force la forme
+    quotee pour que les descriptions avec ':' / "'" / '\\n' / accents ne
+    cassent pas le parsing.
+    """
+    return json.dumps(str(s) if s is not None else "", ensure_ascii=False)
+
+
+def _split_skill_frontmatter(content):
+    """v1.9.0 - Separe un SKILL.md en (frontmatter_lines, body_str). Si pas
+    de frontmatter ou malforme, retourne ([], content).
+    """
+    if not content.startswith("---"):
+        return [], content
+    end = content.find("\n---", 3)
+    if end == -1:
+        return [], content
+    fm_block = content[3:end].strip("\n")
+    body = content[end + 4:]
+    if body.startswith("\n"):
+        body = body[1:]
+    return fm_block.splitlines(), body
+
+
+def _update_skill_frontmatter(content, updates):
+    """v1.9.0 - Retourne le contenu SKILL.md avec les cles `updates`
+    mises a jour dans le frontmatter. Preserve toutes les autres cles
+    et l'ordre. Si pas de frontmatter, en cree un.
+
+    `updates` : dict {key: str}. Les valeurs sont toujours encodees en
+    double-quoted YAML (cf. _yaml_quote_value) pour ne pas casser sur
+    les caracteres speciaux.
+    """
+    fm_lines, body = _split_skill_frontmatter(content)
+    # Map cle -> index pour replace en place
+    existing_idx = {}
+    for i, line in enumerate(fm_lines):
+        m = re.match(r'^\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s*:', line)
+        if m:
+            existing_idx[m.group(1)] = i
+    for key, value in updates.items():
+        new_line = f"{key}: {_yaml_quote_value(value)}"
+        if key in existing_idx:
+            fm_lines[existing_idx[key]] = new_line
+        else:
+            fm_lines.append(new_line)
+    new_fm = "---\n" + "\n".join(fm_lines) + "\n---\n"
+    return new_fm + body
+
+
+def repair_skill(name, description=None, name_override=None):
+    """v1.9.0 - Repare un skill en (re-)ecrivant son frontmatter avec la
+    description fournie. Backup zip cree avant ecriture (cf. delete_skill).
+
+    - `name` : nom du skill (dossier dans SKILLS_DIR ou SKILLS_DISABLED_DIR)
+    - `description` : nouvelle description (string non vide)
+    - `name_override` : nom YAML interne du skill (optionnel - si absent,
+      on utilise le nom du dossier)
+
+    Pour les skills sans frontmatter du tout, on en cree un avec
+    `name:` + `description:`. Le contenu existant est preserve sous le
+    nouveau frontmatter.
+    """
+    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
+        return False, "Nom de skill invalide"
+    if not description or not str(description).strip():
+        return False, "Description requise"
+    target = None
+    for base in (SKILLS_DIR, SKILLS_DISABLED_DIR):
+        candidate = base / name
+        if candidate.exists() and candidate.is_dir():
+            target = candidate
+            break
+    if not target:
+        return False, f"Skill '{name}' introuvable"
+    md = target / "SKILL.md"
+    if not md.exists():
+        # Cree un SKILL.md minimal avec juste le frontmatter
+        original_content = ""
+    else:
+        try:
+            original_content = md.read_text(errors="replace")
+        except Exception as e:
+            return False, f"Erreur lecture SKILL.md : {e}"
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = BACKUP_DIR / f"repaired-skill-{name}-{ts}.zip"
+    try:
+        _zip_dir(target, backup)
+    except Exception as e:
+        return False, f"Backup echoue : {e}"
+    updates = {
+        "name": name_override or name,
+        "description": str(description).strip(),
+    }
+    new_content = _update_skill_frontmatter(original_content, updates)
+    try:
+        md.write_text(new_content)
+    except Exception as e:
+        return False, f"Erreur ecriture : {e}"
+    return True, f"Skill '{name}' repare (description = {len(updates['description'])} chars, backup : {backup.name})"
+
+
+def _read_skill_content(name):
+    """v1.9.0 - Pour la modal de reparation : lit le contenu SKILL.md
+    et separe frontmatter / body. Retourne (ok, dict|err_msg)."""
+    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
+        return False, "Nom de skill invalide"
+    target = None
+    source = None
+    for base, src in ((SKILLS_DIR, "active"), (SKILLS_DISABLED_DIR, "disabled")):
+        candidate = base / name
+        if candidate.exists() and candidate.is_dir():
+            target = candidate
+            source = src
+            break
+    if not target:
+        return False, f"Skill '{name}' introuvable"
+    md = target / "SKILL.md"
+    if not md.exists():
+        return True, {"name": name, "source": source, "exists": False, "content": "",
+                      "frontmatter": [], "body": "", "meta": {"description": None, "category": None, "tags": []}}
+    try:
+        content = md.read_text(errors="replace")
+    except Exception as e:
+        return False, f"Erreur lecture : {e}"
+    fm_lines, body = _split_skill_frontmatter(content)
+    meta = read_skill_meta(target)
+    return True, {
+        "name": name, "source": source, "exists": True,
+        "content": content, "frontmatter": fm_lines, "body": body, "meta": meta,
+    }
+
+
+def _get_anthropic_api_key():
+    """v1.9.0 - Recupere la cle API Anthropic depuis (ordre de priorite) :
+    1. Env var ANTHROPIC_API_KEY (matche les conventions Claude Code)
+    2. Fichier ~/.claude/claude-control-anthropic-key (texte brut, mode 600)
+    Retourne la cle ou None.
+    """
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        return key
+    f = HOME / ".claude/claude-control-anthropic-key"
+    if f.exists():
+        try:
+            key = f.read_text().strip()
+            if key:
+                return key
+        except Exception:
+            pass
+    return None
+
+
+def _call_anthropic_messages(api_key, system_prompt, user_message,
+                             model="claude-haiku-4-5-20251001",
+                             max_tokens=300, timeout=20):
+    """v1.9.0 - Appelle l'API Messages Anthropic via urllib (stdlib only).
+    Retourne le texte assistant concatene. Leve une exception en cas
+    d'erreur HTTP / JSON / timeout.
+    """
+    body = json.dumps({
+        "model": model,
+        "max_tokens": int(max_tokens),
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    parts = []
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "".join(parts).strip()
+
+
+_SUGGEST_SYSTEM_PROMPT = (
+    "You write concise, action-oriented descriptions for Claude Code skills. "
+    "A skill description is a single sentence (40-150 chars) that tells Claude "
+    "WHEN to trigger this skill. It should start with a verb in present tense "
+    "('Use this skill when...', 'Helps with...', 'Generates...'). Avoid generic "
+    "phrasing. Read the SKILL.md content provided and produce ONLY the "
+    "description text - no quotes, no preamble, no explanation, just the "
+    "description string itself. Keep it under 150 chars."
+)
+
+
+def suggest_skill_description(name, body_max_chars=4000):
+    """v1.9.0 - Genere une description suggeree pour un skill via l'API
+    Anthropic (Haiku 4.5, modele cheap+rapide pour cette tache de
+    summarisation). L'utilisateur reste libre d'editer ou rejeter la
+    suggestion via la modal de reparation.
+
+    Garde-fou : on tronque le body envoye a body_max_chars (defaut 4000)
+    pour eviter de payer pour des skills enormes ET pour limiter le
+    risque de re-declencher Bug Type B (read_file > 25k chars).
+
+    Retourne (ok, msg_or_dict) :
+      - ok=True : msg = {"suggestion": str, "model": str, "chars_sent": int}
+      - ok=False : msg = string d'erreur
+    """
+    if not name:
+        return False, "Nom de skill requis"
+    api_key = _get_anthropic_api_key()
+    if not api_key:
+        return False, ("Cle API Anthropic absente. Definir ANTHROPIC_API_KEY "
+                       "dans l'environnement, ou ecrire la cle dans "
+                       "~/.claude/claude-control-anthropic-key")
+    target = None
+    for base in (SKILLS_DIR, SKILLS_DISABLED_DIR):
+        candidate = base / name
+        if candidate.exists() and candidate.is_dir():
+            target = candidate
+            break
+    if not target:
+        return False, f"Skill '{name}' introuvable"
+    md = target / "SKILL.md"
+    if md.exists():
+        try:
+            content = md.read_text(errors="replace")
+        except Exception as e:
+            return False, f"Erreur lecture : {e}"
+    else:
+        content = ""
+    # On envoie tout le contenu (frontmatter + body), tronque a body_max_chars.
+    if len(content) > body_max_chars:
+        content = content[:body_max_chars] + "\n\n[...truncated]"
+    user_msg = (
+        f"Skill name (folder): {name}\n\n"
+        f"SKILL.md content:\n```\n{content}\n```\n\n"
+        f"Generate the description string."
+    )
+    try:
+        suggestion = _call_anthropic_messages(
+            api_key, _SUGGEST_SYSTEM_PROMPT, user_msg,
+        )
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        return False, f"API Anthropic HTTP {e.code} : {err_body[:300]}"
+    except Exception as e:
+        return False, f"Erreur appel API : {e}"
+    suggestion = suggestion.strip().strip('"').strip("'").strip()
+    if not suggestion:
+        return False, "API a retourne une suggestion vide"
+    return True, {
+        "suggestion": suggestion,
+        "model": "claude-haiku-4-5-20251001",
+        "chars_sent": len(content),
+    }
 
 
 def _list_plugin_skills():
@@ -3827,6 +4093,29 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <div id="plugins" class="space-y-2 max-h-[700px] overflow-y-auto"></div>
 </section>
 </div>
+<div id="repair-skill-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
+<div class="card p-6 w-[640px] max-w-[92vw] max-h-[90vh] overflow-y-auto">
+<h3 class="text-lg font-semibold mb-1"><span data-i18n="repair_skill_title">Reparer le skill</span> <span id="repair-skill-name" class="font-mono text-stone-700"></span></h3>
+<p class="text-xs text-stone-500 mb-4" data-i18n="repair_skill_help">Une description claire est ce qui permet a Claude de declencher ton skill au bon moment. Sans description, le skill ne sera jamais utilise automatiquement.</p>
+<div class="mb-3">
+<label class="block text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1" data-i18n="repair_skill_desc_label">Description</label>
+<textarea id="repair-skill-desc" class="w-full p-2 border border-stone-300 rounded-lg text-sm font-sans" rows="3" data-i18n-placeholder="repair_skill_desc_placeholder" placeholder="Decris quand Claude doit utiliser ce skill (40-150 chars)"></textarea>
+<div class="flex justify-between items-center mt-1">
+<span id="repair-skill-desc-count" class="text-[10px] text-stone-400 font-mono">0</span>
+<button id="repair-skill-suggest-btn" onclick="suggestSkillDescription()" class="text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-2 py-1"><span data-i18n="repair_skill_suggest_btn">Suggerer via API Anthropic</span></button>
+</div>
+<div id="repair-skill-suggest-meta" class="text-[10px] text-stone-500 mt-1 hidden"></div>
+</div>
+<details class="mb-3">
+<summary class="text-xs font-semibold text-stone-600 cursor-pointer mb-1" data-i18n="repair_skill_preview_label">Apercu actuel du SKILL.md</summary>
+<pre id="repair-skill-preview" class="text-[11px] bg-stone-50 border border-stone-200 rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono mt-2"></pre>
+</details>
+<div class="flex gap-2 justify-end">
+<button onclick="closeRepairSkill()" class="px-4 py-2 text-sm rounded-lg border border-stone-200 hover:bg-stone-50" data-i18n="btn_cancel">Annuler</button>
+<button id="repair-skill-save-btn" onclick="saveRepairSkill()" class="px-4 py-2 text-sm rounded-lg bg-stone-900 hover:bg-stone-800 text-white font-medium" data-i18n="btn_save">Sauvegarder</button>
+</div>
+</div>
+</div>
 <div id="add-plugin-modal" class="hidden fixed inset-0 modal-bg flex items-center justify-center z-50">
 <div class="card p-6 w-[480px] max-w-[92vw]">
 <h3 class="text-lg font-semibold mb-1" data-i18n="plugin_add_modal_title">Ajouter un plugin via Git</h3>
@@ -4238,6 +4527,18 @@ fr: {
   quality_enrich: "À enrichir",
   quality_broken: "Cassés",
   quality_broken_hint: "Sans description : ne se déclenchera jamais automatiquement.",
+  btn_repair_skill: "Reparer",
+  repair_skill_title: "Reparer le skill",
+  repair_skill_help: "Une description claire est ce qui permet a Claude de declencher ton skill au bon moment. Sans description, le skill ne sera jamais utilise automatiquement.",
+  repair_skill_desc_label: "Description",
+  repair_skill_desc_placeholder: "Decris quand Claude doit utiliser ce skill (40-150 chars)",
+  repair_skill_desc_required: "Description requise",
+  repair_skill_suggest_btn: "Suggerer via API Anthropic",
+  repair_skill_suggesting: "Generation...",
+  repair_skill_suggested_via: "Suggere par {model} (envoye {n} chars)",
+  repair_skill_no_api_key: "Cle API Anthropic absente. Definir ANTHROPIC_API_KEY dans l'environnement, ou ecrire la cle dans ~/.claude/claude-control-anthropic-key",
+  repair_skill_preview_label: "Apercu actuel du SKILL.md",
+  loading: "Chargement...",
   filter_usage: "Usage (30j)",
   filter_usage_top: "Top 10",
   filter_usage_recent: "Utilisés",
@@ -4501,6 +4802,18 @@ en: {
   quality_enrich: "To enrich",
   quality_broken: "Broken",
   quality_broken_hint: "No description: will never auto-trigger.",
+  btn_repair_skill: "Repair",
+  repair_skill_title: "Repair skill",
+  repair_skill_help: "A clear description is what lets Claude trigger your skill at the right moment. Without one, the skill never auto-triggers.",
+  repair_skill_desc_label: "Description",
+  repair_skill_desc_placeholder: "Describe when Claude should use this skill (40-150 chars)",
+  repair_skill_desc_required: "Description required",
+  repair_skill_suggest_btn: "Suggest via Anthropic API",
+  repair_skill_suggesting: "Generating...",
+  repair_skill_suggested_via: "Suggested by {model} (sent {n} chars)",
+  repair_skill_no_api_key: "Anthropic API key missing. Set ANTHROPIC_API_KEY in env, or write the key in ~/.claude/claude-control-anthropic-key",
+  repair_skill_preview_label: "Current SKILL.md preview",
+  loading: "Loading...",
   filter_usage: "Usage (30d)",
   filter_usage_top: "Top 10",
   filter_usage_recent: "Used",
@@ -4893,6 +5206,11 @@ function _renderSkillCard(sk){
   const deleteBtn = editable
     ? `<button type="button" onclick="event.stopPropagation();deleteSkill('${escAttr(sk.name)}')" class="text-[11px] text-stone-400 hover:text-red-700 hover:underline">${tr('btn_delete')}</button>`
     : '';
+  // v1.9.0 - bouton 'Reparer' sur skills broken/enrich, uniquement sur les
+  // skills user editables (les plugins ont leur propre source de verite).
+  const repairBtn = (editable && (sk.quality === 'broken' || sk.quality === 'enrich'))
+    ? `<button type="button" onclick="event.stopPropagation();openRepairSkill('${escAttr(sk.name)}')" class="text-[11px] font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-2 py-0.5">${tr('btn_repair_skill')}</button>`
+    : '';
   const checked = SKILL_SELECTED.has(sk.name) ? 'checked' : '';
   const selectCheckbox = `<input type="checkbox" ${checked} onchange="event.stopPropagation();toggleSkillSelect('${escAttr(sk.name)}', this.checked)" class="w-3.5 h-3.5 rounded accent-stone-700 shrink-0" title="${tr('select_for_bulk_title')}">`;
   return `<div data-skill data-search="${escAttr((sk.name+' '+desc).toLowerCase())}" class="card p-3 border-l-4 ${q.border} ${sk.active?'':'opacity-60'}">
@@ -4906,7 +5224,7 @@ function _renderSkillCard(sk){
         <div class="flex flex-wrap items-center gap-1">${catBadge}${sourceBadge}${usageBadge}</div>
         ${descHtml}
       </div>
-      <div class="flex flex-col items-end gap-1 shrink-0">${checkbox}${deleteBtn}</div>
+      <div class="flex flex-col items-end gap-1 shrink-0">${checkbox}${repairBtn}${deleteBtn}</div>
     </div>
   </div>`;
 }
@@ -5015,6 +5333,112 @@ async function deleteSkill(name){
   const j = await api('/api/delete-skill', {name:name});
   banner(j.success?'green':'red', j.message);
   if(j.success){loadState();loadOverview();}
+}
+
+// v1.9.0 - Modal de reparation des skills (broken/enrich quality).
+// Lit le contenu actuel du SKILL.md, expose un textarea pour la
+// description, propose un bouton "Suggerer via API Anthropic" qui appelle
+// _call_anthropic_messages cote backend (Haiku 4.5, opt-in via env
+// ANTHROPIC_API_KEY ou ~/.claude/claude-control-anthropic-key).
+let CURRENT_REPAIR_SKILL = null;
+async function openRepairSkill(name){
+  CURRENT_REPAIR_SKILL = name;
+  document.getElementById('repair-skill-name').textContent = name;
+  document.getElementById('repair-skill-desc').value = '';
+  document.getElementById('repair-skill-desc-count').textContent = '0';
+  document.getElementById('repair-skill-suggest-meta').classList.add('hidden');
+  document.getElementById('repair-skill-preview').textContent = tr('loading') || 'Loading...';
+  document.getElementById('repair-skill-modal').classList.remove('hidden');
+  // Set up live counter
+  const ta = document.getElementById('repair-skill-desc');
+  ta.oninput = () => {
+    document.getElementById('repair-skill-desc-count').textContent = String(ta.value.length);
+  };
+  ta.focus();
+  // Disable suggest button if no API key configured
+  try {
+    const ks = await (await fetch('/api/anthropic-key-status')).json();
+    const btn = document.getElementById('repair-skill-suggest-btn');
+    if (!ks.configured) {
+      btn.disabled = true;
+      btn.classList.add('opacity-50', 'cursor-not-allowed');
+      btn.title = tr('repair_skill_no_api_key');
+    } else {
+      btn.disabled = false;
+      btn.classList.remove('opacity-50', 'cursor-not-allowed');
+      btn.title = '';
+    }
+  } catch(e){ /* noop */ }
+  // Load current SKILL.md content
+  try {
+    const r = await fetch('/api/skill-content/' + encodeURIComponent(name));
+    if (!r.ok) {
+      document.getElementById('repair-skill-preview').textContent = '(' + r.status + ')';
+      return;
+    }
+    const d = await r.json();
+    const desc = (d.meta && d.meta.description) || '';
+    if (desc) {
+      ta.value = desc;
+      document.getElementById('repair-skill-desc-count').textContent = String(desc.length);
+    }
+    document.getElementById('repair-skill-preview').textContent = d.content || '(empty SKILL.md)';
+  } catch(e){
+    document.getElementById('repair-skill-preview').textContent = '(error: ' + e + ')';
+  }
+}
+function closeRepairSkill(){
+  document.getElementById('repair-skill-modal').classList.add('hidden');
+  CURRENT_REPAIR_SKILL = null;
+}
+async function suggestSkillDescription(){
+  if (!CURRENT_REPAIR_SKILL) return;
+  const btn = document.getElementById('repair-skill-suggest-btn');
+  if (btn.disabled) return;
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span> ' + tr('repair_skill_suggesting');
+  try {
+    const r = await fetch('/api/suggest-skill-description', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: CURRENT_REPAIR_SKILL}),
+    });
+    const j = await r.json();
+    if (!j.success) {
+      banner('red', j.message || 'Suggestion failed');
+    } else {
+      const ta = document.getElementById('repair-skill-desc');
+      ta.value = j.suggestion || '';
+      document.getElementById('repair-skill-desc-count').textContent = String(ta.value.length);
+      const meta = document.getElementById('repair-skill-suggest-meta');
+      meta.textContent = tr('repair_skill_suggested_via').split('{model}').join(j.model || '?').split('{n}').join(j.chars_sent || 0);
+      meta.classList.remove('hidden');
+      ta.focus();
+    }
+  } catch(e){
+    banner('red', 'Erreur reseau : ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+async function saveRepairSkill(){
+  if (!CURRENT_REPAIR_SKILL) return;
+  const desc = document.getElementById('repair-skill-desc').value.trim();
+  if (!desc) { banner('red', tr('repair_skill_desc_required')); return; }
+  const btn = document.getElementById('repair-skill-save-btn');
+  btn.disabled = true;
+  try {
+    const j = await api('/api/repair-skill', {name: CURRENT_REPAIR_SKILL, description: desc});
+    banner(j.success ? 'green' : 'red', j.message);
+    if (j.success) {
+      closeRepairSkill();
+      loadState();
+      loadOverview();
+    }
+  } finally {
+    btn.disabled = false;
+  }
 }
 async function restartMcp(name){
   if(!confirm(tr('confirm_restart_mcp').split('{name}').join(name)))return;
@@ -5668,6 +6092,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(get_overview())
         elif path == "/api/skill-suggestions":
             self._json(skill_optimization_suggestions())
+        elif path.startswith("/api/skill-content/"):
+            # v1.9.0 - lecture du contenu SKILL.md pour la modal de reparation
+            sk_name = unquote(path[len("/api/skill-content/"):])
+            ok, payload = _read_skill_content(sk_name)
+            if ok:
+                self._json(payload)
+            else:
+                self._json({"error": payload}, status=404)
+        elif path == "/api/anthropic-key-status":
+            # v1.9.0 - savoir si la cle API est configuree (sans la divulguer)
+            self._json({"configured": bool(_get_anthropic_api_key())})
         elif path == "/api/watchdog":
             self._json(get_watchdog_status())
         elif path == "/api/diagnose-extensions":
@@ -5730,6 +6165,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/save-claude-md": lambda: save_claude_md(data.get("content", "")),
             "/api/save-settings": lambda: save_settings(data.get("content", "")),
             "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
+            "/api/repair-skill": lambda: repair_skill(data.get("name", ""), data.get("description"), data.get("name_override")),
+            "/api/suggest-skill-description": lambda: suggest_skill_description(data.get("name", "")),
             "/api/delete-user-skill-duplicates": lambda: delete_user_skill_duplicates(),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
             "/api/delete-extension": lambda: delete_extension(data.get("name", "")),
