@@ -294,28 +294,62 @@ def _claude_cli_path():
     return shutil.which("claude")
 
 
+def _diagnose_claude_cli():
+    """v1.9.4 - Sanity check : lance 'claude --version' pour verifier que
+    le CLI est non seulement present mais aussi fonctionnel. Retourne dict :
+      {available: bool, path: str?, version: str?, error: str?}
+    """
+    cli = _claude_cli_path()
+    if not cli:
+        return {"available": False, "path": None, "version": None,
+                "error": "claude not in PATH"}
+    try:
+        r = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=10)
+        version = (r.stdout or "").strip() or (r.stderr or "").strip()
+        if r.returncode != 0:
+            return {"available": False, "path": cli, "version": None,
+                    "error": f"--version exit {r.returncode}: {(r.stderr or '').strip()[:200]}"}
+        return {"available": True, "path": cli, "version": version, "error": None}
+    except subprocess.TimeoutExpired:
+        return {"available": False, "path": cli, "version": None,
+                "error": "--version timeout 10s"}
+    except Exception as e:
+        return {"available": False, "path": cli, "version": None,
+                "error": f"{type(e).__name__}: {e}"}
+
+
 def _call_claude_cli(prompt, timeout=60):
-    """v1.9.3 - Invoque le CLI Claude Code en mode print (non-interactif)
-    pour generer une reponse a partir d'un prompt. Pas de cle API
-    necessaire : le CLI utilise l'OAuth deja configure de Claude Code
-    (abonnement Pro/Max ou usage prepaid).
+    """v1.9.3 / v1.9.4 - Invoque le CLI Claude Code en mode print.
 
-    Bonus : Sonnet par defaut donc qualite > Haiku, gratuit cote Claude
-    Control (paye par l'abonnement CC).
-
-    Retourne le stdout strip. Leve sur exit non-zero ou timeout.
+    v1.9.4 : meilleur error reporting. Inclut stdout + stderr + exit code
+    + commande complete dans l'exception. Logge la commande dans le log
+    central pour le debug post-mortem.
     """
     cli_path = _claude_cli_path()
     if not cli_path:
         raise FileNotFoundError("claude CLI not in PATH")
-    r = subprocess.run(
-        [cli_path, "-p", prompt, "--output-format", "text"],
-        capture_output=True, text=True, timeout=timeout,
-    )
+    cmd = [cli_path, "-p", prompt, "--output-format", "text"]
+    _log(f"_call_claude_cli: argv={cmd[:2]} prompt_len={len(prompt)}")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
-        raise RuntimeError(
-            f"claude CLI exit {r.returncode}: {(r.stderr or '').strip()[:300]}"
-        )
+        stdout = (r.stdout or "").strip()
+        stderr = (r.stderr or "").strip()
+        _log(f"_call_claude_cli: exit={r.returncode} stdout={stdout[:300]!r} stderr={stderr[:300]!r}")
+        # v1.9.4 - message clair selon le contexte
+        if not stdout and not stderr:
+            hint = (
+                "Sortie vide. Causes possibles : (1) le CLI necessite une "
+                "session OAuth deja active (run 'claude' dans un terminal "
+                "pour t'authentifier), (2) le CLI est lance hors d'un TTY "
+                "et refuse de prompter, (3) le PATH du process Claude "
+                "Control ne contient pas l'emplacement attendu de la "
+                "config CLI."
+            )
+            raise RuntimeError(f"claude CLI exit {r.returncode} (stdout+stderr vides). {hint}")
+        details = []
+        if stderr: details.append(f"stderr: {stderr[:300]}")
+        if stdout: details.append(f"stdout: {stdout[:300]}")
+        raise RuntimeError(f"claude CLI exit {r.returncode}. " + " | ".join(details))
     return (r.stdout or "").strip()
 
 
@@ -4568,6 +4602,8 @@ fr: {
   repair_skill_no_cli: "Claude Code CLI introuvable. Installer avec : npm install -g @anthropic-ai/claude-code",
   skills_cli_banner_title: "Pour generer des descriptions automatiquement",
   skills_cli_banner_body: "Installe le CLI Claude Code pour utiliser le bouton « Suggerer via Claude Code » dans la modal de reparation. Pas de cle API requise, le CLI utilise ton abonnement Claude Code existant.",
+  repair_skill_diag_btn: "Diagnostiquer le CLI Claude Code",
+  repair_skill_diag_title: "Diagnostic CLI Claude Code",
   repair_skill_preview_label: "Apercu actuel du SKILL.md",
   loading: "Chargement...",
   filter_usage: "Usage (30j)",
@@ -4847,6 +4883,8 @@ en: {
   repair_skill_no_cli: "Claude Code CLI not found. Install with: npm install -g @anthropic-ai/claude-code",
   skills_cli_banner_title: "To generate descriptions automatically",
   skills_cli_banner_body: "Install the Claude Code CLI to use the 'Suggest via Claude Code' button in the repair modal. No API key required, the CLI uses your existing Claude Code subscription.",
+  repair_skill_diag_btn: "Diagnose Claude Code CLI",
+  repair_skill_diag_title: "Claude Code CLI diagnostic",
   repair_skill_preview_label: "Current SKILL.md preview",
   loading: "Loading...",
   filter_usage: "Usage (30d)",
@@ -5457,6 +5495,23 @@ function closeRepairSkill(){
   document.getElementById('repair-skill-modal').classList.add('hidden');
   CURRENT_REPAIR_SKILL = null;
 }
+async function diagClaudeCli(){
+  // v1.9.4 - diag du CLI Claude Code, expose path + version + sanity check
+  // pour aider l'utilisateur a comprendre pourquoi le CLI echoue.
+  try {
+    const r = await fetch('/api/claude-cli-diagnose');
+    const d = await r.json();
+    const lines = [
+      'available: ' + (d.available ? 'YES' : 'NO'),
+      'path: ' + (d.path || '(not in PATH)'),
+      'version: ' + (d.version || '(unknown)'),
+    ];
+    if (d.error) lines.push('error: ' + d.error);
+    alert(tr('repair_skill_diag_title') + '\n\n' + lines.join('\n'));
+  } catch(e){
+    alert('Diag failed: ' + e.message);
+  }
+}
 async function suggestSkillDescription(){
   if (!CURRENT_REPAIR_SKILL) return;
   const btn = document.getElementById('repair-skill-suggest-btn');
@@ -5483,7 +5538,16 @@ async function suggestSkillDescription(){
     console.log('[repair] suggest response:', j);  // debug visibility
     if (!j.success) {
       const msg = j.message || 'Suggestion failed (no message)';
-      setMeta('<strong>&#9888; ' + escAttr(msg) + '</strong>', 'red');
+      // v1.9.4 - quand le CLI echoue, on affiche un bouton diag pour
+      // l'utilisateur (path + version + sanity check), histoire qu'il puisse
+      // voir pourquoi sans plonger dans les logs.
+      setMeta(
+        '<strong>&#9888; ' + escAttr(msg) + '</strong>'
+        + '<div class="mt-2"><button onclick="diagClaudeCli()" '
+        + 'class="text-[10px] underline text-stone-600 hover:text-stone-900">'
+        + tr('repair_skill_diag_btn') + '</button></div>',
+        'red'
+      );
       banner('red', msg);
     } else {
       const suggestion = (j.suggestion || '').trim();
@@ -6191,6 +6255,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cli = _claude_cli_path()
             self._json({"available": bool(cli), "source": "claude_cli" if cli else None,
                         "path": cli or None})
+        elif path == "/api/claude-cli-diagnose":
+            # v1.9.4 - diag complet (path + version + sanity check) pour
+            # debug quand le CLI exit avec une erreur opaque.
+            self._json(_diagnose_claude_cli())
         elif path == "/api/watchdog":
             self._json(get_watchdog_status())
         elif path == "/api/diagnose-extensions":
