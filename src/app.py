@@ -5792,6 +5792,7 @@ async function bridgePluginMcp(pluginFullName, mcpName){
   banner(j.success?'green':'red', j.message);
   if(j.success){ loadPlugins(); loadState(); loadOverview(); }
 }
+const OPEN_PLUGINS = new Set();
 async function loadPlugins(){
   try{
     const j = await (await fetch('/api/plugins')).json();
@@ -5800,6 +5801,7 @@ async function loadPlugins(){
     if(plugins.length===0){list.innerHTML = `<p class="text-xs text-stone-400">${tr('plugins_empty')}</p>`;return;}
     list.innerHTML = plugins.map(p=>{
       const fn = escAttr(p.full_name);
+      const isOpen = OPEN_PLUGINS.has(p.full_name);
       const opacity = p.enabled ? '' : 'opacity-60';
       // v1.9.9 - badge orphan UX clarifie. Avant : 'orphan: vX.Y.Z' suggerait
       // un warning passif. Maintenant : icone poubelle + label 'Nettoyer
@@ -5825,14 +5827,27 @@ ${orphans}
 </button>
 <button type="button" onclick="event.stopPropagation();deletePlugin('${fn}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>
 </div>
-<div id="pl-detail-${fn}" class="hidden">${pluginDetailHtml(p.contents||{}, fn)}</div>
+<div id="pl-detail-${fn}" class="${isOpen?'':'hidden'}">${pluginDetailHtml(p.contents||{}, fn)}</div>
 </div>`;
     }).join('');
   }catch(e){console.error(e);}
 }
 function togglePluginDetail(fn){
   const el = document.getElementById('pl-detail-'+fn);
-  if(el) el.classList.toggle('hidden');
+  if(!el) return;
+  const willOpen = el.classList.contains('hidden');
+  el.classList.toggle('hidden');
+  if(willOpen){
+    OPEN_PLUGINS.add(fn);
+    requestAnimationFrame(()=>{
+      const r = el.getBoundingClientRect();
+      if(r.bottom > window.innerHeight || r.top < 0){
+        el.scrollIntoView({block:'nearest', behavior:'smooth'});
+      }
+    });
+  } else {
+    OPEN_PLUGINS.delete(fn);
+  }
 }
 async function togglePlugin(fn){
   const j = await api('/api/toggle-plugin',{name:fn});
