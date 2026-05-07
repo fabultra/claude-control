@@ -4522,6 +4522,8 @@ fr: {
   btn_edit: "Modifier",
   btn_view: "Voir",
   readonly: "lecture seule",
+  plugin_readonly_tooltip: "Skill fourni par un plugin Claude Code, géré par son marketplace. Read-only depuis Claude Control. Pour modifier, passe par le plugin source ou crée un skill perso du même nom.",
+  plugin_no_description_hint: "Pas de description (skill plugin, non éditable depuis ici).",
   command_not_found: "Command introuvable",
   claudemd_meta: "Lu à chaque session Claude Code",
   claudemd_help: "Préférences globales injectées dans chaque conversation Claude Code (~/.claude/CLAUDE.md)",
@@ -4811,6 +4813,8 @@ en: {
   btn_edit: "Edit",
   btn_view: "View",
   readonly: "read-only",
+  plugin_readonly_tooltip: "Skill provided by a Claude Code plugin, managed by its marketplace. Read-only from Claude Control. To modify, go through the plugin source or create a personal skill with the same name.",
+  plugin_no_description_hint: "No description (plugin skill, not editable from here).",
   command_not_found: "Command not found",
   claudemd_meta: "Read at each Claude Code session",
   claudemd_help: "Global preferences injected into every Claude Code conversation (~/.claude/CLAUDE.md)",
@@ -5233,7 +5237,15 @@ function _applySkillFilters(skills){
   let f = skills;
   if(SKILL_STATUS_FILTER==='active')   f = f.filter(s=>s.active);
   if(SKILL_STATUS_FILTER==='inactive') f = f.filter(s=>!s.active);
-  if(SKILL_QUALITY_FILTER!=='all')     f = f.filter(s=>s.quality===SKILL_QUALITY_FILTER);
+  if(SKILL_QUALITY_FILTER!=='all'){
+    f = f.filter(s=>s.quality===SKILL_QUALITY_FILTER);
+    // v1.9.8 - 'broken' / 'enrich' = filtres actionables, donc user-only.
+    // Coherent avec les counts du health banner et de la sidebar.
+    // 'excellent' garde tous les skills (info quality globale).
+    if(SKILL_QUALITY_FILTER==='broken' || SKILL_QUALITY_FILTER==='enrich'){
+      f = f.filter(s=>s.source==='user');
+    }
+  }
   if(SKILL_SOURCE_FILTER==='user')     f = f.filter(s=>s.source==='user');
   else if(SKILL_SOURCE_FILTER==='plugin') f = f.filter(s=>s.source!=='user');
   if(SKILL_CAT_FILTER)                 f = f.filter(s=>_skillCat(s)===SKILL_CAT_FILTER);
@@ -5248,9 +5260,15 @@ function _applySkillFilters(skills){
 }
 function _renderHealthBanner(skills){
   const total = skills.length;
+  // v1.9.8 - les counts 'broken' et 'enrich' du health banner ne comptent
+  // QUE les skills user. Les skills plugin sont read-only depuis Claude
+  // Control (cf. tooltip cadenas), donc les inclure dans 'a corriger' /
+  // 'a enrichir' creait du bruit non actionable. Le ratio global et le
+  // total restent sur tous les skills (info utile).
   const excellent = skills.filter(s=>s.quality==='excellent').length;
-  const enrich = skills.filter(s=>s.quality==='enrich').length;
-  const broken = skills.filter(s=>s.quality==='broken').length;
+  const userSkills = skills.filter(s=>s.source==='user');
+  const enrich = userSkills.filter(s=>s.quality==='enrich').length;
+  const broken = userSkills.filter(s=>s.quality==='broken').length;
   const ratio = total>0 ? Math.round(excellent/total*100) : 0;
   const barColor = ratio>=80 ? 'bg-green-500' : (ratio>=50 ? 'bg-amber-500' : 'bg-red-500');
   // Compte des doublons user/plugin (action via cleanupDuplicateUserSkills)
@@ -5279,9 +5297,13 @@ function _renderFiltersSidebar(skills){
   const active = skills.filter(s=>s.active).length;
   const userCount = skills.filter(s=>s.source==='user').length;
   const pluginCount = total - userCount;
+  // v1.9.8 - 'broken' et 'enrich' counts limites aux skills user (actionable).
+  // 'excellent' garde tous les skills (info utile sur la qualite globale).
+  // Ainsi le sidebar est coherent avec le health banner.
+  const userSkills = skills.filter(s=>s.source==='user');
   const qExc = skills.filter(s=>s.quality==='excellent').length;
-  const qEnr = skills.filter(s=>s.quality==='enrich').length;
-  const qBro = skills.filter(s=>s.quality==='broken').length;
+  const qEnr = userSkills.filter(s=>s.quality==='enrich').length;
+  const qBro = userSkills.filter(s=>s.quality==='broken').length;
   const usageNever = skills.filter(s=>(s.usage_count||0)===0).length;
   const usageRecent = skills.filter(s=>(s.usage_count||0)>0).length;
   const allCats = {};
@@ -5329,22 +5351,32 @@ function _renderFiltersSidebar(skills){
 }
 function _renderSkillCard(sk){
   const q = _qualityClass(sk.quality);
+  const isPlugin = sk.source !== 'user';
+  // v1.9.8 - les plugin skills sont read-only (managed par leur marketplace).
+  // Border neutre gris au lieu de la couleur quality (rouge/ambre/vert) pour
+  // signaler visuellement qu'ils ne sont pas dans le bucket actionable.
+  // Le dot quality reste pour l'info mais discret.
+  const borderClass = isPlugin ? 'border-stone-300' : q.border;
   const sourceBadge = sk.source==='user'
     ? `<span class="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded">${tr('source_badge_user')}</span>`
-    : `<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded" title="${escAttr(sk.source)}">${tr('source_badge_plugin')}</span>`;
+    : `<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded" title="${escAttr(sk.source)} - ${tr('plugin_readonly_tooltip')}">${tr('source_badge_plugin')}</span>`;
   const usageBadge = (sk.usage_count||0)>0
     ? `<span class="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded font-mono" title="${tr('used_x_times').split('{n}').join(sk.usage_count)}">${sk.usage_count}&times;</span>`
     : '';
   const cat = _skillCat(sk);
   const catBadge = `<span class="text-[10px] bg-stone-100 text-stone-500 px-1.5 py-0.5 rounded">${escAttr(cat)}</span>`;
   const desc = (sk.description || '').trim();
+  // v1.9.8 - hint "sans description" en rouge SEULEMENT pour user skills
+  // (actionable). Pour plugin skills sans description, hint neutre.
   const descHtml = desc
     ? `<p class="text-xs text-stone-600 mt-2 line-clamp-2">${escAttr(desc)}</p>`
-    : `<p class="text-xs italic text-red-700 mt-2">${tr('quality_broken_hint')}</p>`;
-  const editable = sk.editable !== false;
+    : (isPlugin
+        ? `<p class="text-xs italic text-stone-400 mt-2">${tr('plugin_no_description_hint')}</p>`
+        : `<p class="text-xs italic text-red-700 mt-2">${tr('quality_broken_hint')}</p>`);
+  const editable = !isPlugin;
   const checkbox = editable
     ? `<input type="checkbox" ${sk.active?'checked':''} onchange="event.stopPropagation();toggleSkill('${escAttr(sk.name)}')" class="w-4 h-4 rounded accent-green-700 shrink-0" title="${tr('toggle_skill_title')}">`
-    : `<span class="w-4 h-4 inline-flex items-center justify-center text-stone-300 shrink-0" title="${tr('readonly')}">&#128274;</span>`;
+    : `<span class="w-4 h-4 inline-flex items-center justify-center text-stone-400 shrink-0" title="${tr('plugin_readonly_tooltip')}">&#128274;</span>`;
   const deleteBtn = editable
     ? `<button type="button" onclick="event.stopPropagation();deleteSkill('${escAttr(sk.name)}')" class="text-[11px] text-stone-400 hover:text-red-700 hover:underline">${tr('btn_delete')}</button>`
     : '';
@@ -5354,13 +5386,20 @@ function _renderSkillCard(sk){
     ? `<button type="button" onclick="event.stopPropagation();openRepairSkill('${escAttr(sk.name)}')" class="text-[11px] font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-2 py-0.5">${tr('btn_repair_skill')}</button>`
     : '';
   const checked = SKILL_SELECTED.has(sk.name) ? 'checked' : '';
-  const selectCheckbox = `<input type="checkbox" ${checked} onchange="event.stopPropagation();toggleSkillSelect('${escAttr(sk.name)}', this.checked)" class="w-3.5 h-3.5 rounded accent-stone-700 shrink-0" title="${tr('select_for_bulk_title')}">`;
-  return `<div data-skill data-search="${escAttr((sk.name+' '+desc).toLowerCase())}" class="card p-3 border-l-4 ${q.border} ${sk.active?'':'opacity-60'}">
+  // v1.9.8 - bulk select checkbox masque pour les plugin skills (pas
+  // d'action bulk possible dessus, et c'est cohérent avec leur read-only).
+  const selectCheckbox = editable
+    ? `<input type="checkbox" ${checked} onchange="event.stopPropagation();toggleSkillSelect('${escAttr(sk.name)}', this.checked)" class="w-3.5 h-3.5 rounded accent-stone-700 shrink-0" title="${tr('select_for_bulk_title')}">`
+    : `<span class="w-3.5 h-3.5 shrink-0"></span>`;
+  // v1.9.8 - dot quality discret (gris) pour plugin skills, pour ne pas
+  // suggerer une action.
+  const dotClass = isPlugin ? 'bg-stone-300' : q.dot;
+  return `<div data-skill data-search="${escAttr((sk.name+' '+desc).toLowerCase())}" class="card p-3 border-l-4 ${borderClass} ${sk.active?'':'opacity-60'}${isPlugin?' bg-stone-50/50':''}">
     <div class="flex items-start gap-2">
       ${selectCheckbox}
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 mb-0.5">
-          <span class="inline-block w-1.5 h-1.5 rounded-full ${q.dot}" title="${escAttr(q.label)}"></span>
+          <span class="inline-block w-1.5 h-1.5 rounded-full ${dotClass}" title="${escAttr(q.label)}"></span>
           <span class="font-semibold text-sm truncate">${escAttr(sk.name)}</span>
         </div>
         <div class="flex flex-wrap items-center gap-1">${catBadge}${sourceBadge}${usageBadge}</div>
