@@ -4680,6 +4680,7 @@ fr: {
   confirm_bulk_disable: "Désactiver les {n} skills sélectionnés ?\\n\\nIls passent dans skills-disabled. Toujours réactivables un par un ensuite.\\n\\nCONFIRMER ?",
   confirm_bulk_delete: "Supprimer définitivement les {n} skills sélectionnés ?\\n\\nUn backup zip individuel par skill est créé dans ~/.claude/backups/claude-control/.\\n\\nCONFIRMER ?",
   skills_empty_with_filters: "Aucun skill ne correspond aux filtres actifs.",
+  btn_reset_filters: "Réinitialiser les filtres",
   source_badge_user: "perso",
   source_badge_plugin: "plugin",
   confirm_restart_mcp: "Redémarrer le MCP « {name} » ?\\n\\nLe process sera tué puis Claude Desktop le respawn automatiquement (toggle config). Tes conversations Claude restent intactes.",
@@ -4972,6 +4973,7 @@ en: {
   confirm_bulk_disable: "Disable the {n} selected skills?\\n\\nThey move to skills-disabled. Re-enable any one of them later.\\n\\nCONFIRM?",
   confirm_bulk_delete: "Permanently delete the {n} selected skills?\\n\\nAn individual zip backup per skill is created under ~/.claude/backups/claude-control/.\\n\\nCONFIRM?",
   skills_empty_with_filters: "No skill matches the active filters.",
+  btn_reset_filters: "Reset filters",
   source_badge_user: "yours",
   source_badge_plugin: "plugin",
   confirm_restart_mcp: 'Restart MCP "{name}"?\\n\\nThe process will be killed and Claude Desktop will respawn it automatically (config toggle). Your Claude conversations stay intact.',
@@ -5240,6 +5242,33 @@ let SKILL_SELECTED       = new Set();
 function setSkillStatusFilter(v){ SKILL_STATUS_FILTER=v; localStorage.setItem('cc-skill-status', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
 function setSkillQualityFilter(v){ SKILL_QUALITY_FILTER=v; localStorage.setItem('cc-skill-quality', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
 function setSkillUsageFilter(v){ SKILL_USAGE_FILTER=v; localStorage.setItem('cc-skill-usage', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
+
+// v1.10.1 - reset all filtres en un clic. Bug observe : utilisateur
+// accumule des filtres incompatibles et se retrouve avec 0 resultat,
+// sans porte de sortie evidente.
+function resetSkillFilters(){
+  SKILL_STATUS_FILTER = 'all';
+  SKILL_QUALITY_FILTER = 'all';
+  SKILL_USAGE_FILTER = 'all';
+  SKILL_SOURCE_FILTER = 'all';
+  SKILL_CAT_FILTER = '';
+  localStorage.setItem('cc-skill-status', 'all');
+  localStorage.setItem('cc-skill-quality', 'all');
+  localStorage.setItem('cc-skill-usage', 'all');
+  localStorage.setItem('cc-skill-src', 'all');
+  localStorage.setItem('cc-skill-cat', '');
+  SKILL_SELECTED.clear();
+  const search = document.getElementById('skills-search');
+  if(search) search.value = '';
+  _rerenderSkillsFromCache();
+}
+function _hasActiveSkillFilters(){
+  return SKILL_STATUS_FILTER !== 'all'
+    || SKILL_QUALITY_FILTER !== 'all'
+    || SKILL_USAGE_FILTER !== 'all'
+    || SKILL_SOURCE_FILTER !== 'all'
+    || (SKILL_CAT_FILTER && SKILL_CAT_FILTER !== '');
+}
 function _skillCat(sk){ return sk.category || sk.auto_category || tr('general_category'); }
 function _qualityClass(q){
   if(q==='excellent') return {bg:'bg-green-50', text:'text-green-700', border:'border-green-200', dot:'bg-green-500', label:tr('quality_excellent')};
@@ -5395,7 +5424,14 @@ function _renderFiltersSidebar(skills){
     const isZero = count === 0 && !isActive;
     return `<button onclick="${fn}('${val}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="${isZero?'':''}">${escAttr(label)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'}">${count}</span></button>`;
   };
+  // v1.10.1 - lien 'Reinitialiser' visible seulement quand au moins un
+  // filtre est actif. Permet de revenir a 'tout afficher' en un clic
+  // sans devoir cliquer sur chaque categorie de filtre individuellement.
+  const resetLink = _hasActiveSkillFilters()
+    ? `<button onclick="resetSkillFilters()" class="w-full text-left text-[11px] text-stone-500 hover:text-stone-900 underline px-2 py-1 mb-2">&#x21bb; ${tr('btn_reset_filters')}</button>`
+    : '';
   el.innerHTML = `
+    ${resetLink}
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_status')}</div>
       ${radio('status','all',tr('filter_all'),sStatusAll,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
@@ -5554,7 +5590,10 @@ function renderSkills(skills){
   _renderFiltersSidebar(skills);
   if(!skills || skills.length===0) return `<p class="text-stone-400 text-sm col-span-full">${tr('no_skill')}</p>`;
   const filtered = _applySkillFilters(skills);
-  if(filtered.length === 0) return `<p class="text-stone-400 text-sm col-span-full italic p-4">${tr('skills_empty_with_filters')}</p>`;
+  if(filtered.length === 0) return `<div class="col-span-full p-6 text-center">
+    <p class="text-stone-500 italic mb-3">${tr('skills_empty_with_filters')}</p>
+    <button onclick="resetSkillFilters()" class="text-xs font-medium text-white bg-stone-900 hover:bg-stone-800 rounded-md px-4 py-2">&#x21bb; ${tr('btn_reset_filters')}</button>
+  </div>`;
   return filtered.map(_renderSkillCard).join('');
 }
 function filterSkills(){
