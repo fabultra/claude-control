@@ -3929,6 +3929,71 @@ def bridge_plugin_mcp_to_desktop(full_name, mcp_name):
                   f"pour qu'il le charge.")
 
 
+def package_plugin_skill_for_desktop(full_name, skill_name):
+    """v1.12.0 - Zippe un skill (dossier <plugin>/skills/<skill>/) pour
+    upload manuel dans Claude Desktop > Settings > Customize > Skills.
+
+    Claude Desktop ne lit pas ~/.claude/skills/ comme Claude Code : il
+    necessite un .zip uploade via son UI. On genere donc le .zip dans
+    ~/Downloads/ (ou TMPDIR fallback) et on revele le fichier dans Finder
+    pour que l'user n'ait qu'a le drag-drop dans Customize > Skills.
+
+    Refus si plugin / skill introuvable. Limite MAX_ZIP_SIZE pour eviter
+    de zipper des dossiers absurdes.
+    """
+    if not full_name or not skill_name:
+        return False, "Nom de plugin et nom de skill requis"
+    if "/" in skill_name or ".." in skill_name or skill_name.startswith("."):
+        return False, f"Nom de skill invalide : '{skill_name}'"
+    installed = _load_installed_plugins()
+    if full_name not in installed:
+        return False, f"Plugin '{full_name}' introuvable"
+    entries = installed[full_name]
+    if not isinstance(entries, list) or not entries:
+        return False, f"Plugin '{full_name}' sans entree valide"
+    install_path = entries[0].get("installPath", "") if isinstance(entries[0], dict) else ""
+    p = Path(install_path)
+    skill_dir = None
+    for cand in (p / "skills" / skill_name, p / ".claude-plugin/skills" / skill_name):
+        if cand.is_dir():
+            skill_dir = cand
+            break
+    if skill_dir is None:
+        return False, f"Skill '{skill_name}' introuvable dans le plugin '{full_name}'"
+    total = 0
+    for f in skill_dir.rglob("*"):
+        if f.is_file():
+            total += f.stat().st_size
+            if total > MAX_ZIP_SIZE:
+                return False, f"Skill '{skill_name}' depasse {MAX_ZIP_SIZE//1024//1024} Mo (taille max .zip)"
+    out_dir = HOME / "Downloads"
+    if not out_dir.is_dir():
+        out_dir = Path(tempfile.gettempdir())
+    plugin_short, _ = _split_plugin_name(full_name)
+    safe_plugin = re.sub(r"[^A-Za-z0-9._-]", "_", plugin_short or "plugin")
+    safe_skill = re.sub(r"[^A-Za-z0-9._-]", "_", skill_name)
+    zip_path = out_dir / f"{safe_plugin}-{safe_skill}.zip"
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in skill_dir.rglob("*"):
+                if f.is_file():
+                    arcname = Path(skill_name) / f.relative_to(skill_dir)
+                    z.write(f, arcname.as_posix())
+    except Exception as e:
+        return False, f"Echec creation .zip : {e}"
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(zip_path)])
+    except Exception:
+        pass
+    return True, {"message": (f"Skill '{skill_name}' zippe dans {zip_path}. "
+                              f"Glisse-le dans Settings > Customize > Skills de "
+                              f"Claude Desktop (Finder ouvert sur le fichier)."),
+                  "zip_path": str(zip_path),
+                  "skill": skill_name,
+                  "plugin": full_name}
+
+
 def _split_plugin_name(full_name):
     """github@claude-plugins-official -> ('github', 'claude-plugins-official')"""
     if "@" in full_name:
@@ -4628,6 +4693,15 @@ fr: {
   plugin_mcp_bridged_badge: "dans Claude Desktop",
   plugin_mcp_bridged_tooltip: "Ce MCP est déjà présent dans claude_desktop_config.json — Claude Desktop le charge.",
   confirm_bridge_plugin_mcp: "Copier le MCP « {mcp} » dans claude_desktop_config.json ?\n\nClaude Desktop le chargera après son prochain redémarrage. Le plugin garde sa propre définition (le MCP reste aussi dispo dans Claude Code CLI). Un backup horodaté est créé.",
+  badge_cli: "CLI",
+  badge_cli_tooltip: "Disponible dans Claude Code (CLI) via ce plugin.",
+  badge_desktop: "Desktop",
+  badge_desktop_tooltip: "Disponible dans Claude Desktop.",
+  plugin_skill_import_btn: "Ajouter à Claude Desktop",
+  plugin_skill_import_tooltip: "Génère un .zip du skill dans ~/Downloads/ et ouvre Finder. Glisse-le ensuite dans Settings → Customize → Skills de Claude Desktop. (Claude Desktop ne lit pas ~/.claude/skills/ comme Claude Code, l'upload manuel d'un .zip est requis.)",
+  plugin_skill_imported_badge: "zip prêt",
+  plugin_skill_imported_tooltip: "Le .zip a été généré dans ~/Downloads/ pendant cette session. Glisse-le dans Settings → Customize → Skills de Claude Desktop. (État de session — pas de détection automatique côté Desktop.)",
+  plugin_skill_cli_tooltip: "Skill chargé automatiquement par Claude Code via ce plugin. Claude Desktop ne lit pas ~/.claude/skills/ — il faut uploader un .zip via Settings → Customize → Skills.",
   empty_capture: "(vide)",
   commands: "Commands",
   commands_help: "Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs",
@@ -4927,6 +5001,15 @@ en: {
   plugin_mcp_bridged_badge: "in Claude Desktop",
   plugin_mcp_bridged_tooltip: "This MCP is already present in claude_desktop_config.json — Claude Desktop loads it.",
   confirm_bridge_plugin_mcp: "Copy the MCP \"{mcp}\" into claude_desktop_config.json?\n\nClaude Desktop will load it after its next restart. The plugin keeps its own definition (the MCP also stays available in Claude Code CLI). A timestamped backup is created.",
+  badge_cli: "CLI",
+  badge_cli_tooltip: "Available in Claude Code (CLI) via this plugin.",
+  badge_desktop: "Desktop",
+  badge_desktop_tooltip: "Available in Claude Desktop.",
+  plugin_skill_import_btn: "Add to Claude Desktop",
+  plugin_skill_import_tooltip: "Generates a .zip of the skill in ~/Downloads/ and opens Finder. Then drag it into Settings → Customize → Skills in Claude Desktop. (Claude Desktop doesn't read ~/.claude/skills/ like Claude Code does — manual .zip upload required.)",
+  plugin_skill_imported_badge: "zip ready",
+  plugin_skill_imported_tooltip: "The .zip was generated in ~/Downloads/ during this session. Drag it into Settings → Customize → Skills in Claude Desktop. (Session state — no automatic detection on the Desktop side.)",
+  plugin_skill_cli_tooltip: "Skill loaded automatically by Claude Code via this plugin. Claude Desktop doesn't read ~/.claude/skills/ — you need to upload a .zip via Settings → Customize → Skills.",
   empty_capture: "(empty)",
   commands: "Commands",
   commands_help: "User commands (~/.claude/commands/) and those provided by active plugins",
@@ -5768,20 +5851,46 @@ function pluginContentBadge(c){
   if(c.missing) parts.push(tr('plugin_install_path_missing'));
   return parts.length ? parts.join(' &middot; ') : tr('plugin_empty');
 }
+// v1.12.0 - tracking optimiste session-only des skills dont on a genere le
+// .zip via /api/package-plugin-skill. On ne peut pas detecter cote Desktop
+// (pas d'API publique pour lister les skills uploades), donc le badge "zip
+// pret" est juste un rappel visuel jusqu'au prochain reload.
+const PACKAGED_SKILLS = new Set();
+function _badgeCli(){
+  return `<span class="text-[10px] bg-blue-50 border border-blue-200 text-blue-700 px-1.5 py-0.5 rounded font-medium" title="${escAttr(tr('badge_cli_tooltip'))}">&#10003; ${tr('badge_cli')}</span>`;
+}
+function _badgeDesktop(tooltipKey, labelKey){
+  return `<span class="text-[10px] bg-green-50 border border-green-200 text-green-800 px-1.5 py-0.5 rounded font-medium" title="${escAttr(tr(tooltipKey||'badge_desktop_tooltip'))}">&#10003; ${tr(labelKey||'badge_desktop')}</span>`;
+}
 function _renderPluginMcpChip(fn, m){
   // v1.11.0 - chaque MCP plugin est rendu avec soit un badge 'deja dans CD'
   // (m.bridged === true) soit un bouton 'Ajouter a CD' qui appelle
   // /api/bridge-plugin-mcp pour copier la definition.
+  // v1.12.0 - badges symetriques CLI / Desktop pour clarifier ou le MCP est
+  // disponible.
   const name = (typeof m === 'string') ? m : (m && m.name) || '';
   const bridged = (typeof m === 'object' && m && m.bridged === true);
-  if(bridged){
-    return `<span class="text-xs bg-green-50 border border-green-200 text-green-800 px-2 py-0.5 rounded inline-flex items-center gap-1" title="${escAttr(tr('plugin_mcp_bridged_tooltip'))}">${escAttr(name)} <span class="text-[10px]">&#10003; ${tr('plugin_mcp_bridged_badge')}</span></span>`;
-  }
-  return `<span class="text-xs bg-stone-100 px-2 py-0.5 rounded inline-flex items-center gap-1">${escAttr(name)} <button type="button" onclick="bridgePluginMcp('${fn}','${escAttr(name)}')" class="text-[10px] text-emerald-700 hover:text-emerald-900 hover:underline font-medium" title="${escAttr(tr('plugin_mcp_bridge_tooltip'))}">+ ${tr('plugin_mcp_bridge_btn')}</button></span>`;
+  const desktopPart = bridged
+    ? _badgeDesktop('plugin_mcp_bridged_tooltip')
+    : `<button type="button" onclick="bridgePluginMcp('${fn}','${escAttr(name)}')" class="text-[10px] text-emerald-700 hover:text-emerald-900 hover:underline font-medium" title="${escAttr(tr('plugin_mcp_bridge_tooltip'))}">+ ${tr('plugin_mcp_bridge_btn')}</button>`;
+  return `<span class="text-xs bg-stone-100 px-2 py-0.5 rounded inline-flex items-center gap-1.5">${escAttr(name)} ${_badgeCli()} ${desktopPart}</span>`;
+}
+function _renderPluginSkillChip(fn, name){
+  // v1.12.0 - chaque skill plugin est rendu avec badges CLI (toujours) et
+  // soit un bouton 'Ajouter a CD' (genere .zip dans ~/Downloads) soit un
+  // badge 'zip pret' apres click. Pas de detection cote Desktop - tracking
+  // optimiste session-only via PACKAGED_SKILLS.
+  const key = fn + '/' + name;
+  const packaged = PACKAGED_SKILLS.has(key);
+  const desktopPart = packaged
+    ? _badgeDesktop('plugin_skill_imported_tooltip', 'plugin_skill_imported_badge')
+    : `<button type="button" onclick="packagePluginSkill('${fn}','${escAttr(name)}')" class="text-[10px] text-emerald-700 hover:text-emerald-900 hover:underline font-medium" title="${escAttr(tr('plugin_skill_import_tooltip'))}">+ ${tr('plugin_skill_import_btn')}</button>`;
+  const cliBadge = `<span class="text-[10px] bg-blue-50 border border-blue-200 text-blue-700 px-1.5 py-0.5 rounded font-medium" title="${escAttr(tr('plugin_skill_cli_tooltip'))}">&#10003; ${tr('badge_cli')}</span>`;
+  return `<span class="text-xs bg-stone-100 px-2 py-0.5 rounded inline-flex items-center gap-1.5">${escAttr(name)} ${cliBadge} ${desktopPart}</span>`;
 }
 function pluginDetailHtml(c, fn){
   const sections = [];
-  if(c.skills && c.skills.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Skills</span><div class="mt-1 flex flex-wrap gap-1.5">${c.skills.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">${escAttr(s)}</span>`).join('')}</div></div>`);
+  if(c.skills && c.skills.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Skills</span><div class="mt-1 flex flex-wrap gap-1.5">${c.skills.map(s=>_renderPluginSkillChip(fn, s)).join('')}</div><div class="mt-1.5 text-[11px] text-stone-500 italic">${tr('plugin_skill_cli_tooltip')}</div></div>`);
   if(c.mcps && c.mcps.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">MCPs</span><div class="mt-1 flex flex-wrap gap-1.5">${c.mcps.map(m=>_renderPluginMcpChip(fn, m)).join('')}</div><div class="mt-1.5 text-[11px] text-stone-500 italic">${tr('plugin_mcp_cli_tooltip')}</div></div>`);
   if(c.commands && c.commands.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Commands</span><div class="mt-1 flex flex-wrap gap-1.5">${c.commands.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">/${escAttr(s)}</span>`).join('')}</div></div>`);
   return sections.length ? `<div class="mt-3 pt-3 border-t border-stone-100 space-y-3">${sections.join('')}</div>` : `<div class="mt-3 pt-3 border-t border-stone-100 text-xs text-stone-400">${tr('plugin_no_content')}</div>`;
@@ -5791,6 +5900,14 @@ async function bridgePluginMcp(pluginFullName, mcpName){
   const j = await api('/api/bridge-plugin-mcp', {plugin: pluginFullName, mcp: mcpName});
   banner(j.success?'green':'red', j.message);
   if(j.success){ loadPlugins(); loadState(); loadOverview(); }
+}
+async function packagePluginSkill(pluginFullName, skillName){
+  const j = await api('/api/package-plugin-skill', {plugin: pluginFullName, skill: skillName});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){
+    PACKAGED_SKILLS.add(pluginFullName + '/' + skillName);
+    loadPlugins();
+  }
 }
 const OPEN_PLUGINS = new Set();
 async function loadPlugins(){
@@ -6863,6 +6980,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
             "/api/bridge-plugin-mcp": lambda: bridge_plugin_mcp_to_desktop(data.get("plugin", ""), data.get("mcp", "")),
+            "/api/package-plugin-skill": lambda: package_plugin_skill_for_desktop(data.get("plugin", ""), data.get("skill", "")),
             "/api/watchdog-config": lambda: save_watchdog_config(data),
             "/api/scan-process": lambda: (True, scan_processes(data.get("pattern", ""))),
         }
