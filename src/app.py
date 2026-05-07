@@ -4,7 +4,6 @@ import http.server, io, json, os, re, shutil, socketserver, subprocess, sys, tem
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
-import urllib.request, urllib.error
 
 MAX_ZIP_SIZE = 50 * 1024 * 1024  # 50 Mo
 
@@ -288,56 +287,36 @@ def _read_skill_content(name):
     }
 
 
-def _get_anthropic_api_key():
-    """v1.9.0 - Recupere la cle API Anthropic depuis (ordre de priorite) :
-    1. Env var ANTHROPIC_API_KEY (matche les conventions Claude Code)
-    2. Fichier ~/.claude/claude-control-anthropic-key (texte brut, mode 600)
-    Retourne la cle ou None.
+def _claude_cli_path():
+    """v1.9.3 - Retourne le chemin de la commande 'claude' (Claude Code CLI)
+    si disponible, sinon None. shutil.which respecte le PATH du process.
     """
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if key:
-        return key
-    f = HOME / ".claude/claude-control-anthropic-key"
-    if f.exists():
-        try:
-            key = f.read_text().strip()
-            if key:
-                return key
-        except Exception:
-            pass
-    return None
+    return shutil.which("claude")
 
 
-def _call_anthropic_messages(api_key, system_prompt, user_message,
-                             model="claude-haiku-4-5-20251001",
-                             max_tokens=300, timeout=20):
-    """v1.9.0 - Appelle l'API Messages Anthropic via urllib (stdlib only).
-    Retourne le texte assistant concatene. Leve une exception en cas
-    d'erreur HTTP / JSON / timeout.
+def _call_claude_cli(prompt, timeout=60):
+    """v1.9.3 - Invoque le CLI Claude Code en mode print (non-interactif)
+    pour generer une reponse a partir d'un prompt. Pas de cle API
+    necessaire : le CLI utilise l'OAuth deja configure de Claude Code
+    (abonnement Pro/Max ou usage prepaid).
+
+    Bonus : Sonnet par defaut donc qualite > Haiku, gratuit cote Claude
+    Control (paye par l'abonnement CC).
+
+    Retourne le stdout strip. Leve sur exit non-zero ou timeout.
     """
-    body = json.dumps({
-        "model": model,
-        "max_tokens": int(max_tokens),
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_message}],
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
+    cli_path = _claude_cli_path()
+    if not cli_path:
+        raise FileNotFoundError("claude CLI not in PATH")
+    r = subprocess.run(
+        [cli_path, "-p", prompt, "--output-format", "text"],
+        capture_output=True, text=True, timeout=timeout,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read().decode("utf-8"))
-    parts = []
-    for block in data.get("content", []):
-        if block.get("type") == "text":
-            parts.append(block.get("text", ""))
-    return "".join(parts).strip()
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"claude CLI exit {r.returncode}: {(r.stderr or '').strip()[:300]}"
+        )
+    return (r.stdout or "").strip()
 
 
 _SUGGEST_SYSTEM_PROMPT = (
@@ -352,26 +331,24 @@ _SUGGEST_SYSTEM_PROMPT = (
 
 
 def suggest_skill_description(name, body_max_chars=4000):
-    """v1.9.0 - Genere une description suggeree pour un skill via l'API
-    Anthropic (Haiku 4.5, modele cheap+rapide pour cette tache de
-    summarisation). L'utilisateur reste libre d'editer ou rejeter la
-    suggestion via la modal de reparation.
+    """v1.9.3 - Genere une description suggeree pour un skill via le CLI
+    Claude Code (subprocess `claude -p ...`). Pas de cle API necessaire :
+    le CLI utilise l'OAuth deja configure de Claude Code (abonnement
+    Pro/Max ou usage prepaid). Sonnet par defaut donc qualite > Haiku.
 
     Garde-fou : on tronque le body envoye a body_max_chars (defaut 4000)
-    pour eviter de payer pour des skills enormes ET pour limiter le
-    risque de re-declencher Bug Type B (read_file > 25k chars).
+    pour limiter le risque de re-declencher Bug Type B (read_file > 25k
+    chars).
 
     Retourne (ok, msg_or_dict) :
-      - ok=True : msg = {"suggestion": str, "model": str, "chars_sent": int}
+      - ok=True : msg = {"suggestion": str, "source": "claude_cli", "chars_sent": int}
       - ok=False : msg = string d'erreur
     """
     if not name:
         return False, "Nom de skill requis"
-    api_key = _get_anthropic_api_key()
-    if not api_key:
-        return False, ("Cle API Anthropic absente. Definir ANTHROPIC_API_KEY "
-                       "dans l'environnement, ou ecrire la cle dans "
-                       "~/.claude/claude-control-anthropic-key")
+    if not _claude_cli_path():
+        return False, ("Claude Code CLI ('claude') introuvable dans le PATH. "
+                       "Installer avec : npm install -g @anthropic-ai/claude-code")
     target = None
     for base in (SKILLS_DIR, SKILLS_DISABLED_DIR):
         candidate = base / name
@@ -388,29 +365,29 @@ def suggest_skill_description(name, body_max_chars=4000):
             return False, f"Erreur lecture : {e}"
     else:
         content = ""
-    # On envoie tout le contenu (frontmatter + body), tronque a body_max_chars.
     if len(content) > body_max_chars:
         content = content[:body_max_chars] + "\n\n[...truncated]"
-    user_msg = (
+    # v1.9.3 - on combine system + user en un seul prompt pour le CLI
+    # (qui n'a pas de --system-prompt). Le CLI pipe son output sur stdout.
+    prompt = (
+        _SUGGEST_SYSTEM_PROMPT + "\n\n"
         f"Skill name (folder): {name}\n\n"
         f"SKILL.md content:\n```\n{content}\n```\n\n"
         f"Generate the description string."
     )
     _log(f"suggest_skill_description: name={name} chars_sent={len(content)}")
     try:
-        raw_response = _call_anthropic_messages(
-            api_key, _SUGGEST_SYSTEM_PROMPT, user_msg,
-        )
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            err_body = ""
-        _log(f"suggest_skill_description: HTTP {e.code} body={err_body[:500]}")
-        return False, f"API Anthropic HTTP {e.code} : {err_body[:300]}"
+        raw_response = _call_claude_cli(prompt)
+    except subprocess.TimeoutExpired:
+        _log("suggest_skill_description: claude CLI timeout 60s")
+        return False, "Timeout : le CLI Claude n'a pas repondu en 60s"
+    except FileNotFoundError as e:
+        _log(f"suggest_skill_description: CLI not found : {e}")
+        return False, ("Claude Code CLI introuvable dans le PATH. "
+                       "Installer : npm install -g @anthropic-ai/claude-code")
     except Exception as e:
         _log(f"suggest_skill_description: exception {type(e).__name__} : {e}")
-        return False, f"Erreur appel API ({type(e).__name__}) : {e}"
+        return False, f"Erreur appel CLI ({type(e).__name__}) : {e}"
     _log(f"suggest_skill_description: raw response len={len(raw_response or '')} preview={(raw_response or '')[:200]!r}")
     # v1.9.2 - sanitize plus agressif. Haiku peut retourner :
     # - du markdown (## prefix, **bold**, > quote, * list)
@@ -457,7 +434,7 @@ def suggest_skill_description(name, body_max_chars=4000):
         return False, f"API a retourne une suggestion vide ou non parsable. Raw : {(raw_response or '')[:150]!r}"
     return True, {
         "suggestion": suggestion,
-        "model": "claude-haiku-4-5-20251001",
+        "source": "claude_cli",
         "chars_sent": len(content),
         "raw_chars": len(raw_response or ""),
     }
@@ -4115,6 +4092,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </section>
 </div>
 <div data-main-tab="skills" class="hidden">
+<section id="skills-cli-banner" class="hidden card p-3 mb-3 border-l-4 border-amber-400"></section>
 <section id="skills-health-banner" class="card p-4 mb-4"></section>
 <div class="grid grid-cols-1 md:grid-cols-[260px_1fr] gap-4">
 <aside class="card p-4 md:sticky md:top-4 md:self-start md:max-h-[calc(100vh-2rem)] md:overflow-y-auto">
@@ -4151,7 +4129,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <textarea id="repair-skill-desc" class="w-full p-2 border border-stone-300 rounded-lg text-sm font-sans" rows="3" data-i18n-placeholder="repair_skill_desc_placeholder" placeholder="Decris quand Claude doit utiliser ce skill (40-150 chars)"></textarea>
 <div class="flex justify-between items-center mt-1">
 <span id="repair-skill-desc-count" class="text-[10px] text-stone-400 font-mono">0</span>
-<button id="repair-skill-suggest-btn" onclick="suggestSkillDescription()" class="text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-2 py-1"><span data-i18n="repair_skill_suggest_btn">Suggerer via API Anthropic</span></button>
+<button id="repair-skill-suggest-btn" onclick="suggestSkillDescription()" class="text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-2 py-1"><span data-i18n="repair_skill_suggest_btn">Suggerer via Claude Code</span></button>
 </div>
 <div id="repair-skill-suggest-meta" class="text-[10px] text-stone-500 mt-1 hidden"></div>
 </div>
@@ -4584,10 +4562,12 @@ fr: {
   repair_skill_desc_label: "Description",
   repair_skill_desc_placeholder: "Decris quand Claude doit utiliser ce skill (40-150 chars)",
   repair_skill_desc_required: "Description requise",
-  repair_skill_suggest_btn: "Suggerer via API Anthropic",
+  repair_skill_suggest_btn: "Suggerer via Claude Code",
   repair_skill_suggesting: "Generation...",
-  repair_skill_suggested_via: "Suggere par {model} (envoye {n} chars)",
-  repair_skill_no_api_key: "Cle API Anthropic absente. Definir ANTHROPIC_API_KEY dans l'environnement, ou ecrire la cle dans ~/.claude/claude-control-anthropic-key",
+  repair_skill_suggested_via: "Suggere via Claude Code CLI (envoye {n} chars)",
+  repair_skill_no_cli: "Claude Code CLI introuvable. Installer avec : npm install -g @anthropic-ai/claude-code",
+  skills_cli_banner_title: "Pour generer des descriptions automatiquement",
+  skills_cli_banner_body: "Installe le CLI Claude Code pour utiliser le bouton « Suggerer via Claude Code » dans la modal de reparation. Pas de cle API requise, le CLI utilise ton abonnement Claude Code existant.",
   repair_skill_preview_label: "Apercu actuel du SKILL.md",
   loading: "Chargement...",
   filter_usage: "Usage (30j)",
@@ -4861,10 +4841,12 @@ en: {
   repair_skill_desc_label: "Description",
   repair_skill_desc_placeholder: "Describe when Claude should use this skill (40-150 chars)",
   repair_skill_desc_required: "Description required",
-  repair_skill_suggest_btn: "Suggest via Anthropic API",
+  repair_skill_suggest_btn: "Suggest via Claude Code",
   repair_skill_suggesting: "Generating...",
-  repair_skill_suggested_via: "Suggested by {model} (sent {n} chars)",
-  repair_skill_no_api_key: "Anthropic API key missing. Set ANTHROPIC_API_KEY in env, or write the key in ~/.claude/claude-control-anthropic-key",
+  repair_skill_suggested_via: "Suggested via Claude Code CLI (sent {n} chars)",
+  repair_skill_no_cli: "Claude Code CLI not found. Install with: npm install -g @anthropic-ai/claude-code",
+  skills_cli_banner_title: "To generate descriptions automatically",
+  skills_cli_banner_body: "Install the Claude Code CLI to use the 'Suggest via Claude Code' button in the repair modal. No API key required, the CLI uses your existing Claude Code subscription.",
   repair_skill_preview_label: "Current SKILL.md preview",
   loading: "Loading...",
   filter_usage: "Usage (30d)",
@@ -5314,8 +5296,35 @@ async function bulkDeleteSelectedSkills(){
   for(const n of names){ await api('/api/delete-skill', {name:n}); }
   SKILL_SELECTED.clear(); loadState(); loadOverview();
 }
+// v1.9.3 - banner top Skills si CLI absent ET il y a des skills broken/enrich
+// (cas ou on aurait besoin de generer des descriptions). Cache le banner
+// si CLI dispo OU pas de skill a reparer.
+async function _renderCliInstallBanner(skills){
+  const banner = document.getElementById('skills-cli-banner');
+  if(!banner) return;
+  const needs = (skills || []).some(s => s.quality === 'broken' || s.quality === 'enrich');
+  if(!needs){ banner.classList.add('hidden'); return; }
+  let available = false;
+  try {
+    const r = await fetch('/api/suggest-source-status');
+    if(r.ok){ const d = await r.json(); available = !!d.available; }
+  } catch(e){ /* noop */ }
+  if(available){ banner.classList.add('hidden'); return; }
+  banner.classList.remove('hidden');
+  banner.innerHTML = `
+    <div class="flex items-start gap-3">
+      <span class="text-amber-600 text-lg shrink-0">&#128161;</span>
+      <div class="flex-1 text-xs text-stone-700 leading-relaxed">
+        <strong>${tr('skills_cli_banner_title')}</strong><br>
+        ${tr('skills_cli_banner_body')}
+        <code class="text-[11px] bg-stone-100 px-1.5 py-0.5 rounded font-mono mt-1 inline-block">npm install -g @anthropic-ai/claude-code</code>
+      </div>
+    </div>
+  `;
+}
 function renderSkills(skills){
   _renderHealthBanner(skills);
+  _renderCliInstallBanner(skills);
   _renderFiltersSidebar(skills);
   if(!skills || skills.length===0) return `<p class="text-stone-400 text-sm col-span-full">${tr('no_skill')}</p>`;
   const filtered = _applySkillFilters(skills);
@@ -5412,14 +5421,14 @@ async function openRepairSkill(name){
     document.getElementById('repair-skill-desc-count').textContent = String(ta.value.length);
   };
   ta.focus();
-  // Disable suggest button if no API key configured
+  // v1.9.3 - Disable suggest button if Claude Code CLI not available
   try {
-    const ks = await (await fetch('/api/anthropic-key-status')).json();
+    const ks = await (await fetch('/api/suggest-source-status')).json();
     const btn = document.getElementById('repair-skill-suggest-btn');
-    if (!ks.configured) {
+    if (!ks.available) {
       btn.disabled = true;
       btn.classList.add('opacity-50', 'cursor-not-allowed');
-      btn.title = tr('repair_skill_no_api_key');
+      btn.title = tr('repair_skill_no_cli');
     } else {
       btn.disabled = false;
       btn.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -5486,7 +5495,7 @@ async function suggestSkillDescription(){
       const ta = document.getElementById('repair-skill-desc');
       ta.value = suggestion;
       document.getElementById('repair-skill-desc-count').textContent = String(ta.value.length);
-      setMeta(tr('repair_skill_suggested_via').split('{model}').join(j.model || '?').split('{n}').join(j.chars_sent || 0), 'green');
+      setMeta(tr('repair_skill_suggested_via').split('{n}').join(j.chars_sent || 0), 'green');
       ta.focus();
     }
   } catch(e){
@@ -6177,9 +6186,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(payload)
             else:
                 self._json({"error": payload}, status=404)
-        elif path == "/api/anthropic-key-status":
-            # v1.9.0 - savoir si la cle API est configuree (sans la divulguer)
-            self._json({"configured": bool(_get_anthropic_api_key())})
+        elif path == "/api/suggest-source-status":
+            # v1.9.3 - savoir si la source de suggestion est dispo (Claude CLI)
+            cli = _claude_cli_path()
+            self._json({"available": bool(cli), "source": "claude_cli" if cli else None,
+                        "path": cli or None})
         elif path == "/api/watchdog":
             self._json(get_watchdog_status())
         elif path == "/api/diagnose-extensions":
