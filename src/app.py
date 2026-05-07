@@ -5207,17 +5207,28 @@ function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;'
 let SKILL_USAGE = {};
 let SKILL_SOURCE_FILTER = (localStorage.getItem('cc-skill-src') || 'all');
 let SKILL_CAT_FILTER = (localStorage.getItem('cc-skill-cat') || '');
+// v1.10.0 - re-rendu synchrone depuis CURRENT_STATE quand un filtre change.
+// Avant, on appelait loadState() qui refetch /api/state (1-2s sur grosses
+// configs). Resultat : delai apparent quand on clique sur un filtre, qui
+// donnait l'impression d'un bug. Maintenant : changement filtre = re-render
+// instantane depuis le cache, et un loadState() en background pour
+// rafraichir les counts d'usage etc.
+function _rerenderSkillsFromCache(){
+  if(!CURRENT_STATE || !CURRENT_STATE.skills) return;
+  document.getElementById('skills').innerHTML = renderSkills(CURRENT_STATE.skills);
+  filterSkills();
+}
 function setSkillSourceFilter(src){
   SKILL_SOURCE_FILTER = src;
   localStorage.setItem('cc-skill-src', src);
   if(typeof SKILL_SELECTED !== 'undefined') SKILL_SELECTED.clear();
-  if(typeof loadState==='function') loadState();
+  _rerenderSkillsFromCache();
 }
 function setSkillCatFilter(cat){
   SKILL_CAT_FILTER = cat;
   localStorage.setItem('cc-skill-cat', cat);
   if(typeof SKILL_SELECTED !== 'undefined') SKILL_SELECTED.clear();
-  if(typeof loadState==='function') loadState();
+  _rerenderSkillsFromCache();
 }
 // v1.7.7 - refactor complet 3 zones (health banner + sidebar filters + cards
 // grid). Filtres orthogonaux : status, qualite, usage, source, categorie.
@@ -5226,9 +5237,9 @@ let SKILL_STATUS_FILTER  = (localStorage.getItem('cc-skill-status') || 'all');  
 let SKILL_QUALITY_FILTER = (localStorage.getItem('cc-skill-quality') || 'all');    // all|excellent|enrich|broken
 let SKILL_USAGE_FILTER   = (localStorage.getItem('cc-skill-usage') || 'all');      // all|top|recent|never
 let SKILL_SELECTED       = new Set();
-function setSkillStatusFilter(v){ SKILL_STATUS_FILTER=v; localStorage.setItem('cc-skill-status', v); SKILL_SELECTED.clear(); loadState(); }
-function setSkillQualityFilter(v){ SKILL_QUALITY_FILTER=v; localStorage.setItem('cc-skill-quality', v); SKILL_SELECTED.clear(); loadState(); }
-function setSkillUsageFilter(v){ SKILL_USAGE_FILTER=v; localStorage.setItem('cc-skill-usage', v); SKILL_SELECTED.clear(); loadState(); }
+function setSkillStatusFilter(v){ SKILL_STATUS_FILTER=v; localStorage.setItem('cc-skill-status', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
+function setSkillQualityFilter(v){ SKILL_QUALITY_FILTER=v; localStorage.setItem('cc-skill-quality', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
+function setSkillUsageFilter(v){ SKILL_USAGE_FILTER=v; localStorage.setItem('cc-skill-usage', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
 function _skillCat(sk){ return sk.category || sk.auto_category || tr('general_category'); }
 function _qualityClass(q){
   if(q==='excellent') return {bg:'bg-green-50', text:'text-green-700', border:'border-green-200', dot:'bg-green-500', label:tr('quality_excellent')};
@@ -5292,62 +5303,133 @@ function _renderHealthBanner(skills){
     <div class="flex flex-wrap gap-2">${chipBroken}${chipEnrich}${chipDup}${allOk}</div>
   `;
 }
+// v1.10.0 - applique tous les filtres SAUF celui specifie. Permet aux
+// counts de la sidebar de refleter le nombre reel de skills qu'on verrait
+// en cliquant sur l'option (= passe tous les autres filtres + cette
+// option). Avant, les counts etaient absolus, donc 'Build/Deploy 5'
+// alors qu'avec Mes skills actif on n'en voyait que 2 cards. Confusion
+// utilisateur.
+function _filterSkillsExcept(skills, exclude){
+  let f = skills;
+  if(exclude !== 'status'){
+    if(SKILL_STATUS_FILTER==='active')   f = f.filter(s=>s.active);
+    if(SKILL_STATUS_FILTER==='inactive') f = f.filter(s=>!s.active);
+  }
+  if(exclude !== 'quality'){
+    if(SKILL_QUALITY_FILTER!=='all'){
+      f = f.filter(s=>s.quality===SKILL_QUALITY_FILTER);
+      if(SKILL_QUALITY_FILTER==='broken' || SKILL_QUALITY_FILTER==='enrich'){
+        f = f.filter(s=>s.source==='user');
+      }
+    }
+  }
+  if(exclude !== 'source'){
+    if(SKILL_SOURCE_FILTER==='user')     f = f.filter(s=>s.source==='user');
+    else if(SKILL_SOURCE_FILTER==='plugin') f = f.filter(s=>s.source!=='user');
+  }
+  if(exclude !== 'cat'){
+    if(SKILL_CAT_FILTER)                 f = f.filter(s=>_skillCat(s)===SKILL_CAT_FILTER);
+  }
+  if(exclude !== 'usage'){
+    if(SKILL_USAGE_FILTER==='never')     f = f.filter(s=>(s.usage_count||0)===0);
+    else if(SKILL_USAGE_FILTER==='recent') f = f.filter(s=>(s.usage_count||0)>0);
+    else if(SKILL_USAGE_FILTER==='top'){
+      const top = [...skills].sort((a,b)=>(b.usage_count||0)-(a.usage_count||0)).slice(0,10).map(s=>s.name);
+      const set = new Set(top);
+      f = f.filter(s=>set.has(s.name));
+    }
+  }
+  return f;
+}
 function _renderFiltersSidebar(skills){
   const el = document.getElementById('skills-filters');
   if(!el) return;
-  const total = skills.length;
-  const active = skills.filter(s=>s.active).length;
-  const userCount = skills.filter(s=>s.source==='user').length;
-  const pluginCount = total - userCount;
-  // v1.9.8 - 'broken' et 'enrich' counts limites aux skills user (actionable).
-  // 'excellent' garde tous les skills (info utile sur la qualite globale).
-  // Ainsi le sidebar est coherent avec le health banner.
-  const userSkills = skills.filter(s=>s.source==='user');
-  const qExc = skills.filter(s=>s.quality==='excellent').length;
-  const qEnr = userSkills.filter(s=>s.quality==='enrich').length;
-  const qBro = userSkills.filter(s=>s.quality==='broken').length;
-  const usageNever = skills.filter(s=>(s.usage_count||0)===0).length;
-  const usageRecent = skills.filter(s=>(s.usage_count||0)>0).length;
+  // v1.10.0 - on calcule un set partiel (tous les filtres SAUF celui
+  // qu'on rend) pour chaque groupe. Les counts dans le groupe reflectent
+  // ainsi le nombre de skills qu'on verrait reellement en cliquant.
+  const baseStatus = _filterSkillsExcept(skills, 'status');
+  const baseQuality = _filterSkillsExcept(skills, 'quality');
+  const baseSource = _filterSkillsExcept(skills, 'source');
+  const baseCat = _filterSkillsExcept(skills, 'cat');
+  const baseUsage = _filterSkillsExcept(skills, 'usage');
+
+  const totalAll = skills.length;
+  const sActive = baseStatus.filter(s=>s.active).length;
+  const sInactive = baseStatus.filter(s=>!s.active).length;
+  const sStatusAll = baseStatus.length;
+
+  // Pour quality : 'broken'/'enrich' sont user-only (cf v1.9.8). 'excellent'
+  // garde tous les skills. 'all' = total apres autres filtres.
+  const userInQual = baseQuality.filter(s=>s.source==='user');
+  const qExc = baseQuality.filter(s=>s.quality==='excellent').length;
+  const qEnr = userInQual.filter(s=>s.quality==='enrich').length;
+  const qBro = userInQual.filter(s=>s.quality==='broken').length;
+  const qAll = baseQuality.length;
+
+  const usageRecentCount = baseUsage.filter(s=>(s.usage_count||0)>0).length;
+  const usageNever = baseUsage.filter(s=>(s.usage_count||0)===0).length;
+  const usageAll = baseUsage.length;
+  // 'top' : top 10 du set TOUT (pas du filtre), c'est conceptuellement le
+  // top 10 absolu. On compte combien de ceux-la passent les autres filtres.
+  const top10Names = new Set([...skills].sort((a,b)=>(b.usage_count||0)-(a.usage_count||0)).slice(0,10).map(s=>s.name));
+  const usageTopCount = baseUsage.filter(s=>top10Names.has(s.name)).length;
+
+  const userCount = baseSource.filter(s=>s.source==='user').length;
+  const pluginCount = baseSource.filter(s=>s.source!=='user').length;
+  const sourceAll = baseSource.length;
+
   const allCats = {};
-  skills.forEach(s=>{ const c=_skillCat(s); allCats[c]=(allCats[c]||0)+1; });
+  baseCat.forEach(s=>{ const c=_skillCat(s); allCats[c]=(allCats[c]||0)+1; });
   const catEntries = Object.entries(allCats).sort((a,b)=>{
     if(a[0]===tr('general_category')) return 1;
     if(b[0]===tr('general_category')) return -1;
     return a[0].localeCompare(b[0]);
   });
-  const radio = (group, val, label, count, cur, fn) =>
-    `<button onclick="${fn}('${val}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${cur===val?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${escAttr(label)}</span><span class="text-xs ${cur===val?'opacity-80':'text-stone-400'}">${count}</span></button>`;
+  const catAll = baseCat.length;
+
+  // Version dimmed pour les counts a 0 (categorie ou option non actionable
+  // dans le contexte courant). Pas masque pour ne pas surprendre l'utilisateur,
+  // juste grise.
+  const radio = (group, val, label, count, cur, fn) => {
+    const isActive = cur===val;
+    const isZero = count === 0 && !isActive;
+    return `<button onclick="${fn}('${val}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="${isZero?'':''}">${escAttr(label)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'}">${count}</span></button>`;
+  };
   el.innerHTML = `
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_status')}</div>
-      ${radio('status','all',tr('filter_all'),total,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
-      ${radio('status','active',tr('filter_status_active'),active,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
-      ${radio('status','inactive',tr('filter_status_inactive'),total-active,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','all',tr('filter_all'),sStatusAll,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','active',tr('filter_status_active'),sActive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','inactive',tr('filter_status_inactive'),sInactive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_quality')}</div>
-      ${radio('quality','all',tr('filter_all'),total,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','all',tr('filter_all'),qAll,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
       ${radio('quality','excellent',tr('quality_excellent'),qExc,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
       ${radio('quality','enrich',tr('quality_enrich'),qEnr,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
       ${radio('quality','broken',tr('quality_broken'),qBro,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_usage')}</div>
-      ${radio('usage','all',tr('filter_all'),total,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
-      ${radio('usage','top',tr('filter_usage_top'),Math.min(10,usageRecent),SKILL_USAGE_FILTER,'setSkillUsageFilter')}
-      ${radio('usage','recent',tr('filter_usage_recent'),usageRecent,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','all',tr('filter_all'),usageAll,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','top',tr('filter_usage_top'),usageTopCount,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','recent',tr('filter_usage_recent'),usageRecentCount,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
       ${radio('usage','never',tr('filter_usage_never'),usageNever,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_source')}</div>
-      ${radio('source','all',tr('filter_all'),total,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','all',tr('filter_all'),sourceAll,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
       ${radio('source','user',tr('skill_filter_mine'),userCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
       ${radio('source','plugin',tr('skill_filter_plugins'),pluginCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('category_filter')}</div>
-      <button onclick="setSkillCatFilter('')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${!SKILL_CAT_FILTER?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${tr('skill_filter_all_cats')}</span><span class="text-xs ${!SKILL_CAT_FILTER?'opacity-80':'text-stone-400'}">${total}</span></button>
-      ${catEntries.map(([c,n])=>`<button onclick="setSkillCatFilter('${escAttr(c)}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${SKILL_CAT_FILTER===c?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span class="truncate">${escAttr(c)}</span><span class="text-xs ${SKILL_CAT_FILTER===c?'opacity-80':'text-stone-400'} ml-2 shrink-0">${n}</span></button>`).join('')}
+      <button onclick="setSkillCatFilter('')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${!SKILL_CAT_FILTER?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${tr('skill_filter_all_cats')}</span><span class="text-xs ${!SKILL_CAT_FILTER?'opacity-80':'text-stone-400'}">${catAll}</span></button>
+      ${catEntries.map(([c,n])=>{
+        const isActive = SKILL_CAT_FILTER===c;
+        const isZero = n === 0 && !isActive;
+        return `<button onclick="setSkillCatFilter('${escAttr(c)}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="truncate">${escAttr(c)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'} ml-2 shrink-0">${n}</span></button>`;
+      }).join('')}
     </div>
   `;
 }
