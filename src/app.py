@@ -4662,6 +4662,7 @@ fr: {
   repair_skill_retry_after_login: "Je suis loggé, génère la description",
   repair_skill_preview_label: "Apercu actuel du SKILL.md",
   loading: "Chargement...",
+  saving: "Sauvegarde...",
   filter_usage: "Usage (30j)",
   filter_usage_top: "Top 10",
   filter_usage_recent: "Utilisés",
@@ -4950,6 +4951,7 @@ en: {
   repair_skill_retry_after_login: "I'm logged in, generate the description",
   repair_skill_preview_label: "Current SKILL.md preview",
   loading: "Loading...",
+  saving: "Saving...",
   filter_usage: "Usage (30d)",
   filter_usage_top: "Top 10",
   filter_usage_recent: "Used",
@@ -5703,7 +5705,12 @@ async function saveRepairSkill(){
   const desc = document.getElementById('repair-skill-desc').value.trim();
   if (!desc) { banner('red', tr('repair_skill_desc_required')); return; }
   const btn = document.getElementById('repair-skill-save-btn');
+  // v1.9.7 - feedback visuel pendant la sauvegarde. Sans label change,
+  // le delai (write file + zip backup + reload state) faisait croire
+  // a un bug parce que le bouton restait fige.
+  const orig = btn.innerHTML;
   btn.disabled = true;
+  btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span> ' + tr('saving');
   try {
     const j = await api('/api/repair-skill', {name: CURRENT_REPAIR_SKILL, description: desc});
     banner(j.success ? 'green' : 'red', j.message);
@@ -5714,6 +5721,7 @@ async function saveRepairSkill(){
     }
   } finally {
     btn.disabled = false;
+    btn.innerHTML = orig;
   }
 }
 async function restartMcp(name){
