@@ -3831,6 +3831,25 @@ def _plugin_root(install_path):
     return p
 
 
+def _read_plugin_mcp_servers(install_path):
+    """Lit le .mcp.json d'un plugin et retourne un dict {name: server_def}.
+    Cherche dans <install>/.mcp.json puis <install>/.claude-plugin/.mcp.json.
+    Retourne {} si rien trouve / parse error."""
+    p = Path(install_path)
+    if not p.exists():
+        return {}
+    for mf in (p / ".mcp.json", p / ".claude-plugin/.mcp.json"):
+        if mf.is_file():
+            try:
+                data = json.loads(mf.read_text())
+            except Exception:
+                continue
+            servers = data.get("mcpServers", data) if isinstance(data, dict) else {}
+            if isinstance(servers, dict):
+                return {k: v for k, v in servers.items() if isinstance(v, dict)}
+    return {}
+
+
 def _scan_plugin_contents(install_path):
     p = Path(install_path)
     if not p.exists():
@@ -3841,17 +3860,19 @@ def _scan_plugin_contents(install_path):
     for sd in candidates_skills:
         if sd.is_dir():
             skills.extend(sorted(d.name for d in sd.iterdir() if d.is_dir() and not d.name.startswith(".")))
-    candidates_mcp = [p / ".mcp.json", p / ".claude-plugin/.mcp.json"]
-    mcps = []
-    for mf in candidates_mcp:
-        if mf.is_file():
-            try:
-                data = json.loads(mf.read_text())
-                servers = data.get("mcpServers", data) if isinstance(data, dict) else {}
-                if isinstance(servers, dict):
-                    mcps.extend(sorted(servers.keys()))
-            except Exception:
-                pass
+    servers = _read_plugin_mcp_servers(install_path)
+    # v1.11.0 - on annote chaque MCP plugin avec son etat 'bridged' (deja
+    # present dans claude_desktop_config.json -> Claude Desktop le charge).
+    # Permet a l'UI d'afficher soit un bouton 'Ajouter a Claude Desktop'
+    # soit un badge 'Deja dans Claude Desktop'.
+    cd_names = set()
+    try:
+        cd_config = load_config()
+        for bucket in ("mcpServers", "_disabledMcps"):
+            cd_names.update(cd_config.get(bucket, {}).keys())
+    except Exception:
+        pass
+    mcps = [{"name": n, "bridged": n in cd_names} for n in sorted(servers.keys())]
     cmd_dir = p / "commands"
     commands = sorted(f.stem for f in cmd_dir.glob("*.md")) if cmd_dir.is_dir() else []
     hooks_count = 0
@@ -3869,6 +3890,43 @@ def _scan_plugin_contents(install_path):
     return {"skills_count": len(skills), "mcp_count": len(mcps),
             "commands_count": len(commands), "hooks_count": hooks_count,
             "skills": skills, "mcps": mcps, "commands": commands, "missing": False}
+
+
+def bridge_plugin_mcp_to_desktop(full_name, mcp_name):
+    """v1.11.0 - Copie la definition d'un MCP declare par un plugin Claude
+    Code dans claude_desktop_config.json, pour que Claude Desktop le charge
+    aussi. Le plugin garde la sienne (lecture seule cote plugin). Backup
+    horodate de claude_desktop_config.json via save_config.
+
+    Refus si :
+      - plugin / MCP introuvable
+      - un MCP du meme nom existe deja dans claude_desktop_config.json
+        (mcpServers ou _disabledMcps)
+    """
+    if not full_name or not mcp_name:
+        return False, "Nom de plugin et nom de MCP requis"
+    installed = _load_installed_plugins()
+    if full_name not in installed:
+        return False, f"Plugin '{full_name}' introuvable"
+    entries = installed[full_name]
+    if not isinstance(entries, list) or not entries:
+        return False, f"Plugin '{full_name}' sans entree valide"
+    install_path = entries[0].get("installPath", "") if isinstance(entries[0], dict) else ""
+    servers = _read_plugin_mcp_servers(install_path)
+    if mcp_name not in servers:
+        return False, f"MCP '{mcp_name}' introuvable dans le plugin '{full_name}'"
+    server_def = servers[mcp_name]
+    config = load_config()
+    for bucket in ("mcpServers", "_disabledMcps"):
+        if mcp_name in config.get(bucket, {}):
+            return False, (f"Un MCP nomme '{mcp_name}' existe deja dans "
+                           f"claude_desktop_config.json. Renomme ou supprime "
+                           f"l'existant avant de bridger celui du plugin.")
+    config.setdefault("mcpServers", {})[mcp_name] = server_def
+    save_config(config)
+    return True, (f"MCP '{mcp_name}' du plugin '{full_name}' ajoute a "
+                  f"claude_desktop_config.json. Redemarre Claude Desktop "
+                  f"pour qu'il le charge.")
 
 
 def _split_plugin_name(full_name):
@@ -4564,6 +4622,12 @@ fr: {
   plugin_install_path_missing: "install path manquant",
   plugin_empty: "vide",
   plugin_no_content: "Aucun contenu détecté.",
+  plugin_mcp_cli_tooltip: "MCP fourni par ce plugin Claude Code (CLI). Pas chargé par Claude Desktop tant qu'il n'est pas ajouté à claude_desktop_config.json.",
+  plugin_mcp_bridge_btn: "Ajouter à Claude Desktop",
+  plugin_mcp_bridge_tooltip: "Copier la définition de ce MCP dans claude_desktop_config.json pour que Claude Desktop le charge aussi (en plus de Claude Code CLI). Backup horodaté créé.",
+  plugin_mcp_bridged_badge: "dans Claude Desktop",
+  plugin_mcp_bridged_tooltip: "Ce MCP est déjà présent dans claude_desktop_config.json — Claude Desktop le charge.",
+  confirm_bridge_plugin_mcp: "Copier le MCP « {mcp} » dans claude_desktop_config.json ?\n\nClaude Desktop le chargera après son prochain redémarrage. Le plugin garde sa propre définition (le MCP reste aussi dispo dans Claude Code CLI). Un backup horodaté est créé.",
   empty_capture: "(vide)",
   commands: "Commands",
   commands_help: "Commands utilisateur (~/.claude/commands/) et fournies par les plugins actifs",
@@ -4857,6 +4921,12 @@ en: {
   plugin_install_path_missing: "install path missing",
   plugin_empty: "empty",
   plugin_no_content: "No content detected.",
+  plugin_mcp_cli_tooltip: "MCP provided by this Claude Code (CLI) plugin. Not loaded by Claude Desktop until added to claude_desktop_config.json.",
+  plugin_mcp_bridge_btn: "Add to Claude Desktop",
+  plugin_mcp_bridge_tooltip: "Copy this MCP's definition into claude_desktop_config.json so Claude Desktop loads it too (alongside Claude Code CLI). A timestamped backup is created.",
+  plugin_mcp_bridged_badge: "in Claude Desktop",
+  plugin_mcp_bridged_tooltip: "This MCP is already present in claude_desktop_config.json — Claude Desktop loads it.",
+  confirm_bridge_plugin_mcp: "Copy the MCP \"{mcp}\" into claude_desktop_config.json?\n\nClaude Desktop will load it after its next restart. The plugin keeps its own definition (the MCP also stays available in Claude Code CLI). A timestamped backup is created.",
   empty_capture: "(empty)",
   commands: "Commands",
   commands_help: "User commands (~/.claude/commands/) and those provided by active plugins",
@@ -5689,18 +5759,38 @@ function filterSkills(){
 function pluginContentBadge(c){
   const parts = [];
   if(c.skills_count) parts.push(c.skills_count + ' skill' + (c.skills_count>1?'s':''));
-  if(c.mcp_count) parts.push(c.mcp_count + ' MCP' + (c.mcp_count>1?'s':''));
+  if(c.mcp_count){
+    const mcpLabel = c.mcp_count + ' MCP' + (c.mcp_count>1?'s':'');
+    parts.push(`<span title="${escAttr(tr('plugin_mcp_cli_tooltip'))}" class="cursor-help underline decoration-dotted">${mcpLabel}</span>`);
+  }
   if(c.commands_count) parts.push(c.commands_count + ' command' + (c.commands_count>1?'s':''));
   if(c.hooks_count) parts.push(c.hooks_count + ' hook' + (c.hooks_count>1?'s':''));
   if(c.missing) parts.push(tr('plugin_install_path_missing'));
   return parts.length ? parts.join(' &middot; ') : tr('plugin_empty');
 }
-function pluginDetailHtml(c){
+function _renderPluginMcpChip(fn, m){
+  // v1.11.0 - chaque MCP plugin est rendu avec soit un badge 'deja dans CD'
+  // (m.bridged === true) soit un bouton 'Ajouter a CD' qui appelle
+  // /api/bridge-plugin-mcp pour copier la definition.
+  const name = (typeof m === 'string') ? m : (m && m.name) || '';
+  const bridged = (typeof m === 'object' && m && m.bridged === true);
+  if(bridged){
+    return `<span class="text-xs bg-green-50 border border-green-200 text-green-800 px-2 py-0.5 rounded inline-flex items-center gap-1" title="${escAttr(tr('plugin_mcp_bridged_tooltip'))}">${escAttr(name)} <span class="text-[10px]">&#10003; ${tr('plugin_mcp_bridged_badge')}</span></span>`;
+  }
+  return `<span class="text-xs bg-stone-100 px-2 py-0.5 rounded inline-flex items-center gap-1">${escAttr(name)} <button type="button" onclick="bridgePluginMcp('${fn}','${escAttr(name)}')" class="text-[10px] text-emerald-700 hover:text-emerald-900 hover:underline font-medium" title="${escAttr(tr('plugin_mcp_bridge_tooltip'))}">+ ${tr('plugin_mcp_bridge_btn')}</button></span>`;
+}
+function pluginDetailHtml(c, fn){
   const sections = [];
   if(c.skills && c.skills.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Skills</span><div class="mt-1 flex flex-wrap gap-1.5">${c.skills.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">${escAttr(s)}</span>`).join('')}</div></div>`);
-  if(c.mcps && c.mcps.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">MCPs</span><div class="mt-1 flex flex-wrap gap-1.5">${c.mcps.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">${escAttr(s)}</span>`).join('')}</div></div>`);
+  if(c.mcps && c.mcps.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">MCPs</span><div class="mt-1 flex flex-wrap gap-1.5">${c.mcps.map(m=>_renderPluginMcpChip(fn, m)).join('')}</div><div class="mt-1.5 text-[11px] text-stone-500 italic">${tr('plugin_mcp_cli_tooltip')}</div></div>`);
   if(c.commands && c.commands.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Commands</span><div class="mt-1 flex flex-wrap gap-1.5">${c.commands.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">/${escAttr(s)}</span>`).join('')}</div></div>`);
   return sections.length ? `<div class="mt-3 pt-3 border-t border-stone-100 space-y-3">${sections.join('')}</div>` : `<div class="mt-3 pt-3 border-t border-stone-100 text-xs text-stone-400">${tr('plugin_no_content')}</div>`;
+}
+async function bridgePluginMcp(pluginFullName, mcpName){
+  if(!confirm(tr('confirm_bridge_plugin_mcp').split('{mcp}').join(mcpName))) return;
+  const j = await api('/api/bridge-plugin-mcp', {plugin: pluginFullName, mcp: mcpName});
+  banner(j.success?'green':'red', j.message);
+  if(j.success){ loadPlugins(); loadState(); loadOverview(); }
 }
 async function loadPlugins(){
   try{
@@ -5735,7 +5825,7 @@ ${orphans}
 </button>
 <button type="button" onclick="event.stopPropagation();deletePlugin('${fn}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>
 </div>
-<div id="pl-detail-${fn}" class="hidden">${pluginDetailHtml(p.contents||{})}</div>
+<div id="pl-detail-${fn}" class="hidden">${pluginDetailHtml(p.contents||{}, fn)}</div>
 </div>`;
     }).join('');
   }catch(e){console.error(e);}
@@ -6757,6 +6847,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/toggle-extension": lambda: toggle_extension(data.get("name", ""), data.get("enabled")),
             "/api/delete-plugin": lambda: delete_plugin(data.get("name", ""), bool(data.get("delete_files", False))),
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
+            "/api/bridge-plugin-mcp": lambda: bridge_plugin_mcp_to_desktop(data.get("plugin", ""), data.get("mcp", "")),
             "/api/watchdog-config": lambda: save_watchdog_config(data),
             "/api/scan-process": lambda: (True, scan_processes(data.get("pattern", ""))),
         }
