@@ -2930,15 +2930,27 @@ def get_skill_usage(days=30):
                     # v1.10.4 - track tous les tool names pour le diag
                     if name:
                         tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
-                    if name != "Skill":
-                        continue
+                    # v1.10.7 - real fix : on cherche les Read de SKILL.md
+                    # comme proxy d'invocation. Claude Code moderne n'a plus
+                    # de tool 'Skill' -> les skills sont charges via Read
+                    # quand Claude les utilise. Pattern :
+                    # ~/.claude/skills/<NAME>/SKILL.md ou
+                    # .claude/skills/<NAME>/SKILL.md (dans args.path / file_path).
                     inp = block.get("input", {})
                     if not isinstance(inp, dict):
                         continue
-                    skill = inp.get("skill") or inp.get("name")
-                    if not skill:
-                        continue
-                    counts[str(skill)] = counts.get(str(skill), 0) + 1
+                    if name in ("Read", "mcp__1d4a6474-72c9-4934-a111-78a5ca57d3dd__read_file_content"):
+                        path = inp.get("file_path") or inp.get("path") or ""
+                        m = re.search(r"\.claude/skills/([^/]+)/SKILL\.md", path)
+                        if m:
+                            sk = m.group(1)
+                            counts[sk] = counts.get(sk, 0) + 1
+                            continue
+                    # Legacy : tool 'Skill' direct (vieux Claude Code)
+                    if name == "Skill":
+                        skill = inp.get("skill") or inp.get("name")
+                        if skill:
+                            counts[str(skill)] = counts.get(str(skill), 0) + 1
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     tool_ranked = sorted(tool_name_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
     return {
@@ -4603,7 +4615,7 @@ fr: {
   top_skills_30d: "Top skills (30 derniers jours)",
   sessions: "sessions",
   files: "fichiers",
-  no_skill_usage_yet: "Aucune activation de skill détectée dans tes logs ({n} fichier(s) scanné(s)). Une fois que Claude Code commence à utiliser tes skills, le classement apparaîtra ici.",
+  no_skill_usage_yet: "Tracking d'usage limité : Claude Code récent ne logge pas les invocations Skill comme un tool dédié. On les détecte uniquement via les Read explicites de SKILL.md (couvre une partie des cas, pas tous). {n} fichier(s) scanné(s), aucune invocation traçable.",
   used_x_times: "Utilisé {n} fois ces 30 derniers jours",
   skill_suggestions: "Suggestions d'optimisation",
   fallback_no_usage: "heuristiques uniquement (pas de données d'usage)",
@@ -4896,7 +4908,7 @@ en: {
   top_skills_30d: "Top skills (last 30 days)",
   sessions: "sessions",
   files: "files",
-  no_skill_usage_yet: "No skill activations detected in your logs ({n} file(s) scanned). Once Claude Code starts using your skills, the ranking will appear here.",
+  no_skill_usage_yet: "Limited usage tracking: recent Claude Code does not log Skill invocations as a dedicated tool. We only detect explicit Reads of SKILL.md (partial coverage). {n} file(s) scanned, no traceable invocation.",
   used_x_times: "Used {n} times in the last 30 days",
   skill_suggestions: "Optimization suggestions",
   fallback_no_usage: "heuristics only (no usage data)",
