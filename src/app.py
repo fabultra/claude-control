@@ -4089,6 +4089,10 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <button onclick="openAddPlugin()" class="text-xs text-stone-700 hover:text-stone-900 font-medium" data-i18n="plugin_add_btn">+ Ajouter un plugin (Git)</button>
 </div>
 <p class="text-xs text-stone-500 mb-3" data-i18n="plugins_help">Plugins Claude Code installés via marketplace</p>
+<div class="mb-3 p-3 rounded-lg bg-stone-50 border border-stone-200 text-xs text-stone-600 leading-relaxed">
+<strong>&#8505; <span data-i18n="plugins_explainer_title">Pas de Start/Stop/Restart sur les plugins</span></strong>
+<p class="mt-1" data-i18n-html="plugins_explainer_body">Un plugin n'est pas un process - c'est un bundle (manifest JSON + fichiers) qui peut <em>contenir</em> des MCPs, skills, commands, hooks. Pour relancer un MCP fourni par un plugin, retrouve-le dans la tab <strong>Serveurs MCP</strong> avec ses boutons Stop/Démarrer/Redémarrer dédiés. La case à cocher ici contrôle uniquement si le plugin est <em>enabled</em> dans <code>~/.claude/settings.json</code>.</p>
+</div>
 <input id="plugins-search" type="search" oninput="filterPlugins()" data-i18n-placeholder="plugins_search_placeholder" placeholder="Rechercher un plugin..." class="w-full mb-3 p-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:border-stone-400"/>
 <div id="plugins" class="space-y-2 max-h-[700px] overflow-y-auto"></div>
 </section>
@@ -4325,6 +4329,8 @@ fr: {
   plugins: "Plugins",
   plugins_meta: "Lecture seule · toggle persistant dans settings.json",
   plugins_help: "Plugins Claude Code installés via marketplace",
+  plugins_explainer_title: "Pas de Start/Stop/Restart sur les plugins",
+  plugins_explainer_body: "Un plugin n'est pas un process - c'est un bundle (manifest JSON + fichiers) qui peut <em>contenir</em> des MCPs, skills, commands, hooks. Pour relancer un MCP fourni par un plugin, retrouve-le dans la tab <strong>Serveurs MCP</strong> avec ses boutons Stop/Démarrer/Redémarrer dédiés. La case à cocher ici contrôle uniquement si le plugin est <em>enabled</em> dans <code>~/.claude/settings.json</code>.",
   plugins_empty: "Aucun plugin installé.",
   add_mcp: "+ Ajouter un MCP",
   add_mcp_help: "JSON, fichier local ou repo Git",
@@ -4600,6 +4606,8 @@ en: {
   plugins: "Plugins",
   plugins_meta: "Read-only · toggle persistent in settings.json",
   plugins_help: "Claude Code plugins installed via marketplace",
+  plugins_explainer_title: "No Start/Stop/Restart on plugins",
+  plugins_explainer_body: "A plugin is not a process - it's a bundle (JSON manifest + files) that can <em>contain</em> MCPs, skills, commands, hooks. To restart an MCP provided by a plugin, find it in the <strong>MCP servers</strong> tab with its dedicated Stop/Start/Restart buttons. The checkbox here only controls whether the plugin is <em>enabled</em> in <code>~/.claude/settings.json</code>.",
   plugins_empty: "No plugin installed.",
   add_mcp: "+ Add an MCP",
   add_mcp_help: "JSON, local file or Git repo",
@@ -4869,6 +4877,10 @@ function applyLang(lang){
   localStorage.setItem('cc-lang', lang);
   document.documentElement.lang = lang;
   document.querySelectorAll('[data-i18n]').forEach(el=>{const k=el.getAttribute('data-i18n'); if(T[lang][k]!==undefined) el.textContent = T[lang][k];});
+  // v1.9.1 - data-i18n-html : pour les strings qui contiennent du HTML inline
+  // (ex. <strong>, <em>, <code> dans les explainers). Utilise innerHTML au
+  // lieu de textContent. A reserver aux strings de notre code (pas user input).
+  document.querySelectorAll('[data-i18n-html]').forEach(el=>{const k=el.getAttribute('data-i18n-html'); if(T[lang][k]!==undefined) el.innerHTML = T[lang][k];});
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{const k=el.getAttribute('data-i18n-placeholder'); if(T[lang][k]!==undefined) el.placeholder = T[lang][k];});
   document.querySelectorAll('[data-i18n-title]').forEach(el=>{const k=el.getAttribute('data-i18n-title'); if(T[lang][k]!==undefined) el.title = T[lang][k];});
   ['fr','en'].forEach(l=>{const b=document.getElementById('lang-'+l); if(b){b.classList.toggle('active', l===lang);}});
