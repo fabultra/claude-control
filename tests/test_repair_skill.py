@@ -227,6 +227,43 @@ class SuggestSkillDescriptionTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Timeout", msg)
 
+    def test_lang_fr_adds_french_directive(self):
+        """v1.9.6 - le param lang='fr' doit ajouter une directive
+        'Respond in French' dans le system prompt envoye au CLI."""
+        captured = {}
+        def fake_call(prompt, timeout=60):
+            captured["prompt"] = prompt
+            return "Utilise ce skill pour traiter les factures."
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with patch.object(app, "_call_claude_cli", fake_call):
+                ok, payload = app.suggest_skill_description("demo", lang="fr")
+        self.assertTrue(ok, payload)
+        self.assertIn("Respond in French", captured["prompt"])
+        self.assertEqual(payload["lang"], "fr")
+
+    def test_lang_en_adds_english_directive(self):
+        captured = {}
+        def fake_call(prompt, timeout=60):
+            captured["prompt"] = prompt
+            return "Use this skill for invoices."
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with patch.object(app, "_call_claude_cli", fake_call):
+                ok, payload = app.suggest_skill_description("demo", lang="en")
+        self.assertTrue(ok)
+        self.assertIn("Respond in English", captured["prompt"])
+
+    def test_lang_none_leaves_prompt_untouched(self):
+        """Si lang=None (defaut), pas de directive de langue ajoutee."""
+        captured = {}
+        def fake_call(prompt, timeout=60):
+            captured["prompt"] = prompt
+            return "anything"
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+            with patch.object(app, "_call_claude_cli", fake_call):
+                app.suggest_skill_description("demo")
+        self.assertNotIn("Respond in French", captured["prompt"])
+        self.assertNotIn("Respond in English", captured["prompt"])
+
     def test_detects_not_logged_in(self):
         """v1.9.5 - cas reel observe : le CLI exit 1 avec stdout
         'Not logged in / Please run /login'. On detecte ce pattern et

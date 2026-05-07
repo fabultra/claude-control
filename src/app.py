@@ -395,19 +395,15 @@ _SUGGEST_SYSTEM_PROMPT = (
 )
 
 
-def suggest_skill_description(name, body_max_chars=4000):
-    """v1.9.3 - Genere une description suggeree pour un skill via le CLI
-    Claude Code (subprocess `claude -p ...`). Pas de cle API necessaire :
-    le CLI utilise l'OAuth deja configure de Claude Code (abonnement
-    Pro/Max ou usage prepaid). Sonnet par defaut donc qualite > Haiku.
+def suggest_skill_description(name, body_max_chars=4000, lang=None):
+    """v1.9.3 / v1.9.6 - Genere une description suggeree pour un skill via
+    le CLI Claude Code.
 
-    Garde-fou : on tronque le body envoye a body_max_chars (defaut 4000)
-    pour limiter le risque de re-declencher Bug Type B (read_file > 25k
-    chars).
-
-    Retourne (ok, msg_or_dict) :
-      - ok=True : msg = {"suggestion": str, "source": "claude_cli", "chars_sent": int}
-      - ok=False : msg = string d'erreur
+    v1.9.6 : ajout du parametre `lang` ('fr'|'en'|None). Le system prompt
+    inclut une directive 'Respond in {lang}' pour que la suggestion match
+    la langue voulue par l'utilisateur (par defaut, langue de l'UI Claude
+    Control). Sans lang, le LLM suit ses propres instincts (souvent EN
+    parce que le system prompt est en anglais).
     """
     if not name:
         return False, "Nom de skill requis"
@@ -432,15 +428,19 @@ def suggest_skill_description(name, body_max_chars=4000):
         content = ""
     if len(content) > body_max_chars:
         content = content[:body_max_chars] + "\n\n[...truncated]"
-    # v1.9.3 - on combine system + user en un seul prompt pour le CLI
-    # (qui n'a pas de --system-prompt). Le CLI pipe son output sur stdout.
+    # v1.9.6 - directive de langue dans le system prompt si lang fourni.
+    lang_directive = ""
+    if lang == "fr":
+        lang_directive = "\n\nIMPORTANT: Respond in French (Francais)."
+    elif lang == "en":
+        lang_directive = "\n\nIMPORTANT: Respond in English."
     prompt = (
-        _SUGGEST_SYSTEM_PROMPT + "\n\n"
+        _SUGGEST_SYSTEM_PROMPT + lang_directive + "\n\n"
         f"Skill name (folder): {name}\n\n"
         f"SKILL.md content:\n```\n{content}\n```\n\n"
         f"Generate the description string."
     )
-    _log(f"suggest_skill_description: name={name} chars_sent={len(content)}")
+    _log(f"suggest_skill_description: name={name} chars_sent={len(content)} lang={lang}")
     try:
         raw_response = _call_claude_cli(prompt)
     except ClaudeCliNotLoggedIn as e:
@@ -513,6 +513,7 @@ def suggest_skill_description(name, body_max_chars=4000):
         "source": "claude_cli",
         "chars_sent": len(content),
         "raw_chars": len(raw_response or ""),
+        "lang": lang,
     }
 
 
@@ -4203,9 +4204,15 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <div class="mb-3">
 <label class="block text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1" data-i18n="repair_skill_desc_label">Description</label>
 <textarea id="repair-skill-desc" class="w-full p-2 border border-stone-300 rounded-lg text-sm font-sans" rows="3" data-i18n-placeholder="repair_skill_desc_placeholder" placeholder="Decris quand Claude doit utiliser ce skill (40-150 chars)"></textarea>
-<div class="flex justify-between items-center mt-1">
+<div class="flex justify-between items-center mt-1 flex-wrap gap-2">
 <span id="repair-skill-desc-count" class="text-[10px] text-stone-400 font-mono">0</span>
+<div class="flex items-center gap-2">
+<div class="inline-flex rounded border border-stone-200 overflow-hidden text-[10px]" title="Langue de la description generee">
+<button type="button" id="repair-skill-lang-fr" onclick="setRepairSuggestLang('fr')" class="px-2 py-0.5 text-stone-700 hover:bg-stone-100">FR</button>
+<button type="button" id="repair-skill-lang-en" onclick="setRepairSuggestLang('en')" class="px-2 py-0.5 text-stone-700 hover:bg-stone-100 border-l border-stone-200">EN</button>
+</div>
 <button id="repair-skill-suggest-btn" onclick="suggestSkillDescription()" class="text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-2 py-1"><span data-i18n="repair_skill_suggest_btn">Suggerer via Claude Code</span></button>
+</div>
 </div>
 <div id="repair-skill-suggest-meta" class="text-[10px] text-stone-500 mt-1 hidden"></div>
 </div>
@@ -4651,6 +4658,8 @@ fr: {
   btn_copy: "Copier",
   btn_open_terminal: "Ouvrir Terminal",
   copied: "Commande copiee",
+  repair_skill_login_pending_hint: "Une fois 'Login successful' affiche dans Terminal, clique ci-dessous pour generer la description :",
+  repair_skill_retry_after_login: "Je suis loggé, génère la description",
   repair_skill_preview_label: "Apercu actuel du SKILL.md",
   loading: "Chargement...",
   filter_usage: "Usage (30j)",
@@ -4937,6 +4946,8 @@ en: {
   btn_copy: "Copy",
   btn_open_terminal: "Open Terminal",
   copied: "Command copied",
+  repair_skill_login_pending_hint: "Once 'Login successful' shows in Terminal, click below to generate the description:",
+  repair_skill_retry_after_login: "I'm logged in, generate the description",
   repair_skill_preview_label: "Current SKILL.md preview",
   loading: "Loading...",
   filter_usage: "Usage (30d)",
@@ -5497,12 +5508,32 @@ async function deleteSkill(name){
 // _call_anthropic_messages cote backend (Haiku 4.5, opt-in via env
 // ANTHROPIC_API_KEY ou ~/.claude/claude-control-anthropic-key).
 let CURRENT_REPAIR_SKILL = null;
+let REPAIR_SUGGEST_LANG = null;  // v1.9.6 - null = follow CURRENT_LANG, sinon override
+function setRepairSuggestLang(lang){
+  REPAIR_SUGGEST_LANG = lang;
+  _updateRepairLangToggleUI();
+}
+function _updateRepairLangToggleUI(){
+  const active = REPAIR_SUGGEST_LANG || CURRENT_LANG || 'fr';
+  ['fr','en'].forEach(l=>{
+    const btn = document.getElementById('repair-skill-lang-'+l);
+    if(!btn) return;
+    if(l === active){
+      btn.classList.add('bg-stone-900','text-white');
+      btn.classList.remove('text-stone-700','hover:bg-stone-100');
+    } else {
+      btn.classList.remove('bg-stone-900','text-white');
+      btn.classList.add('text-stone-700','hover:bg-stone-100');
+    }
+  });
+}
 async function openRepairSkill(name){
   CURRENT_REPAIR_SKILL = name;
   document.getElementById('repair-skill-name').textContent = name;
   document.getElementById('repair-skill-desc').value = '';
   document.getElementById('repair-skill-desc-count').textContent = '0';
   document.getElementById('repair-skill-suggest-meta').classList.add('hidden');
+  _updateRepairLangToggleUI();
   document.getElementById('repair-skill-preview').textContent = tr('loading') || 'Loading...';
   document.getElementById('repair-skill-modal').classList.remove('hidden');
   // Set up live counter
@@ -5549,9 +5580,23 @@ function closeRepairSkill(){
 }
 async function openTerminalForLogin(){
   // v1.9.5 - ouvre Terminal.app en pre-tapant 'claude /login' via le
-  // backend (osascript). L'utilisateur n'a qu'a appuyer sur Enter.
+  // backend. v1.9.6 : apres ouverture, on remplace la zone meta par
+  // un appel a l'action 'Une fois loggé, clique pour reessayer' avec
+  // un gros bouton vert. Plus de devinette pour l'utilisateur.
   const j = await api('/api/open-terminal-claude-login', {});
   banner(j.success ? 'green' : 'red', j.message);
+  if(!j.success) return;
+  const meta = document.getElementById('repair-skill-suggest-meta');
+  meta.classList.remove('hidden');
+  meta.className = 'text-xs mt-2';
+  meta.innerHTML = `
+    <div class="p-2 rounded bg-amber-50 border border-amber-200">
+      <p class="text-stone-700 mb-2">${tr('repair_skill_login_pending_hint')}</p>
+      <button onclick="suggestSkillDescription()" class="text-xs font-medium text-white bg-green-700 hover:bg-green-800 rounded px-3 py-1.5">
+        &#10003; ${tr('repair_skill_retry_after_login')}
+      </button>
+    </div>
+  `;
 }
 async function diagClaudeCli(){
   // v1.9.4 - diag du CLI Claude Code, expose path + version + sanity check
@@ -5588,9 +5633,11 @@ async function suggestSkillDescription(){
   btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span> ' + tr('repair_skill_suggesting');
   setMeta(tr('repair_skill_suggesting'), 'gray');
   try {
+    // v1.9.6 - lang : par defaut langue UI, override via REPAIR_SUGGEST_LANG si toggle utilise
+    const lang = (typeof REPAIR_SUGGEST_LANG !== 'undefined' && REPAIR_SUGGEST_LANG) || CURRENT_LANG || 'fr';
     const r = await fetch('/api/suggest-skill-description', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: CURRENT_REPAIR_SKILL}),
+      body: JSON.stringify({name: CURRENT_REPAIR_SKILL, lang: lang}),
     });
     const j = await r.json();
     console.log('[repair] suggest response:', j);  // debug visibility
@@ -6401,7 +6448,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/save-settings": lambda: save_settings(data.get("content", "")),
             "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
             "/api/repair-skill": lambda: repair_skill(data.get("name", ""), data.get("description"), data.get("name_override")),
-            "/api/suggest-skill-description": lambda: suggest_skill_description(data.get("name", "")),
+            "/api/suggest-skill-description": lambda: suggest_skill_description(data.get("name", ""), lang=data.get("lang")),
             "/api/delete-user-skill-duplicates": lambda: delete_user_skill_duplicates(),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
             "/api/delete-extension": lambda: delete_extension(data.get("name", "")),
