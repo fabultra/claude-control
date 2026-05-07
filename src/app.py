@@ -396,8 +396,9 @@ def suggest_skill_description(name, body_max_chars=4000):
         f"SKILL.md content:\n```\n{content}\n```\n\n"
         f"Generate the description string."
     )
+    _log(f"suggest_skill_description: name={name} chars_sent={len(content)}")
     try:
-        suggestion = _call_anthropic_messages(
+        raw_response = _call_anthropic_messages(
             api_key, _SUGGEST_SYSTEM_PROMPT, user_msg,
         )
     except urllib.error.HTTPError as e:
@@ -405,16 +406,60 @@ def suggest_skill_description(name, body_max_chars=4000):
             err_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             err_body = ""
+        _log(f"suggest_skill_description: HTTP {e.code} body={err_body[:500]}")
         return False, f"API Anthropic HTTP {e.code} : {err_body[:300]}"
     except Exception as e:
-        return False, f"Erreur appel API : {e}"
-    suggestion = suggestion.strip().strip('"').strip("'").strip()
+        _log(f"suggest_skill_description: exception {type(e).__name__} : {e}")
+        return False, f"Erreur appel API ({type(e).__name__}) : {e}"
+    _log(f"suggest_skill_description: raw response len={len(raw_response or '')} preview={(raw_response or '')[:200]!r}")
+    # v1.9.2 - sanitize plus agressif. Haiku peut retourner :
+    # - du markdown (## prefix, **bold**, > quote, * list)
+    # - des prefixes 'Description:', 'Here is the description:'
+    # - des quotes triple ou single
+    # - du preamble multi-ligne ('Sure! Here is...\n\nUse this skill for X')
+    # On nettoie chaque ligne puis on prend la plus longue / la plus
+    # substantive (heuristique : la 'vraie' description est generalement
+    # la ligne la plus longue dans la reponse).
+    def _strip_line(s):
+        s = s.strip()
+        while s and s[0] in '#>*-':
+            s = s.lstrip('#>*- ').strip()
+        for prefix in ("Description:", "description:", "Here's the description:",
+                       "Here is the description:", "Suggested description:"):
+            if s.lower().startswith(prefix.lower()):
+                s = s[len(prefix):].strip()
+        s = s.strip('"').strip("'").strip("`").strip()
+        return s
+
+    raw = (raw_response or "")
+    cleaned_lines = [_strip_line(ln) for ln in raw.splitlines()]
+    cleaned_lines = [ln for ln in cleaned_lines if ln]
+    if cleaned_lines:
+        # Heuristique : prefer lines that don't end with ':' (preamble) and
+        # don't start with 'Sure', 'Here', 'Of course' (filler). Sort by
+        # (is_preamble ASC, length DESC) -> first non-preamble + longest.
+        preamble_starts = ("sure", "here", "of course", "absolutely",
+                           "certainly", "yes,", "let me", "i'll", "let's")
+        def _is_preamble(line):
+            ll = line.lower().strip()
+            if ll.endswith(":"):
+                return True
+            for p in preamble_starts:
+                if ll.startswith(p):
+                    return True
+            return False
+        cleaned_lines.sort(key=lambda ln: (_is_preamble(ln), -len(ln)))
+        suggestion = cleaned_lines[0].strip()
+    else:
+        suggestion = _strip_line(raw)
     if not suggestion:
-        return False, "API a retourne une suggestion vide"
+        _log(f"suggest_skill_description: empty after sanitization (raw was {raw_response[:200]!r})")
+        return False, f"API a retourne une suggestion vide ou non parsable. Raw : {(raw_response or '')[:150]!r}"
     return True, {
         "suggestion": suggestion,
         "model": "claude-haiku-4-5-20251001",
         "chars_sent": len(content),
+        "raw_chars": len(raw_response or ""),
     }
 
 
@@ -4089,6 +4134,10 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <button onclick="openAddPlugin()" class="text-xs text-stone-700 hover:text-stone-900 font-medium" data-i18n="plugin_add_btn">+ Ajouter un plugin (Git)</button>
 </div>
 <p class="text-xs text-stone-500 mb-3" data-i18n="plugins_help">Plugins Claude Code installés via marketplace</p>
+<div class="mb-3 p-3 rounded-lg bg-stone-50 border border-stone-200 text-xs text-stone-600 leading-relaxed">
+<strong>&#8505; <span data-i18n="plugins_explainer_title">Pas de Start/Stop/Restart sur les plugins</span></strong>
+<p class="mt-1" data-i18n-html="plugins_explainer_body">Un plugin n'est pas un process - c'est un bundle (manifest JSON + fichiers) qui peut <em>contenir</em> des MCPs, skills, commands, hooks. Pour relancer un MCP fourni par un plugin, retrouve-le dans la tab <strong>Serveurs MCP</strong> avec ses boutons Stop/Démarrer/Redémarrer dédiés. La case à cocher ici contrôle uniquement si le plugin est <em>enabled</em> dans <code>~/.claude/settings.json</code>.</p>
+</div>
 <input id="plugins-search" type="search" oninput="filterPlugins()" data-i18n-placeholder="plugins_search_placeholder" placeholder="Rechercher un plugin..." class="w-full mb-3 p-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:border-stone-400"/>
 <div id="plugins" class="space-y-2 max-h-[700px] overflow-y-auto"></div>
 </section>
@@ -4325,6 +4374,8 @@ fr: {
   plugins: "Plugins",
   plugins_meta: "Lecture seule · toggle persistant dans settings.json",
   plugins_help: "Plugins Claude Code installés via marketplace",
+  plugins_explainer_title: "Pas de Start/Stop/Restart sur les plugins",
+  plugins_explainer_body: "Un plugin n'est pas un process - c'est un bundle (manifest JSON + fichiers) qui peut <em>contenir</em> des MCPs, skills, commands, hooks. Pour relancer un MCP fourni par un plugin, retrouve-le dans la tab <strong>Serveurs MCP</strong> avec ses boutons Stop/Démarrer/Redémarrer dédiés. La case à cocher ici contrôle uniquement si le plugin est <em>enabled</em> dans <code>~/.claude/settings.json</code>.",
   plugins_empty: "Aucun plugin installé.",
   add_mcp: "+ Ajouter un MCP",
   add_mcp_help: "JSON, fichier local ou repo Git",
@@ -4600,6 +4651,8 @@ en: {
   plugins: "Plugins",
   plugins_meta: "Read-only · toggle persistent in settings.json",
   plugins_help: "Claude Code plugins installed via marketplace",
+  plugins_explainer_title: "No Start/Stop/Restart on plugins",
+  plugins_explainer_body: "A plugin is not a process - it's a bundle (JSON manifest + files) that can <em>contain</em> MCPs, skills, commands, hooks. To restart an MCP provided by a plugin, find it in the <strong>MCP servers</strong> tab with its dedicated Stop/Start/Restart buttons. The checkbox here only controls whether the plugin is <em>enabled</em> in <code>~/.claude/settings.json</code>.",
   plugins_empty: "No plugin installed.",
   add_mcp: "+ Add an MCP",
   add_mcp_help: "JSON, local file or Git repo",
@@ -4869,6 +4922,10 @@ function applyLang(lang){
   localStorage.setItem('cc-lang', lang);
   document.documentElement.lang = lang;
   document.querySelectorAll('[data-i18n]').forEach(el=>{const k=el.getAttribute('data-i18n'); if(T[lang][k]!==undefined) el.textContent = T[lang][k];});
+  // v1.9.1 - data-i18n-html : pour les strings qui contiennent du HTML inline
+  // (ex. <strong>, <em>, <code> dans les explainers). Utilise innerHTML au
+  // lieu de textContent. A reserver aux strings de notre code (pas user input).
+  document.querySelectorAll('[data-i18n-html]').forEach(el=>{const k=el.getAttribute('data-i18n-html'); if(T[lang][k]!==undefined) el.innerHTML = T[lang][k];});
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{const k=el.getAttribute('data-i18n-placeholder'); if(T[lang][k]!==undefined) el.placeholder = T[lang][k];});
   document.querySelectorAll('[data-i18n-title]').forEach(el=>{const k=el.getAttribute('data-i18n-title'); if(T[lang][k]!==undefined) el.title = T[lang][k];});
   ['fr','en'].forEach(l=>{const b=document.getElementById('lang-'+l); if(b){b.classList.toggle('active', l===lang);}});
@@ -5396,27 +5453,47 @@ async function suggestSkillDescription(){
   const btn = document.getElementById('repair-skill-suggest-btn');
   if (btn.disabled) return;
   const orig = btn.innerHTML;
+  const meta = document.getElementById('repair-skill-suggest-meta');
+  // v1.9.2 - status persistant dans la modal (le banner global se dismiss
+  // trop vite et l'utilisateur croit que rien ne s'est passe). On affiche
+  // dans le meta : success + model+chars OU error en rouge persistant.
+  function setMeta(html, color){
+    meta.innerHTML = html;
+    meta.className = 'text-[10px] mt-1 ' + (color === 'red' ? 'text-red-700' : (color === 'green' ? 'text-green-700' : 'text-stone-500'));
+    meta.classList.remove('hidden');
+  }
   btn.disabled = true;
   btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span> ' + tr('repair_skill_suggesting');
+  setMeta(tr('repair_skill_suggesting'), 'gray');
   try {
     const r = await fetch('/api/suggest-skill-description', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name: CURRENT_REPAIR_SKILL}),
     });
     const j = await r.json();
+    console.log('[repair] suggest response:', j);  // debug visibility
     if (!j.success) {
-      banner('red', j.message || 'Suggestion failed');
+      const msg = j.message || 'Suggestion failed (no message)';
+      setMeta('<strong>&#9888; ' + escAttr(msg) + '</strong>', 'red');
+      banner('red', msg);
     } else {
+      const suggestion = (j.suggestion || '').trim();
+      if (!suggestion) {
+        setMeta('<strong>&#9888; API returned empty suggestion (response: ' + escAttr(JSON.stringify(j).substring(0, 200)) + ')</strong>', 'red');
+        banner('red', 'API returned empty suggestion');
+        return;
+      }
       const ta = document.getElementById('repair-skill-desc');
-      ta.value = j.suggestion || '';
+      ta.value = suggestion;
       document.getElementById('repair-skill-desc-count').textContent = String(ta.value.length);
-      const meta = document.getElementById('repair-skill-suggest-meta');
-      meta.textContent = tr('repair_skill_suggested_via').split('{model}').join(j.model || '?').split('{n}').join(j.chars_sent || 0);
-      meta.classList.remove('hidden');
+      setMeta(tr('repair_skill_suggested_via').split('{model}').join(j.model || '?').split('{n}').join(j.chars_sent || 0), 'green');
       ta.focus();
     }
   } catch(e){
-    banner('red', 'Erreur reseau : ' + e.message);
+    console.error('[repair] suggest error:', e);
+    const msg = 'Erreur reseau : ' + e.message;
+    setMeta('<strong>&#9888; ' + escAttr(msg) + '</strong>', 'red');
+    banner('red', msg);
   } finally {
     btn.disabled = false;
     btn.innerHTML = orig;

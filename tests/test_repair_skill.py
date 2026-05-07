@@ -186,6 +186,64 @@ class SuggestSkillDescriptionTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("introuvable", msg)
 
+    def _stub_api(self, response_text):
+        """v1.9.2 - helper pour stubber la reponse API et tester le
+        sanitizer."""
+        fake = json.dumps({"content": [{"type": "text", "text": response_text}]}).encode("utf-8")
+        class FakeResp:
+            def __enter__(s): return s
+            def __exit__(s, *a): pass
+            def read(s): return fake
+        def fake_urlopen(req, timeout=20):
+            return FakeResp()
+        return patch.object(urllib.request, "urlopen", fake_urlopen)
+
+    def test_sanitizes_markdown_header_prefix(self):
+        """Bug observe v1.9.0/1.9.1 : Haiku retourne parfois '## Use this
+        skill when...' au lieu du texte brut. Le sanitizer doit nettoyer."""
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
+            with self._stub_api("## Use this skill when handling invoices"):
+                ok, payload = app.suggest_skill_description("demo")
+        self.assertTrue(ok, payload)
+        self.assertEqual(payload["suggestion"], "Use this skill when handling invoices")
+
+    def test_sanitizes_description_prefix(self):
+        """Sanitizer strip 'Description:', 'Here is the description:', etc."""
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
+            with self._stub_api("Description: Use this skill for X"):
+                ok, payload = app.suggest_skill_description("demo")
+        self.assertTrue(ok)
+        self.assertEqual(payload["suggestion"], "Use this skill for X")
+
+    def test_sanitizes_quotes_and_backticks(self):
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
+            with self._stub_api('"Use this skill for Y"'):
+                ok, payload = app.suggest_skill_description("demo")
+        self.assertTrue(ok)
+        self.assertEqual(payload["suggestion"], "Use this skill for Y")
+
+    def test_sanitizes_multiline_keeps_first_meaningful(self):
+        """Si la reponse contient plusieurs lignes (preamble + description),
+        on garde la 1ere ligne non-vide apres sanitization."""
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
+            with self._stub_api("Sure! Here's the description:\n\nUse this skill for Z\n\nHope this helps."):
+                ok, payload = app.suggest_skill_description("demo")
+        self.assertTrue(ok)
+        # Apres strip prefix 'Sure!' (pas dans la liste mais multiline -> 1ere ligne)
+        # Le 1er token est 'Sure! Here's the description:' qui matche le prefix
+        # Ensuite split lines, 1ere non-vide = 'Use this skill for Z'
+        self.assertIn("Use this skill for Z", payload["suggestion"])
+
+    def test_returns_error_when_api_returns_empty(self):
+        """Cas observe par utilisateur : API retourne quelque chose qui se
+        sanitize en vide (juste des caracteres markdown). Le backend doit
+        retourner une erreur claire avec le raw response."""
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
+            with self._stub_api("###"):
+                ok, msg = app.suggest_skill_description("demo")
+        self.assertFalse(ok)
+        self.assertIn("vide", msg)
+
 
 if __name__ == "__main__":
     unittest.main()
