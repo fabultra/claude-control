@@ -4524,6 +4524,7 @@ fr: {
   readonly: "lecture seule",
   plugin_readonly_tooltip: "Skill fourni par un plugin Claude Code, géré par son marketplace. Read-only depuis Claude Control. Pour modifier, passe par le plugin source ou crée un skill perso du même nom.",
   plugin_no_description_hint: "Pas de description (skill plugin, non éditable depuis ici).",
+  btn_cleanup_orphan_cache: "Nettoyer cache v{v}",
   command_not_found: "Command introuvable",
   claudemd_meta: "Lu à chaque session Claude Code",
   claudemd_help: "Préférences globales injectées dans chaque conversation Claude Code (~/.claude/CLAUDE.md)",
@@ -4815,6 +4816,7 @@ en: {
   readonly: "read-only",
   plugin_readonly_tooltip: "Skill provided by a Claude Code plugin, managed by its marketplace. Read-only from Claude Control. To modify, go through the plugin source or create a personal skill with the same name.",
   plugin_no_description_hint: "No description (plugin skill, not editable from here).",
+  btn_cleanup_orphan_cache: "Clean cache v{v}",
   command_not_found: "Command not found",
   claudemd_meta: "Read at each Claude Code session",
   claudemd_help: "Global preferences injected into every Claude Code conversation (~/.claude/CLAUDE.md)",
@@ -5507,7 +5509,16 @@ async function loadPlugins(){
     list.innerHTML = plugins.map(p=>{
       const fn = escAttr(p.full_name);
       const opacity = p.enabled ? '' : 'opacity-60';
-      const orphans = (p.extra_versions||[]).map(v=>`<button onclick="event.stopPropagation();cleanupOrphan('${fn}','${escAttr(v)}')" class="text-xs px-2 py-0.5 rounded-full font-medium update-badge text-white" title="Cliquer pour supprimer ce dossier orphelin">&#9888; orphan: v${escAttr(v)}</button>`).join(' ');
+      // v1.9.9 - badge orphan UX clarifie. Avant : 'orphan: vX.Y.Z' suggerait
+      // un warning passif. Maintenant : icone poubelle + label 'Nettoyer
+      // cache vX.Y.Z' rend l'action explicite. Tooltip detaille pour rassurer
+      // (le plugin actif n'est pas touche, juste l'ancienne version).
+      const orphans = (p.extra_versions||[]).map(v=>{
+        const tooltip = (CURRENT_LANG === 'en'
+          ? `Click to delete only the orphan cache directory v${v} of "${fn}". The active plugin v${p.version||'?'} is NOT touched.`
+          : `Cliquer pour supprimer UNIQUEMENT le dossier de cache orphelin v${v} de « ${fn} ». Le plugin actif v${p.version||'?'} N'EST PAS touche.`);
+        return `<button onclick="event.stopPropagation();cleanupOrphan('${fn}','${escAttr(v)}','${escAttr(p.version||'?')}')" class="text-xs px-2 py-0.5 rounded-full font-medium update-badge text-white inline-flex items-center gap-1" title="${escAttr(tooltip)}">&#128465; ${tr('btn_cleanup_orphan_cache').split('{v}').join(escAttr(v))}</button>`;
+      }).join(' ');
       return `<div data-plugin-name="${escAttr(p.name)} ${escAttr(p.marketplace||'')} ${escAttr(p.full_name)}" class="group border ${p.enabled?'border-stone-200':'border-stone-100'} rounded-lg p-3 ${opacity}">
 <div class="flex items-center gap-3">
 <input type="checkbox" ${p.enabled?'checked':''} onchange="togglePlugin('${fn}')" class="w-5 h-5 rounded accent-green-700 shrink-0">
@@ -5816,10 +5827,23 @@ async function confirmAddPlugin(){
   banner(j.success?'green':'red', j.message);
   if(j.success){closeAddPlugin();loadPlugins();loadOverview();loadCommands();}
 }
-async function cleanupOrphan(fn, version){
+async function cleanupOrphan(fn, version, activeVersion){
+  // v1.9.9 - confirm popup detaille pour rassurer l'utilisateur. Mention
+  // explicite : le plugin actif (activeVersion) reste intact, seul le
+  // dossier de cache orphelin (version) est supprime + backup ZIP.
   const msg = CURRENT_LANG === 'en'
-    ? `Delete orphan version ${version} of "${fn}"?\n\nA ZIP backup will be created in ~/.claude/backups/claude-control/orphan-plugins/`
-    : `Supprimer la version orpheline ${version} de « ${fn} » ?\n\nUn backup ZIP sera créé dans ~/.claude/backups/claude-control/orphan-plugins/`;
+    ? `Delete the orphan cache directory v${version} of "${fn}"?\n\n` +
+      `[OK]   Cache directory v${version} -> backup ZIP + deletion\n` +
+      `[NOT TOUCHED]   Active plugin v${activeVersion || '?'} stays running\n` +
+      `[NOT TOUCHED]   Plugin metadata, settings, all skills/MCPs/commands\n\n` +
+      `Backup location: ~/.claude/backups/claude-control/orphan-plugins/\n\n` +
+      `CONFIRM?`
+    : `Supprimer le dossier de cache orphelin v${version} de « ${fn} » ?\n\n` +
+      `[OUI]   Dossier de cache v${version} -> backup ZIP + suppression\n` +
+      `[INTACT]   Plugin actif v${activeVersion || '?'} continue de tourner\n` +
+      `[INTACT]   Metadonnees, settings, skills/MCPs/commands du plugin\n\n` +
+      `Backup : ~/.claude/backups/claude-control/orphan-plugins/\n\n` +
+      `CONFIRMER ?`;
   if(!confirm(msg))return;
   const j = await api('/api/plugin-cleanup',{name:fn, version:version});
   banner(j.success?'green':'red',j.message);
