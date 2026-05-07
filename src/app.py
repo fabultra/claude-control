@@ -2855,12 +2855,22 @@ def start_watchdog():
 def get_skill_usage(days=30):
     """Parcourt ~/.claude/projects/*/*.jsonl et compte les invocations du tool
     `Skill`. Tolerant aux changements de schema : ignore silencieusement chaque
-    ligne malformee. Retourne un classement et de la metadata pour le fallback."""
+    ligne malformee. Retourne un classement et de la metadata pour le fallback.
+
+    v1.10.4 : ajoute aussi un breakdown 'tool_name_counts' (top 20) de tous
+    les tool names rencontres dans les tool_use blocks. Diagnostic pour
+    comprendre quand 0 invocations 'Skill' sont trouvees : soit l'utilisateur
+    n'a vraiment pas de Skill triggers, soit le format JSONL a change et le
+    nom du tool n'est plus 'Skill'.
+    """
     counts = {}
+    tool_name_counts = {}
     sessions_seen = set()
     files_scanned = 0
     lines_scanned = 0
     parse_errors = 0
+    assistant_msgs = 0
+    tool_use_blocks = 0
     cutoff = None
     if days and days > 0:
         cutoff = datetime.now().timestamp() - days * 86400
@@ -2899,6 +2909,7 @@ def get_skill_usage(days=30):
                     sessions_seen.add(sid)
                 if obj.get("type") != "assistant":
                     continue
+                assistant_msgs += 1
                 msg = obj.get("message")
                 if not isinstance(msg, dict):
                     continue
@@ -2910,7 +2921,11 @@ def get_skill_usage(days=30):
                         continue
                     if block.get("type") != "tool_use":
                         continue
+                    tool_use_blocks += 1
                     name = block.get("name", "")
+                    # v1.10.4 - track tous les tool names pour le diag
+                    if name:
+                        tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
                     if name != "Skill":
                         continue
                     inp = block.get("input", {})
@@ -2921,6 +2936,7 @@ def get_skill_usage(days=30):
                         continue
                     counts[str(skill)] = counts.get(str(skill), 0) + 1
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    tool_ranked = sorted(tool_name_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
     return {
         "counts": counts,
         "ranked": [{"name": k, "count": v} for k, v in ranked],
@@ -2930,6 +2946,10 @@ def get_skill_usage(days=30):
         "sessions": len(sessions_seen),
         "days_window": days,
         "ok": True,
+        # v1.10.4 - diag breakdown
+        "assistant_msgs": assistant_msgs,
+        "tool_use_blocks": tool_use_blocks,
+        "tool_name_counts": dict(tool_ranked),
     }
 
 
@@ -3090,6 +3110,10 @@ def get_overview():
             "files_scanned": usage.get("files_scanned", 0),
             "sessions": usage.get("sessions", 0),
             "days_window": usage.get("days_window", 30),
+            # v1.10.4 - diag pour comprendre pourquoi 0 invocations 'Skill'
+            "assistant_msgs": usage.get("assistant_msgs", 0),
+            "tool_use_blocks": usage.get("tool_use_blocks", 0),
+            "tool_name_counts": usage.get("tool_name_counts", {}),
         },
         "health": {
             "plugin_orphans": plugin_orphans,
@@ -6227,7 +6251,23 @@ async function loadOverview(){
         const items = top.map(t=>`<button onclick="document.getElementById('skills-search').value='${escAttr(t.name)}';filterSkills();document.getElementById('skills').scrollIntoView({behavior:'smooth'});" class="text-xs px-2 py-0.5 rounded-full bg-green-50 text-green-800 border border-green-200 hover:bg-green-100 font-mono">${escAttr(t.name)} <span class="text-green-700 font-semibold">${t.count}×</span></button>`).join(' ');
         topEl.innerHTML = `<div class="text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1">${tr('top_skills_30d')} <span class="text-stone-400 font-normal normal-case">&middot; ${meta.sessions||0} ${tr('sessions')} / ${meta.files_scanned||0} ${tr('files')}</span></div><div class="flex flex-wrap gap-1.5">${items}</div>`;
       }else if(meta.ok){
-        topEl.innerHTML = `<div class="text-xs text-stone-400">${tr('no_skill_usage_yet').split('{n}').join(meta.files_scanned||0)}</div>`;
+        // v1.10.4 - diag breakdown quand 0 invocations 'Skill' trouvees.
+        // Affiche le total tool_use detectes + top 5 tool names. Permet a
+        // l'utilisateur (et nous) de voir si 'Skill' n'apparait jamais
+        // (parser obsolete) ou si les sessions ne contiennent juste pas
+        // d'invocations Skill (cas legitime).
+        const tnc = meta.tool_name_counts || {};
+        const tnNames = Object.keys(tnc);
+        let breakdown = '';
+        if (tnNames.length > 0) {
+          const sorted = tnNames.sort((a,b)=>tnc[b]-tnc[a]).slice(0,8);
+          const skillFound = tnNames.indexOf('Skill') >= 0;
+          breakdown = `<div class="text-[11px] text-stone-500 mt-1.5">
+            <span class="text-stone-400">Diagnostic :</span> ${meta.tool_use_blocks||0} tool_use trouves. Top tools : ${sorted.map(n=>`<span class="font-mono">${escAttr(n)}(${tnc[n]})</span>`).join(', ')}.
+            ${!skillFound ? `<br><span class="text-amber-700">Aucun tool nomme 'Skill' detecte. ${meta.assistant_msgs||0} messages assistant scannes. Soit aucun skill auto-trigger en 30j, soit le format JSONL a evolue.</span>` : ''}
+          </div>`;
+        }
+        topEl.innerHTML = `<div class="text-xs text-stone-400">${tr('no_skill_usage_yet').split('{n}').join(meta.files_scanned||0)}</div>${breakdown}`;
       }else{
         topEl.innerHTML = '';
       }
