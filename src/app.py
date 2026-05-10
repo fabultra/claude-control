@@ -518,8 +518,14 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
 
 
 def _list_plugin_skills():
-    """Retourne la liste des skills fournis par chaque plugin actif sous forme de
-    dicts identiques aux skills utilisateur (mais source != 'user', editable=False)."""
+    """Retourne la liste des skills fournis par chaque plugin (active ou non).
+    Chaque item porte _enabled (True/False) qui reflete l'etat du plugin parent.
+
+    v1.13.0 - on n'exclut plus les plugins desactives. Avant, leurs skills
+    disparaissaient totalement de la liste, ce qui rendait le decompte
+    'Inactifs' systematiquement = 0 dans la sidebar et trompait l'utilisateur
+    qui pensait que tous ses skills etaient actifs.
+    """
     items = []
     try:
         installed = _load_installed_plugins()
@@ -528,8 +534,7 @@ def _list_plugin_skills():
     settings = _load_settings()
     enabled_map = settings.get("enabledPlugins", {}) if isinstance(settings, dict) else {}
     for full_name, entries in installed.items():
-        if not enabled_map.get(full_name, True):
-            continue
+        plugin_enabled = bool(enabled_map.get(full_name, True))
         if not isinstance(entries, list) or not entries:
             continue
         entry = entries[0]
@@ -545,7 +550,8 @@ def _list_plugin_skills():
                 if not (d / "SKILL.md").exists():
                     continue
                 meta = read_skill_meta(d)
-                items.append({"name": d.name, "_dir": d, "_source": f"plugin:{full_name}", "meta": meta})
+                items.append({"name": d.name, "_dir": d, "_source": f"plugin:{full_name}",
+                              "_enabled": plugin_enabled, "meta": meta})
     return items
 
 
@@ -603,8 +609,11 @@ def get_state():
         if it["name"] in user_names:
             continue  # the user version takes precedence in the listing; duplicate is reported in overview
         meta = it["meta"]
+        # v1.13.0 - active reflete l'etat enabled du plugin parent (avant :
+        # toujours True). Cohere avec le mental model de l'utilisateur :
+        # desactiver un plugin rend ses skills "Inactifs".
         skills.append({
-            "name": it["name"], "active": True,
+            "name": it["name"], "active": bool(it.get("_enabled", True)),
             "category": meta["category"],
             "auto_category": _auto_category(meta["description"], it["name"]) if not meta["category"] else None,
             "description": meta["description"],
@@ -2941,7 +2950,14 @@ def get_skill_usage(days=30):
                         continue
                     if name in ("Read", "mcp__1d4a6474-72c9-4934-a111-78a5ca57d3dd__read_file_content"):
                         path = inp.get("file_path") or inp.get("path") or ""
-                        m = re.search(r"\.claude/skills/([^/]+)/SKILL\.md", path)
+                        # v1.13.0 - regex permissive : matche aussi les plugin
+                        # skills (ex: ~/.claude/plugins/<plugin>/skills/<name>/SKILL.md
+                        # ou .../.claude-plugin/skills/<name>/SKILL.md). Avant,
+                        # le regex etait ancre sur '.claude/skills/' qui ne
+                        # matchait QUE les skills user, donc tous les triggers
+                        # de plugin skills etaient invisibles -> Top 10 vide,
+                        # 'Jamais declenches' surevaluee, etc.
+                        m = re.search(r"[/\\]skills[/\\]([^/\\]+)[/\\]SKILL\.md", path)
                         if m:
                             sk = m.group(1)
                             counts[sk] = counts.get(sk, 0) + 1
@@ -5628,6 +5644,11 @@ function _renderFiltersSidebar(skills){
   const sActive = baseStatus.filter(s=>s.active).length;
   const sInactive = baseStatus.filter(s=>!s.active).length;
   const sStatusAll = baseStatus.length;
+  // v1.13.0 - counts globaux (sur skills entier, sans filtre) pour
+  // afficher en X / Y (scoped / global) dans la sidebar. Demande utilisateur :
+  // savoir "6 actifs ici, sur 110 globalement" en un coup d'oeil.
+  const gActive = skills.filter(s=>s.active).length;
+  const gInactive = skills.filter(s=>!s.active).length;
 
   // Pour quality : 'broken'/'enrich' sont user-only (cf v1.9.8). 'excellent'
   // garde tous les skills. 'all' = total apres autres filtres.
@@ -5636,6 +5657,10 @@ function _renderFiltersSidebar(skills){
   const qEnr = userInQual.filter(s=>s.quality==='enrich').length;
   const qBro = userInQual.filter(s=>s.quality==='broken').length;
   const qAll = baseQuality.length;
+  const gUserSkills = skills.filter(s=>s.source==='user');
+  const gQExc = skills.filter(s=>s.quality==='excellent').length;
+  const gQEnr = gUserSkills.filter(s=>s.quality==='enrich').length;
+  const gQBro = gUserSkills.filter(s=>s.quality==='broken').length;
 
   const usageRecentCount = baseUsage.filter(s=>(s.usage_count||0)>0).length;
   const usageNever = baseUsage.filter(s=>(s.usage_count||0)===0).length;
@@ -5648,10 +5673,15 @@ function _renderFiltersSidebar(skills){
   // Utilises = 0. Incoherent.
   const top10Names = new Set([...skills].filter(s=>(s.usage_count||0)>0).sort((a,b)=>(b.usage_count||0)-(a.usage_count||0)).slice(0,10).map(s=>s.name));
   const usageTopCount = baseUsage.filter(s=>top10Names.has(s.name)).length;
+  const gUsageTop = top10Names.size;
+  const gUsageRecent = skills.filter(s=>(s.usage_count||0)>0).length;
+  const gUsageNever = skills.filter(s=>(s.usage_count||0)===0).length;
 
   const userCount = baseSource.filter(s=>s.source==='user').length;
   const pluginCount = baseSource.filter(s=>s.source!=='user').length;
   const sourceAll = baseSource.length;
+  const gUserCount = skills.filter(s=>s.source==='user').length;
+  const gPluginCount = skills.filter(s=>s.source!=='user').length;
 
   // v1.10.6 - groupage case-insensitive. Bug : 'Workflow' et 'workflow'
   // dans 2 SKILL.md differents creaient 2 categories distinctes. On
@@ -5662,6 +5692,13 @@ function _renderFiltersSidebar(skills){
     if(!allCats[k]) allCats[k] = {count: 0, display: _skillCatDisplay(_skillCat(s))};
     allCats[k].count++;
   });
+  // v1.13.0 - counts globaux par categorie pour affichage X/Y
+  const allCatsGlobal = {};
+  skills.forEach(s=>{
+    const k = _skillCatKey(s);
+    if(!allCatsGlobal[k]) allCatsGlobal[k] = 0;
+    allCatsGlobal[k]++;
+  });
   const catEntries = Object.entries(allCats).sort((a,b)=>{
     if(a[1].display===tr('general_category')) return 1;
     if(b[1].display===tr('general_category')) return -1;
@@ -5669,13 +5706,20 @@ function _renderFiltersSidebar(skills){
   });
   const catAll = baseCat.length;
 
-  // Version dimmed pour les counts a 0 (categorie ou option non actionable
-  // dans le contexte courant). Pas masque pour ne pas surprendre l'utilisateur,
-  // juste grise.
-  const radio = (group, val, label, count, cur, fn) => {
+  // v1.13.0 - rendu X / Y dans la sidebar (scoped / global). Quand X==Y,
+  // on n'affiche que X pour eviter la redondance. Tooltip explicite ce
+  // que represente chaque chiffre.
+  const radio = (group, val, label, count, globalCount, cur, fn) => {
     const isActive = cur===val;
     const isZero = count === 0 && !isActive;
-    return `<button onclick="${fn}('${val}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="${isZero?'':''}">${escAttr(label)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'}">${count}</span></button>`;
+    const showGlobal = globalCount != null && globalCount !== count;
+    const tooltip = showGlobal
+      ? `${count} parmi tes filtres actuels / ${globalCount} au total`
+      : `${count} skill${count===1?'':'s'}`;
+    const countDisplay = showGlobal
+      ? `${count}<span class="${isActive?'opacity-60':'text-stone-300'}"> / ${globalCount}</span>`
+      : `${count}`;
+    return `<button onclick="${fn}('${val}')" title="${escAttr(tooltip)}" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span>${escAttr(label)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'}">${countDisplay}</span></button>`;
   };
   // v1.10.1 - lien 'Reinitialiser' visible seulement quand au moins un
   // filtre est actif. Permet de revenir a 'tout afficher' en un clic
@@ -5687,39 +5731,43 @@ function _renderFiltersSidebar(skills){
     ${resetLink}
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_status')}</div>
-      ${radio('status','all',tr('filter_all'),sStatusAll,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
-      ${radio('status','active',tr('filter_status_active'),sActive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
-      ${radio('status','inactive',tr('filter_status_inactive'),sInactive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','all',tr('filter_all'),sStatusAll,totalAll,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','active',tr('filter_status_active'),sActive,gActive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','inactive',tr('filter_status_inactive'),sInactive,gInactive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_quality')}</div>
-      ${radio('quality','all',tr('filter_all'),qAll,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
-      ${radio('quality','excellent',tr('quality_excellent'),qExc,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
-      ${radio('quality','enrich',tr('quality_enrich'),qEnr,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
-      ${radio('quality','broken',tr('quality_broken'),qBro,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','all',tr('filter_all'),qAll,totalAll,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','excellent',tr('quality_excellent'),qExc,gQExc,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','enrich',tr('quality_enrich'),qEnr,gQEnr,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','broken',tr('quality_broken'),qBro,gQBro,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_usage')}</div>
-      ${radio('usage','all',tr('filter_all'),usageAll,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
-      ${radio('usage','top',tr('filter_usage_top'),usageTopCount,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
-      ${radio('usage','recent',tr('filter_usage_recent'),usageRecentCount,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
-      ${radio('usage','never',tr('filter_usage_never'),usageNever,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','all',tr('filter_all'),usageAll,totalAll,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','top',tr('filter_usage_top'),usageTopCount,gUsageTop,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','recent',tr('filter_usage_recent'),usageRecentCount,gUsageRecent,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','never',tr('filter_usage_never'),usageNever,gUsageNever,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_source')}</div>
-      ${radio('source','all',tr('filter_all'),sourceAll,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
-      ${radio('source','user',tr('skill_filter_mine'),userCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
-      ${radio('source','plugin',tr('skill_filter_plugins'),pluginCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','all',tr('filter_all'),sourceAll,totalAll,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','user',tr('skill_filter_mine'),userCount,gUserCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','plugin',tr('skill_filter_plugins'),pluginCount,gPluginCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('category_filter')}</div>
-      <button onclick="setSkillCatFilter('')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${!SKILL_CAT_FILTER?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${tr('skill_filter_all_cats')}</span><span class="text-xs ${!SKILL_CAT_FILTER?'opacity-80':'text-stone-400'}">${catAll}</span></button>
+      <button onclick="setSkillCatFilter('')" title="${escAttr(catAll!==totalAll ? catAll+' parmi tes filtres / '+totalAll+' au total' : catAll+' skills')}" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${!SKILL_CAT_FILTER?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${tr('skill_filter_all_cats')}</span><span class="text-xs ${!SKILL_CAT_FILTER?'opacity-80':'text-stone-400'}">${catAll!==totalAll?`${catAll}<span class="${!SKILL_CAT_FILTER?'opacity-60':'text-stone-300'}"> / ${totalAll}</span>`:catAll}</span></button>
       ${catEntries.map(([key,data])=>{
         const display = data.display;
         const n = data.count;
+        const gN = allCatsGlobal[key] || 0;
         const isActive = (SKILL_CAT_FILTER || '').toLowerCase() === key;
         const isZero = n === 0 && !isActive;
-        return `<button onclick="setSkillCatFilter('${escAttr(display)}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="truncate">${escAttr(display)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'} ml-2 shrink-0">${n}</span></button>`;
+        const showG = gN !== n;
+        const tooltip = showG ? `${n} parmi tes filtres / ${gN} au total` : `${n} skill${n===1?'':'s'}`;
+        const cd = showG ? `${n}<span class="${isActive?'opacity-60':'text-stone-300'}"> / ${gN}</span>` : `${n}`;
+        return `<button onclick="setSkillCatFilter('${escAttr(display)}')" title="${escAttr(tooltip)}" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="truncate">${escAttr(display)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'} ml-2 shrink-0">${cd}</span></button>`;
       }).join('')}
     </div>
   `;
