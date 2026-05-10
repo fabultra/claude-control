@@ -289,9 +289,46 @@ def _read_skill_content(name):
 
 def _claude_cli_path():
     """v1.9.3 - Retourne le chemin de la commande 'claude' (Claude Code CLI)
-    si disponible, sinon None. shutil.which respecte le PATH du process.
+    si disponible, sinon None.
+
+    v1.13.1 - on n'utilise plus uniquement `shutil.which("claude")` qui
+    depend du PATH du process. Sur macOS quand Claude Control est lance
+    depuis Finder (Launch Services), le PATH par defaut de launchd
+    n'inclut PAS /usr/local/bin, /opt/homebrew/bin, ni les dirs npm/nvm/
+    volta/fnm utilisateur. Resultat : le bouton "Suggerer via Claude Code"
+    se desactive a tort parce que `claude` est introuvable, alors que le
+    CLI marche tres bien depuis Terminal. Fallback : on inspecte aussi
+    les emplacements communs avant d'abandonner.
     """
-    return shutil.which("claude")
+    found = shutil.which("claude")
+    if found:
+        return found
+    candidates = [
+        Path("/opt/homebrew/bin/claude"),       # macOS Apple Silicon + brew
+        Path("/usr/local/bin/claude"),          # macOS Intel + brew, npm global
+        HOME / ".npm-global/bin/claude",
+        HOME / ".local/bin/claude",
+        HOME / ".bun/bin/claude",
+        HOME / ".volta/bin/claude",
+        HOME / ".fnm/aliases/default/bin/claude",
+        HOME / "n/bin/claude",
+        HOME / ".asdf/shims/claude",
+    ]
+    # nvm : ~/.nvm/versions/node/*/bin/claude (toutes versions installees)
+    nvm_dir = HOME / ".nvm/versions/node"
+    if nvm_dir.is_dir():
+        try:
+            for v in sorted(nvm_dir.iterdir(), reverse=True):
+                candidates.append(v / "bin/claude")
+        except Exception:
+            pass
+    for c in candidates:
+        try:
+            if c.is_file() and os.access(c, os.X_OK):
+                return str(c)
+        except Exception:
+            continue
+    return None
 
 
 def open_terminal_claude_login():
@@ -355,7 +392,31 @@ def _call_claude_cli(prompt, timeout=60):
         raise FileNotFoundError("claude CLI not in PATH")
     cmd = [cli_path, "-p", prompt, "--output-format", "text"]
     _log(f"_call_claude_cli: argv={cmd[:2]} prompt_len={len(prompt)}")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # v1.13.1 - augmente le PATH du subprocess pour inclure les dirs ou
+    # vivent les binaires npm/node/etc. Necessaire quand Claude Control
+    # est lance depuis Finder (PATH minimal launchd). Sans ca le CLI
+    # claude peut lui-meme echouer avec 'node: command not found'.
+    env = os.environ.copy()
+    extra = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        str(HOME / ".npm-global/bin"),
+        str(HOME / ".local/bin"),
+        str(HOME / ".bun/bin"),
+        str(HOME / ".volta/bin"),
+    ]
+    nvm_dir = HOME / ".nvm/versions/node"
+    if nvm_dir.is_dir():
+        try:
+            for v in sorted(nvm_dir.iterdir(), reverse=True):
+                extra.append(str(v / "bin"))
+        except Exception:
+            pass
+    cur = env.get("PATH", "")
+    parts = [p for p in extra if p not in cur]
+    if parts:
+        env["PATH"] = ":".join(parts) + (":" + cur if cur else "")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     stdout = (r.stdout or "").strip()
     stderr = (r.stderr or "").strip()
     if r.returncode != 0:
