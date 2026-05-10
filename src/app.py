@@ -518,8 +518,14 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
 
 
 def _list_plugin_skills():
-    """Retourne la liste des skills fournis par chaque plugin actif sous forme de
-    dicts identiques aux skills utilisateur (mais source != 'user', editable=False)."""
+    """Retourne la liste des skills fournis par chaque plugin (active ou non).
+    Chaque item porte _enabled (True/False) qui reflete l'etat du plugin parent.
+
+    v1.13.0 - on n'exclut plus les plugins desactives. Avant, leurs skills
+    disparaissaient totalement de la liste, ce qui rendait le decompte
+    'Inactifs' systematiquement = 0 dans la sidebar et trompait l'utilisateur
+    qui pensait que tous ses skills etaient actifs.
+    """
     items = []
     try:
         installed = _load_installed_plugins()
@@ -528,8 +534,7 @@ def _list_plugin_skills():
     settings = _load_settings()
     enabled_map = settings.get("enabledPlugins", {}) if isinstance(settings, dict) else {}
     for full_name, entries in installed.items():
-        if not enabled_map.get(full_name, True):
-            continue
+        plugin_enabled = bool(enabled_map.get(full_name, True))
         if not isinstance(entries, list) or not entries:
             continue
         entry = entries[0]
@@ -545,7 +550,8 @@ def _list_plugin_skills():
                 if not (d / "SKILL.md").exists():
                     continue
                 meta = read_skill_meta(d)
-                items.append({"name": d.name, "_dir": d, "_source": f"plugin:{full_name}", "meta": meta})
+                items.append({"name": d.name, "_dir": d, "_source": f"plugin:{full_name}",
+                              "_enabled": plugin_enabled, "meta": meta})
     return items
 
 
@@ -603,8 +609,11 @@ def get_state():
         if it["name"] in user_names:
             continue  # the user version takes precedence in the listing; duplicate is reported in overview
         meta = it["meta"]
+        # v1.13.0 - active reflete l'etat enabled du plugin parent (avant :
+        # toujours True). Cohere avec le mental model de l'utilisateur :
+        # desactiver un plugin rend ses skills "Inactifs".
         skills.append({
-            "name": it["name"], "active": True,
+            "name": it["name"], "active": bool(it.get("_enabled", True)),
             "category": meta["category"],
             "auto_category": _auto_category(meta["description"], it["name"]) if not meta["category"] else None,
             "description": meta["description"],
@@ -2941,7 +2950,14 @@ def get_skill_usage(days=30):
                         continue
                     if name in ("Read", "mcp__1d4a6474-72c9-4934-a111-78a5ca57d3dd__read_file_content"):
                         path = inp.get("file_path") or inp.get("path") or ""
-                        m = re.search(r"\.claude/skills/([^/]+)/SKILL\.md", path)
+                        # v1.13.0 - regex permissive : matche aussi les plugin
+                        # skills (ex: ~/.claude/plugins/<plugin>/skills/<name>/SKILL.md
+                        # ou .../.claude-plugin/skills/<name>/SKILL.md). Avant,
+                        # le regex etait ancre sur '.claude/skills/' qui ne
+                        # matchait QUE les skills user, donc tous les triggers
+                        # de plugin skills etaient invisibles -> Top 10 vide,
+                        # 'Jamais declenches' surevaluee, etc.
+                        m = re.search(r"[/\\]skills[/\\]([^/\\]+)[/\\]SKILL\.md", path)
                         if m:
                             sk = m.group(1)
                             counts[sk] = counts.get(sk, 0) + 1
@@ -4280,6 +4296,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <span>&#x21bb;</span><span data-i18n="restart_claude">Redémarrer Claude</span></button>
 </div></header>
 <div id="banner" class="hidden mb-4 p-3 rounded-lg text-sm border"></div>
+<div id="toasts" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm pointer-events-none"></div>
 <div id="watchdog-widget" class="mb-4"></div>
 <nav id="main-tabs" class="flex gap-1 mb-6 bg-stone-100 p-1 rounded-lg overflow-x-auto">
 <button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="overview" onclick="setMainTab('overview')" data-i18n="tab_overview">Vue d'ensemble</button>
@@ -5448,6 +5465,26 @@ let SKILL_SELECTED       = new Set();
 function setSkillStatusFilter(v){ SKILL_STATUS_FILTER=v; localStorage.setItem('cc-skill-status', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
 function setSkillQualityFilter(v){ SKILL_QUALITY_FILTER=v; localStorage.setItem('cc-skill-quality', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
 function setSkillUsageFilter(v){ SKILL_USAGE_FILTER=v; localStorage.setItem('cc-skill-usage', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
+// v1.12.2 - clic depuis les chips du health banner. Le banner compte global
+// mais l'utilisateur peut etre filtre sur Plugins+Workflow par exemple, ou
+// les skills user broken n'apparaitront pas. On reset les filtres
+// incompatibles pour rendre les skills concernes immediatement visibles.
+function focusOnSkillQuality(v){
+  SKILL_QUALITY_FILTER = v;
+  SKILL_SOURCE_FILTER = 'user'; // broken/enrich ne comptent que les user skills
+  SKILL_STATUS_FILTER = 'all';
+  SKILL_USAGE_FILTER = 'all';
+  SKILL_CAT_FILTER = '';
+  localStorage.setItem('cc-skill-quality', v);
+  localStorage.setItem('cc-skill-src', 'user');
+  localStorage.setItem('cc-skill-status', 'all');
+  localStorage.setItem('cc-skill-usage', 'all');
+  localStorage.setItem('cc-skill-cat', '');
+  SKILL_SELECTED.clear();
+  const search = document.getElementById('skills-search');
+  if(search) search.value = '';
+  _rerenderSkillsFromCache();
+}
 
 // v1.10.1 - reset all filtres en un clic. Bug observe : utilisateur
 // accumule des filtres incompatibles et se retrouve avec 0 resultat,
@@ -5538,8 +5575,8 @@ function _renderHealthBanner(skills){
   const userNames = new Set(skills.filter(s=>s.source==='user').map(s=>s.name));
   const pluginNames = new Set(skills.filter(s=>s.source!=='user').map(s=>s.name));
   let dups = 0; userNames.forEach(n=>{ if(pluginNames.has(n)) dups++; });
-  const chipBroken = broken>0 ? `<button onclick="setSkillQualityFilter('broken')" class="text-xs px-2.5 py-1 rounded-full bg-red-50 text-red-700 border border-red-200 hover:bg-red-100">${broken} ${tr('chip_broken_action')}</button>` : '';
-  const chipEnrich = enrich>0 ? `<button onclick="setSkillQualityFilter('enrich')" class="text-xs px-2.5 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100">${enrich} ${tr('chip_enrich_action')}</button>` : '';
+  const chipBroken = broken>0 ? `<button onclick="focusOnSkillQuality('broken')" class="text-xs px-2.5 py-1 rounded-full bg-red-50 text-red-700 border border-red-200 hover:bg-red-100">${broken} ${tr('chip_broken_action')}</button>` : '';
+  const chipEnrich = enrich>0 ? `<button onclick="focusOnSkillQuality('enrich')" class="text-xs px-2.5 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100">${enrich} ${tr('chip_enrich_action')}</button>` : '';
   const chipDup = dups>0 ? `<button onclick="cleanupDuplicateUserSkills()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${dups} ${tr('chip_duplicate_action')}</button>` : '';
   const allOk = (broken+enrich+dups)===0 ? `<span class="text-xs text-green-700">${tr('skills_health_all_good')}</span>` : '';
   const banner = document.getElementById('skills-health-banner');
@@ -5607,6 +5644,11 @@ function _renderFiltersSidebar(skills){
   const sActive = baseStatus.filter(s=>s.active).length;
   const sInactive = baseStatus.filter(s=>!s.active).length;
   const sStatusAll = baseStatus.length;
+  // v1.13.0 - counts globaux (sur skills entier, sans filtre) pour
+  // afficher en X / Y (scoped / global) dans la sidebar. Demande utilisateur :
+  // savoir "6 actifs ici, sur 110 globalement" en un coup d'oeil.
+  const gActive = skills.filter(s=>s.active).length;
+  const gInactive = skills.filter(s=>!s.active).length;
 
   // Pour quality : 'broken'/'enrich' sont user-only (cf v1.9.8). 'excellent'
   // garde tous les skills. 'all' = total apres autres filtres.
@@ -5615,6 +5657,10 @@ function _renderFiltersSidebar(skills){
   const qEnr = userInQual.filter(s=>s.quality==='enrich').length;
   const qBro = userInQual.filter(s=>s.quality==='broken').length;
   const qAll = baseQuality.length;
+  const gUserSkills = skills.filter(s=>s.source==='user');
+  const gQExc = skills.filter(s=>s.quality==='excellent').length;
+  const gQEnr = gUserSkills.filter(s=>s.quality==='enrich').length;
+  const gQBro = gUserSkills.filter(s=>s.quality==='broken').length;
 
   const usageRecentCount = baseUsage.filter(s=>(s.usage_count||0)>0).length;
   const usageNever = baseUsage.filter(s=>(s.usage_count||0)===0).length;
@@ -5627,10 +5673,15 @@ function _renderFiltersSidebar(skills){
   // Utilises = 0. Incoherent.
   const top10Names = new Set([...skills].filter(s=>(s.usage_count||0)>0).sort((a,b)=>(b.usage_count||0)-(a.usage_count||0)).slice(0,10).map(s=>s.name));
   const usageTopCount = baseUsage.filter(s=>top10Names.has(s.name)).length;
+  const gUsageTop = top10Names.size;
+  const gUsageRecent = skills.filter(s=>(s.usage_count||0)>0).length;
+  const gUsageNever = skills.filter(s=>(s.usage_count||0)===0).length;
 
   const userCount = baseSource.filter(s=>s.source==='user').length;
   const pluginCount = baseSource.filter(s=>s.source!=='user').length;
   const sourceAll = baseSource.length;
+  const gUserCount = skills.filter(s=>s.source==='user').length;
+  const gPluginCount = skills.filter(s=>s.source!=='user').length;
 
   // v1.10.6 - groupage case-insensitive. Bug : 'Workflow' et 'workflow'
   // dans 2 SKILL.md differents creaient 2 categories distinctes. On
@@ -5641,6 +5692,13 @@ function _renderFiltersSidebar(skills){
     if(!allCats[k]) allCats[k] = {count: 0, display: _skillCatDisplay(_skillCat(s))};
     allCats[k].count++;
   });
+  // v1.13.0 - counts globaux par categorie pour affichage X/Y
+  const allCatsGlobal = {};
+  skills.forEach(s=>{
+    const k = _skillCatKey(s);
+    if(!allCatsGlobal[k]) allCatsGlobal[k] = 0;
+    allCatsGlobal[k]++;
+  });
   const catEntries = Object.entries(allCats).sort((a,b)=>{
     if(a[1].display===tr('general_category')) return 1;
     if(b[1].display===tr('general_category')) return -1;
@@ -5648,13 +5706,20 @@ function _renderFiltersSidebar(skills){
   });
   const catAll = baseCat.length;
 
-  // Version dimmed pour les counts a 0 (categorie ou option non actionable
-  // dans le contexte courant). Pas masque pour ne pas surprendre l'utilisateur,
-  // juste grise.
-  const radio = (group, val, label, count, cur, fn) => {
+  // v1.13.0 - rendu X / Y dans la sidebar (scoped / global). Quand X==Y,
+  // on n'affiche que X pour eviter la redondance. Tooltip explicite ce
+  // que represente chaque chiffre.
+  const radio = (group, val, label, count, globalCount, cur, fn) => {
     const isActive = cur===val;
     const isZero = count === 0 && !isActive;
-    return `<button onclick="${fn}('${val}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="${isZero?'':''}">${escAttr(label)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'}">${count}</span></button>`;
+    const showGlobal = globalCount != null && globalCount !== count;
+    const tooltip = showGlobal
+      ? `${count} parmi tes filtres actuels / ${globalCount} au total`
+      : `${count} skill${count===1?'':'s'}`;
+    const countDisplay = showGlobal
+      ? `${count}<span class="${isActive?'opacity-60':'text-stone-300'}"> / ${globalCount}</span>`
+      : `${count}`;
+    return `<button onclick="${fn}('${val}')" title="${escAttr(tooltip)}" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span>${escAttr(label)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'}">${countDisplay}</span></button>`;
   };
   // v1.10.1 - lien 'Reinitialiser' visible seulement quand au moins un
   // filtre est actif. Permet de revenir a 'tout afficher' en un clic
@@ -5666,39 +5731,43 @@ function _renderFiltersSidebar(skills){
     ${resetLink}
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_status')}</div>
-      ${radio('status','all',tr('filter_all'),sStatusAll,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
-      ${radio('status','active',tr('filter_status_active'),sActive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
-      ${radio('status','inactive',tr('filter_status_inactive'),sInactive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','all',tr('filter_all'),sStatusAll,totalAll,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','active',tr('filter_status_active'),sActive,gActive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
+      ${radio('status','inactive',tr('filter_status_inactive'),sInactive,gInactive,SKILL_STATUS_FILTER,'setSkillStatusFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_quality')}</div>
-      ${radio('quality','all',tr('filter_all'),qAll,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
-      ${radio('quality','excellent',tr('quality_excellent'),qExc,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
-      ${radio('quality','enrich',tr('quality_enrich'),qEnr,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
-      ${radio('quality','broken',tr('quality_broken'),qBro,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','all',tr('filter_all'),qAll,totalAll,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','excellent',tr('quality_excellent'),qExc,gQExc,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','enrich',tr('quality_enrich'),qEnr,gQEnr,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
+      ${radio('quality','broken',tr('quality_broken'),qBro,gQBro,SKILL_QUALITY_FILTER,'setSkillQualityFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_usage')}</div>
-      ${radio('usage','all',tr('filter_all'),usageAll,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
-      ${radio('usage','top',tr('filter_usage_top'),usageTopCount,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
-      ${radio('usage','recent',tr('filter_usage_recent'),usageRecentCount,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
-      ${radio('usage','never',tr('filter_usage_never'),usageNever,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','all',tr('filter_all'),usageAll,totalAll,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','top',tr('filter_usage_top'),usageTopCount,gUsageTop,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','recent',tr('filter_usage_recent'),usageRecentCount,gUsageRecent,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
+      ${radio('usage','never',tr('filter_usage_never'),usageNever,gUsageNever,SKILL_USAGE_FILTER,'setSkillUsageFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('filter_source')}</div>
-      ${radio('source','all',tr('filter_all'),sourceAll,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
-      ${radio('source','user',tr('skill_filter_mine'),userCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
-      ${radio('source','plugin',tr('skill_filter_plugins'),pluginCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','all',tr('filter_all'),sourceAll,totalAll,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','user',tr('skill_filter_mine'),userCount,gUserCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','plugin',tr('skill_filter_plugins'),pluginCount,gPluginCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('category_filter')}</div>
-      <button onclick="setSkillCatFilter('')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${!SKILL_CAT_FILTER?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${tr('skill_filter_all_cats')}</span><span class="text-xs ${!SKILL_CAT_FILTER?'opacity-80':'text-stone-400'}">${catAll}</span></button>
+      <button onclick="setSkillCatFilter('')" title="${escAttr(catAll!==totalAll ? catAll+' parmi tes filtres / '+totalAll+' au total' : catAll+' skills')}" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${!SKILL_CAT_FILTER?'bg-stone-900 text-white':'hover:bg-stone-50'}"><span>${tr('skill_filter_all_cats')}</span><span class="text-xs ${!SKILL_CAT_FILTER?'opacity-80':'text-stone-400'}">${catAll!==totalAll?`${catAll}<span class="${!SKILL_CAT_FILTER?'opacity-60':'text-stone-300'}"> / ${totalAll}</span>`:catAll}</span></button>
       ${catEntries.map(([key,data])=>{
         const display = data.display;
         const n = data.count;
+        const gN = allCatsGlobal[key] || 0;
         const isActive = (SKILL_CAT_FILTER || '').toLowerCase() === key;
         const isZero = n === 0 && !isActive;
-        return `<button onclick="setSkillCatFilter('${escAttr(display)}')" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="truncate">${escAttr(display)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'} ml-2 shrink-0">${n}</span></button>`;
+        const showG = gN !== n;
+        const tooltip = showG ? `${n} parmi tes filtres / ${gN} au total` : `${n} skill${n===1?'':'s'}`;
+        const cd = showG ? `${n}<span class="${isActive?'opacity-60':'text-stone-300'}"> / ${gN}</span>` : `${n}`;
+        return `<button onclick="setSkillCatFilter('${escAttr(display)}')" title="${escAttr(tooltip)}" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="truncate">${escAttr(display)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'} ml-2 shrink-0">${cd}</span></button>`;
       }).join('')}
     </div>
   `;
@@ -5895,18 +5964,40 @@ function pluginDetailHtml(c, fn){
   if(c.commands && c.commands.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Commands</span><div class="mt-1 flex flex-wrap gap-1.5">${c.commands.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">/${escAttr(s)}</span>`).join('')}</div></div>`);
   return sections.length ? `<div class="mt-3 pt-3 border-t border-stone-100 space-y-3">${sections.join('')}</div>` : `<div class="mt-3 pt-3 border-t border-stone-100 text-xs text-stone-400">${tr('plugin_no_content')}</div>`;
 }
+// v1.12.1 - feedback visuel immediat : on remplace le bouton clique par un
+// "..." disabled pour que l'utilisateur sache que l'action est en cours,
+// avant meme que la requete API revienne. Sinon le bouton reste cliquable
+// et l'user peut redoublecliquer / penser que rien ne se passe.
+function _markBtnPending(btn){
+  if(!btn) return null;
+  const orig = btn.outerHTML;
+  btn.disabled = true;
+  btn.textContent = '...';
+  btn.classList.add('opacity-60','cursor-wait');
+  return orig;
+}
+function _restoreBtn(btn, orig){
+  if(btn && orig) btn.outerHTML = orig;
+}
 async function bridgePluginMcp(pluginFullName, mcpName){
   if(!confirm(tr('confirm_bridge_plugin_mcp').split('{mcp}').join(mcpName))) return;
+  const btn = (event && event.target) || null;
+  const orig = _markBtnPending(btn);
   const j = await api('/api/bridge-plugin-mcp', {plugin: pluginFullName, mcp: mcpName});
   banner(j.success?'green':'red', j.message);
   if(j.success){ loadPlugins(); loadState(); loadOverview(); }
+  else { _restoreBtn(btn, orig); }
 }
 async function packagePluginSkill(pluginFullName, skillName){
+  const btn = (event && event.target) || null;
+  const orig = _markBtnPending(btn);
   const j = await api('/api/package-plugin-skill', {plugin: pluginFullName, skill: skillName});
   banner(j.success?'green':'red', j.message);
   if(j.success){
     PACKAGED_SKILLS.add(pluginFullName + '/' + skillName);
     loadPlugins();
+  } else {
+    _restoreBtn(btn, orig);
   }
 }
 const OPEN_PLUGINS = new Set();
@@ -6819,7 +6910,22 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Escape'){closeSavePreset();closeMcpError();closeAddPlugin();closeCmdEdit();}
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
-function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
+function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);toast(c,m);}
+// v1.12.1 - toast bottom-right toujours visible peu importe le scroll. La
+// banniere classique reste pour le top de page mais ne sert plus a rien
+// quand l'utilisateur est scrolle dans la liste des plugins.
+function toast(c,m){
+  const wrap = document.getElementById('toasts'); if(!wrap) return;
+  const cls = {green:'bg-green-600 border-green-700',red:'bg-red-600 border-red-700',blue:'bg-blue-600 border-blue-700'}[c] || 'bg-stone-700 border-stone-800';
+  const el = document.createElement('div');
+  el.className = 'pointer-events-auto text-white text-sm rounded-lg shadow-lg border px-4 py-3 flex items-start gap-2 ' + cls;
+  el.style.cssText = 'opacity:0;transform:translateY(8px);transition:opacity .15s,transform .15s';
+  el.innerHTML = `<div class="flex-1 break-words">${String(m).replace(/[<>&]/g,s=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[s]))}</div><button type="button" class="text-white/80 hover:text-white text-xs leading-none px-1" aria-label="close">&#10005;</button>`;
+  el.querySelector('button').onclick = ()=>el.remove();
+  wrap.appendChild(el);
+  requestAnimationFrame(()=>{el.style.opacity='1';el.style.transform='translateY(0)';});
+  setTimeout(()=>{el.style.opacity='0';el.style.transform='translateY(8px)';setTimeout(()=>el.remove(),200);}, 7000);
+}
 applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();loadWatchdogTab();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(loadWatchdog,10000);setInterval(loadWatchdogTab,10000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
@@ -7029,8 +7135,15 @@ def main():
     print(f"\n  Claude Control v{get_local_version()} - http://localhost:{PORT}")
     print(f"  Cmd+C pour arreter\n")
     socketserver.TCPServer.allow_reuse_address = True
+    # v1.12.1 - serveur multi-thread pour eviter que les setInterval JS
+    # (loadState 5s, loadOverview 10s, loadPlugins 15s, etc.) bloquent en
+    # cascade les actions utilisateur. Avant : un POST /api/package-plugin-skill
+    # pouvait attendre 1-2s qu'un loadPlugins en cours finisse, donnant une
+    # impression de lag tres marquee.
+    class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
     try:
-        server = socketserver.TCPServer(("127.0.0.1", PORT), Handler)
+        server = ThreadingTCPServer(("127.0.0.1", PORT), Handler)
     except OSError as e:
         if e.errno in (48, 98, 10048):
             _log(f"port {PORT} already in use, opening browser to existing instance")
