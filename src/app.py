@@ -4132,6 +4132,41 @@ def package_plugin_skill_for_desktop(full_name, skill_name):
                   "plugin": full_name}
 
 
+def pick_native_folder(prompt_text="Choisis le dossier du skill"):
+    """v1.13.4 - Native macOS folder picker via osascript. L'user n'a plus
+    a taper le path a la main dans le champ texte du tab "Dossier" de
+    "+ Ajouter un Skill". Bouton "Parcourir..." appelle cet endpoint qui
+    ouvre une vraie boite de dialogue Finder.
+
+    Retourne (success, message). Sur success, message est le path
+    POSIX du dossier choisi. Sur cancel utilisateur, success=False et
+    message est neutre ('Annule') pour qu'on n'affiche pas une erreur
+    rouge inutilement cote UI.
+    """
+    if sys.platform != "darwin":
+        return False, "Picker natif disponible seulement sur macOS"
+    safe_prompt = (prompt_text or "").replace('"', '').replace("\\", "")[:200]
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             f'POSIX path of (choose folder with prompt "{safe_prompt}")'],
+            capture_output=True, text=True, timeout=300,
+        )
+    except Exception as e:
+        return False, f"Erreur lancement picker : {e}"
+    if r.returncode != 0:
+        stderr = (r.stderr or "").strip().lower()
+        if "user canceled" in stderr or "user cancelled" in stderr or "-128" in stderr:
+            return False, "Annule"
+        return False, f"Erreur picker : {r.stderr.strip()[:200]}"
+    path = (r.stdout or "").strip()
+    if not path:
+        return False, "Aucun chemin retourne"
+    # osascript renvoie souvent un trailing slash, on enleve pour
+    # coherence avec ce que le backend attend dans add_skill_from_folder
+    return True, path.rstrip("/")
+
+
 def reveal_path_in_finder(path):
     """v1.13.2 - Revele un fichier dans Finder sur macOS. Appele a la
     demande par le toast UI ('Reveler dans Finder'), plus
@@ -4519,6 +4554,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <div data-main-tab="skills" class="hidden">
 <section id="skills-cli-banner" class="hidden card p-3 mb-3 border-l-4 border-amber-400"></section>
 <section id="skills-health-banner" class="card p-4 mb-4"></section>
+<div class="flex items-center justify-end mb-3"><button onclick="openAddSkillModal()" class="text-xs font-medium text-white bg-stone-900 hover:bg-stone-800 rounded-md px-3 py-1.5" data-i18n="add_skill">+ Ajouter un Skill</button></div>
 <div class="grid grid-cols-1 md:grid-cols-[260px_1fr] gap-4">
 <aside class="card p-4 md:sticky md:top-4 md:self-start md:max-h-[calc(100vh-2rem)] md:overflow-y-auto">
 <input id="skills-search" type="search" oninput="filterSkills()" data-i18n-placeholder="skills_search_placeholder" placeholder="Rechercher..." class="w-full mb-4 p-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:border-stone-400"/>
@@ -4670,7 +4706,11 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <button class="tab-btn flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="sk-git" onclick="setTab('sk','git')">Git</button>
 <button class="tab-btn flex-1 px-2 py-1.5 text-xs rounded-md font-medium" data-tab="sk-md" onclick="setTab('sk','md')">Markdown</button>
 </div>
-<div data-pane="sk-folder"><input id="sk-folder-in" type="text" class="w-full p-3 border border-stone-200 rounded-lg text-sm" placeholder="/Users/.../mon-skill/"/>
+<div data-pane="sk-folder">
+<div class="flex gap-2">
+<input id="sk-folder-in" type="text" class="flex-1 p-3 border border-stone-200 rounded-lg text-sm" placeholder="/Users/.../mon-skill/"/>
+<button type="button" onclick="pickSkillFolder()" class="px-3 py-2 text-sm border border-stone-300 rounded-lg hover:bg-stone-50 whitespace-nowrap" data-i18n="btn_browse">Parcourir...</button>
+</div>
 <p class="text-xs text-stone-500 mt-1" data-i18n="sk_folder_help">Le dossier doit contenir SKILL.md</p>
 <button onclick="addSkillFolder()" class="mt-2 w-full bg-stone-900 hover:bg-stone-800 text-white py-2 rounded-lg text-sm font-medium" data-i18n="btn_import">Importer</button></div>
 <div data-pane="sk-git" class="hidden"><input id="sk-git-in" type="text" class="w-full p-3 border border-stone-200 rounded-lg text-sm" placeholder="https://github.com/.../skill.git"/>
@@ -4794,6 +4834,7 @@ fr: {
   tab_folder: "Dossier",
   btn_add: "Ajouter",
   btn_import: "Importer",
+  btn_browse: "Parcourir...",
   btn_import_zip: "Importer le ZIP",
   btn_clone_import: "Cloner et importer",
   btn_create: "Créer",
@@ -5104,6 +5145,7 @@ en: {
   tab_folder: "Folder",
   btn_add: "Add",
   btn_import: "Import",
+  btn_browse: "Browse...",
   btn_import_zip: "Import ZIP",
   btn_clone_import: "Clone and import",
   btn_create: "Create",
@@ -7032,6 +7074,40 @@ async function addMcpJson(){const v=document.getElementById('mcp-json-in').value
 async function addMcpFile(){const v=document.getElementById('mcp-file-in').value.trim();if(!v)return;const j=await api('/api/import-mcp-file',{path:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('mcp-file-in').value='';loadState();}}
 async function addMcpGit(){const v=document.getElementById('mcp-git-in').value.trim();if(!v)return;banner('blue', tr('banner_cloning'));const j=await api('/api/import-mcp-git',{url:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('mcp-git-in').value='';loadState();}}
 async function addSkillFolder(){const v=document.getElementById('sk-folder-in').value.trim();if(!v)return;const j=await api('/api/import-skill-folder',{path:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-folder-in').value='';loadState();}}
+// v1.13.4 - bouton "Parcourir..." appelle un endpoint qui ouvre osascript
+// 'choose folder' (vraie boite Finder native), et remplit le champ texte
+// avec le path POSIX choisi. Cancel utilisateur = silencieux (pas de toast
+// rouge). Sur succes, focus l'input pour que l'user voit le path et clique
+// "Importer".
+async function pickSkillFolder(){
+  const j = await api('/api/pick-folder', {prompt: 'Choisis le dossier du skill (doit contenir SKILL.md)'});
+  if(j.success){
+    const inp = document.getElementById('sk-folder-in');
+    if(inp){ inp.value = j.message; inp.focus(); }
+  } else if(j.message && j.message !== 'Annule'){
+    toast('red', j.message);
+  }
+}
+// v1.13.4 - "+ Ajouter un Skill" depuis l'onglet Skills bascule vers
+// l'onglet Avance et scroll sur la section "+ Ajouter un Skill". Plus
+// rapide que de chercher manuellement, et evite de dupliquer la modal
+// avec ses 4 tabs (Dossier/ZIP/Git/Markdown).
+function openAddSkillModal(){
+  if(typeof setMainTab === 'function') setMainTab('advanced');
+  setTimeout(()=>{
+    const sec = document.querySelector('[data-pane="sk-folder"]');
+    if(sec){
+      const card = sec.closest('section');
+      if(card){
+        card.scrollIntoView({behavior:'smooth', block:'start'});
+        card.classList.add('ring-2','ring-stone-900');
+        setTimeout(()=>card.classList.remove('ring-2','ring-stone-900'), 1800);
+      }
+    }
+    const inp = document.getElementById('sk-folder-in');
+    if(inp) inp.focus();
+  }, 80);
+}
 async function addSkillGit(){const v=document.getElementById('sk-git-in').value.trim();if(!v)return;banner('blue', tr('banner_cloning'));const j=await api('/api/import-skill-git',{url:v});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-git-in').value='';loadState();}}
 async function addSkillMd(){const n=document.getElementById('sk-md-name').value.trim();const c=document.getElementById('sk-md-content').value;if(!n||!c)return;const j=await api('/api/import-skill-markdown',{name:n,content:c});banner(j.success?'green':'red',j.message);if(j.success){document.getElementById('sk-md-name').value='';document.getElementById('sk-md-content').value='';loadState();}}
 async function uploadZip(path, inputId){
@@ -7278,6 +7354,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/bridge-plugin-mcp": lambda: bridge_plugin_mcp_to_desktop(data.get("plugin", ""), data.get("mcp", "")),
             "/api/package-plugin-skill": lambda: package_plugin_skill_for_desktop(data.get("plugin", ""), data.get("skill", "")),
             "/api/reveal-path": lambda: reveal_path_in_finder(data.get("path", "")),
+            "/api/pick-folder": lambda: pick_native_folder(data.get("prompt", "Choisis le dossier du skill")),
             "/api/watchdog-config": lambda: save_watchdog_config(data),
             "/api/scan-process": lambda: (True, scan_processes(data.get("pattern", ""))),
         }
