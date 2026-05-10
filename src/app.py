@@ -578,6 +578,45 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
     }
 
 
+def _list_desktop_skills():
+    """v1.13.3 - Skills decompresses par Claude Desktop pour ses sessions
+    actives. Path concret repere via diag fait sur la machine de Fabien :
+      ~/Library/Application Support/Claude/local-agent-mode-sessions/
+        skills-plugin/<session-uuid>/<task-uuid>/skills/<NAME>/SKILL.md
+
+    Le dossier contient les skills uploades via Settings > Customize >
+    Skills + les skills bundles Anthropic (logo-design, schedule, etc.).
+    Limitation : c'est session-dependent. Si Claude Desktop n'a aucune
+    session ouverte, le dir peut etre absent ou vide. Quand on detecte
+    un SKILL.md, on considere le skill 'actif' (charge actuellement par
+    Claude Desktop).
+    """
+    items = []
+    base = HOME / "Library/Application Support/Claude/local-agent-mode-sessions/skills-plugin"
+    if not base.is_dir():
+        return items
+    seen = set()
+    try:
+        for skill_md in base.rglob("SKILL.md"):
+            try:
+                skill_dir = skill_md.parent
+                if skill_dir.parent.name != "skills":
+                    continue
+                name = skill_dir.name
+                if name in seen or name.startswith("."):
+                    continue
+                seen.add(name)
+                meta = read_skill_meta(skill_dir)
+                items.append({"name": name, "_dir": skill_dir,
+                              "_source": "desktop", "_enabled": True,
+                              "meta": meta})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return items
+
+
 def _list_plugin_skills():
     """Retourne la liste des skills fournis par chaque plugin (active ou non).
     Chaque item porte _enabled (True/False) qui reflete l'etat du plugin parent.
@@ -680,6 +719,28 @@ def get_state():
             "description": meta["description"],
             "tags": meta["tags"],
             "source": it["_source"],
+            "editable": False,
+            "quality": _skill_quality(meta["description"]),
+            "usage_count": int(usage_counts.get(it["name"], 0)),
+        })
+    # v1.13.3 - skills decompresses par Claude Desktop dans son dir local-
+    # agent-mode-sessions. Inclut les skills uploades via Customize > Skills
+    # ainsi que les bundled Anthropic. Precedence : user > plugin > desktop
+    # (si meme nom existe deja, on n'ajoute pas le desktop pour eviter le
+    # bruit visuel).
+    seen_names = {s["name"] for s in skills}
+    for it in _list_desktop_skills():
+        if it["name"] in seen_names:
+            continue
+        seen_names.add(it["name"])
+        meta = it["meta"]
+        skills.append({
+            "name": it["name"], "active": True,
+            "category": meta["category"],
+            "auto_category": _auto_category(meta["description"], it["name"]) if not meta["category"] else None,
+            "description": meta["description"],
+            "tags": meta["tags"],
+            "source": it["_source"],  # "desktop"
             "editable": False,
             "quality": _skill_quality(meta["description"]),
             "usage_count": int(usage_counts.get(it["name"], 0)),
@@ -4927,6 +4988,8 @@ fr: {
   mcp_col_stopped_empty: "Tous les MCPs tournent",
   skill_filter_mine: "Mes skills",
   skill_filter_plugins: "Plugins",
+  skill_filter_desktop: "Claude Desktop",
+  skill_source_desktop_tooltip: "Skill chargé par Claude Desktop (uploadé via Settings → Customize → Skills, ou bundled Anthropic). Détecté dans local-agent-mode-sessions/skills-plugin/.",
   skill_filter_all: "Tous",
   skill_filter_all_cats: "Toutes les catégories",
   category_filter: "Catégorie",
@@ -5235,6 +5298,8 @@ en: {
   mcp_col_stopped_empty: "All MCPs are running",
   skill_filter_mine: "My skills",
   skill_filter_plugins: "Plugins",
+  skill_filter_desktop: "Claude Desktop",
+  skill_source_desktop_tooltip: "Skill loaded by Claude Desktop (uploaded via Settings → Customize → Skills, or bundled by Anthropic). Detected in local-agent-mode-sessions/skills-plugin/.",
   skill_filter_all: "All",
   skill_filter_all_cats: "All categories",
   category_filter: "Category",
@@ -5706,7 +5771,8 @@ function _filterSkillsExcept(skills, exclude){
   }
   if(exclude !== 'source'){
     if(SKILL_SOURCE_FILTER==='user')     f = f.filter(s=>s.source==='user');
-    else if(SKILL_SOURCE_FILTER==='plugin') f = f.filter(s=>s.source!=='user');
+    else if(SKILL_SOURCE_FILTER==='plugin') f = f.filter(s=>typeof s.source==='string' && s.source.startsWith('plugin:'));
+    else if(SKILL_SOURCE_FILTER==='desktop') f = f.filter(s=>s.source==='desktop');
   }
   if(exclude !== 'cat'){
     if(SKILL_CAT_FILTER)                 f = f.filter(s=>_skillCatKey(s)===SKILL_CAT_FILTER.toLowerCase());
@@ -5772,10 +5838,12 @@ function _renderFiltersSidebar(skills){
   const gUsageNever = skills.filter(s=>(s.usage_count||0)===0).length;
 
   const userCount = baseSource.filter(s=>s.source==='user').length;
-  const pluginCount = baseSource.filter(s=>s.source!=='user').length;
+  const pluginCount = baseSource.filter(s=>typeof s.source==='string' && s.source.startsWith('plugin:')).length;
+  const desktopCount = baseSource.filter(s=>s.source==='desktop').length;
   const sourceAll = baseSource.length;
   const gUserCount = skills.filter(s=>s.source==='user').length;
-  const gPluginCount = skills.filter(s=>s.source!=='user').length;
+  const gPluginCount = skills.filter(s=>typeof s.source==='string' && s.source.startsWith('plugin:')).length;
+  const gDesktopCount = skills.filter(s=>s.source==='desktop').length;
 
   // v1.10.6 - groupage case-insensitive. Bug : 'Workflow' et 'workflow'
   // dans 2 SKILL.md differents creaient 2 categories distinctes. On
@@ -5848,6 +5916,7 @@ function _renderFiltersSidebar(skills){
       ${radio('source','all',tr('filter_all'),sourceAll,totalAll,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
       ${radio('source','user',tr('skill_filter_mine'),userCount,gUserCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
       ${radio('source','plugin',tr('skill_filter_plugins'),pluginCount,gPluginCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
+      ${radio('source','desktop',tr('skill_filter_desktop'),desktopCount,gDesktopCount,SKILL_SOURCE_FILTER,'setSkillSourceFilter')}
     </div>
     <div>
       <div class="text-[10px] uppercase tracking-wide font-semibold text-stone-500 mb-1.5">${tr('category_filter')}</div>
@@ -5874,9 +5943,13 @@ function _renderSkillCard(sk){
   // signaler visuellement qu'ils ne sont pas dans le bucket actionable.
   // Le dot quality reste pour l'info mais discret.
   const borderClass = isPlugin ? 'border-stone-300' : q.border;
+  // v1.13.3 - distingue 3 sources : user (ecran d'edition), plugin (cadenas
+  // marketplace), desktop (skill charge par Claude Desktop, read-only ici).
   const sourceBadge = sk.source==='user'
     ? `<span class="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded">${tr('source_badge_user')}</span>`
-    : `<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded" title="${escAttr(sk.source)} - ${tr('plugin_readonly_tooltip')}">${tr('source_badge_plugin')}</span>`;
+    : (sk.source==='desktop'
+        ? `<span class="text-[10px] bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded" title="${escAttr(tr('skill_source_desktop_tooltip'))}">${tr('skill_filter_desktop')}</span>`
+        : `<span class="text-[10px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded" title="${escAttr(sk.source)} - ${tr('plugin_readonly_tooltip')}">${tr('source_badge_plugin')}</span>`);
   const usageBadge = (sk.usage_count||0)>0
     ? `<span class="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded font-mono" title="${tr('used_x_times').split('{n}').join(sk.usage_count)}">${sk.usage_count}&times;</span>`
     : '';
