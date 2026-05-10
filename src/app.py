@@ -5449,6 +5449,26 @@ let SKILL_SELECTED       = new Set();
 function setSkillStatusFilter(v){ SKILL_STATUS_FILTER=v; localStorage.setItem('cc-skill-status', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
 function setSkillQualityFilter(v){ SKILL_QUALITY_FILTER=v; localStorage.setItem('cc-skill-quality', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
 function setSkillUsageFilter(v){ SKILL_USAGE_FILTER=v; localStorage.setItem('cc-skill-usage', v); SKILL_SELECTED.clear(); _rerenderSkillsFromCache(); }
+// v1.12.2 - clic depuis les chips du health banner. Le banner compte global
+// mais l'utilisateur peut etre filtre sur Plugins+Workflow par exemple, ou
+// les skills user broken n'apparaitront pas. On reset les filtres
+// incompatibles pour rendre les skills concernes immediatement visibles.
+function focusOnSkillQuality(v){
+  SKILL_QUALITY_FILTER = v;
+  SKILL_SOURCE_FILTER = 'user'; // broken/enrich ne comptent que les user skills
+  SKILL_STATUS_FILTER = 'all';
+  SKILL_USAGE_FILTER = 'all';
+  SKILL_CAT_FILTER = '';
+  localStorage.setItem('cc-skill-quality', v);
+  localStorage.setItem('cc-skill-src', 'user');
+  localStorage.setItem('cc-skill-status', 'all');
+  localStorage.setItem('cc-skill-usage', 'all');
+  localStorage.setItem('cc-skill-cat', '');
+  SKILL_SELECTED.clear();
+  const search = document.getElementById('skills-search');
+  if(search) search.value = '';
+  _rerenderSkillsFromCache();
+}
 
 // v1.10.1 - reset all filtres en un clic. Bug observe : utilisateur
 // accumule des filtres incompatibles et se retrouve avec 0 resultat,
@@ -5539,8 +5559,8 @@ function _renderHealthBanner(skills){
   const userNames = new Set(skills.filter(s=>s.source==='user').map(s=>s.name));
   const pluginNames = new Set(skills.filter(s=>s.source!=='user').map(s=>s.name));
   let dups = 0; userNames.forEach(n=>{ if(pluginNames.has(n)) dups++; });
-  const chipBroken = broken>0 ? `<button onclick="setSkillQualityFilter('broken')" class="text-xs px-2.5 py-1 rounded-full bg-red-50 text-red-700 border border-red-200 hover:bg-red-100">${broken} ${tr('chip_broken_action')}</button>` : '';
-  const chipEnrich = enrich>0 ? `<button onclick="setSkillQualityFilter('enrich')" class="text-xs px-2.5 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100">${enrich} ${tr('chip_enrich_action')}</button>` : '';
+  const chipBroken = broken>0 ? `<button onclick="focusOnSkillQuality('broken')" class="text-xs px-2.5 py-1 rounded-full bg-red-50 text-red-700 border border-red-200 hover:bg-red-100">${broken} ${tr('chip_broken_action')}</button>` : '';
+  const chipEnrich = enrich>0 ? `<button onclick="focusOnSkillQuality('enrich')" class="text-xs px-2.5 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100">${enrich} ${tr('chip_enrich_action')}</button>` : '';
   const chipDup = dups>0 ? `<button onclick="cleanupDuplicateUserSkills()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${dups} ${tr('chip_duplicate_action')}</button>` : '';
   const allOk = (broken+enrich+dups)===0 ? `<span class="text-xs text-green-700">${tr('skills_health_all_good')}</span>` : '';
   const banner = document.getElementById('skills-health-banner');
