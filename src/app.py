@@ -4280,6 +4280,7 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 <span>&#x21bb;</span><span data-i18n="restart_claude">Redémarrer Claude</span></button>
 </div></header>
 <div id="banner" class="hidden mb-4 p-3 rounded-lg text-sm border"></div>
+<div id="toasts" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm pointer-events-none"></div>
 <div id="watchdog-widget" class="mb-4"></div>
 <nav id="main-tabs" class="flex gap-1 mb-6 bg-stone-100 p-1 rounded-lg overflow-x-auto">
 <button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="overview" onclick="setMainTab('overview')" data-i18n="tab_overview">Vue d'ensemble</button>
@@ -5895,18 +5896,40 @@ function pluginDetailHtml(c, fn){
   if(c.commands && c.commands.length) sections.push(`<div><span class="text-xs font-semibold uppercase tracking-wide text-stone-600">Commands</span><div class="mt-1 flex flex-wrap gap-1.5">${c.commands.map(s=>`<span class="text-xs bg-stone-100 px-2 py-0.5 rounded">/${escAttr(s)}</span>`).join('')}</div></div>`);
   return sections.length ? `<div class="mt-3 pt-3 border-t border-stone-100 space-y-3">${sections.join('')}</div>` : `<div class="mt-3 pt-3 border-t border-stone-100 text-xs text-stone-400">${tr('plugin_no_content')}</div>`;
 }
+// v1.12.1 - feedback visuel immediat : on remplace le bouton clique par un
+// "..." disabled pour que l'utilisateur sache que l'action est en cours,
+// avant meme que la requete API revienne. Sinon le bouton reste cliquable
+// et l'user peut redoublecliquer / penser que rien ne se passe.
+function _markBtnPending(btn){
+  if(!btn) return null;
+  const orig = btn.outerHTML;
+  btn.disabled = true;
+  btn.textContent = '...';
+  btn.classList.add('opacity-60','cursor-wait');
+  return orig;
+}
+function _restoreBtn(btn, orig){
+  if(btn && orig) btn.outerHTML = orig;
+}
 async function bridgePluginMcp(pluginFullName, mcpName){
   if(!confirm(tr('confirm_bridge_plugin_mcp').split('{mcp}').join(mcpName))) return;
+  const btn = (event && event.target) || null;
+  const orig = _markBtnPending(btn);
   const j = await api('/api/bridge-plugin-mcp', {plugin: pluginFullName, mcp: mcpName});
   banner(j.success?'green':'red', j.message);
   if(j.success){ loadPlugins(); loadState(); loadOverview(); }
+  else { _restoreBtn(btn, orig); }
 }
 async function packagePluginSkill(pluginFullName, skillName){
+  const btn = (event && event.target) || null;
+  const orig = _markBtnPending(btn);
   const j = await api('/api/package-plugin-skill', {plugin: pluginFullName, skill: skillName});
   banner(j.success?'green':'red', j.message);
   if(j.success){
     PACKAGED_SKILLS.add(pluginFullName + '/' + skillName);
     loadPlugins();
+  } else {
+    _restoreBtn(btn, orig);
   }
 }
 const OPEN_PLUGINS = new Set();
@@ -6819,7 +6842,22 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Escape'){closeSavePreset();closeMcpError();closeAddPlugin();closeCmdEdit();}
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
-function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);}
+function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);toast(c,m);}
+// v1.12.1 - toast bottom-right toujours visible peu importe le scroll. La
+// banniere classique reste pour le top de page mais ne sert plus a rien
+// quand l'utilisateur est scrolle dans la liste des plugins.
+function toast(c,m){
+  const wrap = document.getElementById('toasts'); if(!wrap) return;
+  const cls = {green:'bg-green-600 border-green-700',red:'bg-red-600 border-red-700',blue:'bg-blue-600 border-blue-700'}[c] || 'bg-stone-700 border-stone-800';
+  const el = document.createElement('div');
+  el.className = 'pointer-events-auto text-white text-sm rounded-lg shadow-lg border px-4 py-3 flex items-start gap-2 ' + cls;
+  el.style.cssText = 'opacity:0;transform:translateY(8px);transition:opacity .15s,transform .15s';
+  el.innerHTML = `<div class="flex-1 break-words">${String(m).replace(/[<>&]/g,s=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[s]))}</div><button type="button" class="text-white/80 hover:text-white text-xs leading-none px-1" aria-label="close">&#10005;</button>`;
+  el.querySelector('button').onclick = ()=>el.remove();
+  wrap.appendChild(el);
+  requestAnimationFrame(()=>{el.style.opacity='1';el.style.transform='translateY(0)';});
+  setTimeout(()=>{el.style.opacity='0';el.style.transform='translateY(8px)';setTimeout(()=>el.remove(),200);}, 7000);
+}
 applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();loadWatchdogTab();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(loadWatchdog,10000);setInterval(loadWatchdogTab,10000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
 
@@ -7029,8 +7067,15 @@ def main():
     print(f"\n  Claude Control v{get_local_version()} - http://localhost:{PORT}")
     print(f"  Cmd+C pour arreter\n")
     socketserver.TCPServer.allow_reuse_address = True
+    # v1.12.1 - serveur multi-thread pour eviter que les setInterval JS
+    # (loadState 5s, loadOverview 10s, loadPlugins 15s, etc.) bloquent en
+    # cascade les actions utilisateur. Avant : un POST /api/package-plugin-skill
+    # pouvait attendre 1-2s qu'un loadPlugins en cours finisse, donnant une
+    # impression de lag tres marquee.
+    class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
     try:
-        server = socketserver.TCPServer(("127.0.0.1", PORT), Handler)
+        server = ThreadingTCPServer(("127.0.0.1", PORT), Handler)
     except OSError as e:
         if e.errno in (48, 98, 10048):
             _log(f"port {PORT} already in use, opening browser to existing instance")
