@@ -4058,17 +4058,50 @@ def package_plugin_skill_for_desktop(full_name, skill_name):
                     z.write(f, arcname.as_posix())
     except Exception as e:
         return False, f"Echec creation .zip : {e}"
-    try:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", str(zip_path)])
-    except Exception:
-        pass
-    return True, {"message": (f"Skill '{skill_name}' zippe dans {zip_path}. "
-                              f"Glisse-le dans Settings > Customize > Skills de "
-                              f"Claude Desktop (Finder ouvert sur le fichier)."),
+    # v1.13.2 - on n'ouvre plus Finder automatiquement. Sur macOS un
+    # 'open -R' coute 0.5-2s pour faire apparaitre la fenetre, et pour
+    # 8 skills d'un meme plugin l'utilisateur se tapait 8 fenetres
+    # Finder. Maintenant le toast UI expose un bouton "Reveler dans
+    # Finder" qui appelle /api/reveal-path uniquement si l'user veut.
+    return True, {"message": (f"Skill '{skill_name}' zippe : {zip_path}. "
+                              f"Glisse-le dans Settings > Customize > Skills "
+                              f"de Claude Desktop."),
                   "zip_path": str(zip_path),
                   "skill": skill_name,
                   "plugin": full_name}
+
+
+def reveal_path_in_finder(path):
+    """v1.13.2 - Revele un fichier dans Finder sur macOS. Appele a la
+    demande par le toast UI ('Reveler dans Finder'), plus
+    automatiquement apres chaque import de skill (Finder lent + spam
+    pour les imports multiples).
+
+    Refus si le path n'est pas un fichier ou s'echappe de ~/Downloads
+    ou de TMPDIR (defense en profondeur, le path vient quand meme
+    d'un endpoint cote serveur).
+    """
+    if not path:
+        return False, "Chemin manquant"
+    try:
+        p = Path(path).resolve()
+    except Exception as e:
+        return False, f"Chemin invalide : {e}"
+    if not p.is_file():
+        return False, f"Fichier introuvable : {p}"
+    allowed_roots = [
+        (HOME / "Downloads").resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+    ]
+    if not any(str(p).startswith(str(root) + os.sep) for root in allowed_roots):
+        return False, f"Chemin hors zone autorisee : {p}"
+    if sys.platform != "darwin":
+        return False, "Reveler dans Finder n'est disponible que sur macOS"
+    try:
+        subprocess.Popen(["open", "-R", str(p)])
+        return True, f"Finder ouvert sur {p.name}"
+    except Exception as e:
+        return False, f"Echec ouverture Finder : {e}"
 
 
 def _split_plugin_name(full_name):
@@ -6053,11 +6086,16 @@ async function packagePluginSkill(pluginFullName, skillName){
   const btn = (event && event.target) || null;
   const orig = _markBtnPending(btn);
   const j = await api('/api/package-plugin-skill', {plugin: pluginFullName, skill: skillName});
-  banner(j.success?'green':'red', j.message);
   if(j.success){
     PACKAGED_SKILLS.add(pluginFullName + '/' + skillName);
+    // v1.13.2 - toast actionnable. Plus de Finder auto (lent + spam).
+    // L'user peut reveler a la demande via le bouton du toast.
+    toast('green', j.message, {actions: [
+      {label: 'Reveler dans Finder', onClick: ()=>_revealPathInFinder(j.zip_path)}
+    ]});
     loadPlugins();
   } else {
+    banner('red', j.message);
     _restoreBtn(btn, orig);
   }
 }
@@ -6975,17 +7013,35 @@ function banner(c,m){const b=document.getElementById('banner');const cls={green:
 // v1.12.1 - toast bottom-right toujours visible peu importe le scroll. La
 // banniere classique reste pour le top de page mais ne sert plus a rien
 // quand l'utilisateur est scrolle dans la liste des plugins.
-function toast(c,m){
+// v1.13.2 - opts.actions = [{label, onClick}] pour exposer des CTA dans
+// le toast (ex: "Reveler dans Finder" apres un import skill, optionnel).
+function toast(c,m,opts){
   const wrap = document.getElementById('toasts'); if(!wrap) return;
   const cls = {green:'bg-green-600 border-green-700',red:'bg-red-600 border-red-700',blue:'bg-blue-600 border-blue-700'}[c] || 'bg-stone-700 border-stone-800';
   const el = document.createElement('div');
-  el.className = 'pointer-events-auto text-white text-sm rounded-lg shadow-lg border px-4 py-3 flex items-start gap-2 ' + cls;
+  el.className = 'pointer-events-auto text-white text-sm rounded-lg shadow-lg border px-4 py-3 flex flex-col gap-2 ' + cls;
   el.style.cssText = 'opacity:0;transform:translateY(8px);transition:opacity .15s,transform .15s';
-  el.innerHTML = `<div class="flex-1 break-words">${String(m).replace(/[<>&]/g,s=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[s]))}</div><button type="button" class="text-white/80 hover:text-white text-xs leading-none px-1" aria-label="close">&#10005;</button>`;
-  el.querySelector('button').onclick = ()=>el.remove();
+  const escMsg = String(m).replace(/[<>&]/g,s=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[s]));
+  const actions = (opts && opts.actions) || [];
+  const actionsHtml = actions.length
+    ? `<div class="flex gap-2 flex-wrap">${actions.map((a,i)=>`<button type="button" data-toast-action="${i}" class="text-xs bg-white/20 hover:bg-white/30 text-white rounded px-2 py-1 font-medium">${String(a.label).replace(/[<>&]/g,s=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[s]))}</button>`).join('')}</div>`
+    : '';
+  el.innerHTML = `<div class="flex items-start gap-2"><div class="flex-1 break-words">${escMsg}</div><button type="button" data-toast-close="1" class="text-white/80 hover:text-white text-xs leading-none px-1" aria-label="close">&#10005;</button></div>${actionsHtml}`;
+  el.querySelector('[data-toast-close]').onclick = ()=>el.remove();
+  actions.forEach((a,i)=>{
+    const b = el.querySelector(`[data-toast-action="${i}"]`);
+    if(b) b.onclick = ()=>{ try{ a.onClick(); }catch(e){ console.error(e); } };
+  });
+  // v1.13.2 - persiste plus longtemps quand il y a une action, l'user
+  // a besoin de temps pour cliquer.
+  const ttl = actions.length ? 12000 : 7000;
   wrap.appendChild(el);
   requestAnimationFrame(()=>{el.style.opacity='1';el.style.transform='translateY(0)';});
-  setTimeout(()=>{el.style.opacity='0';el.style.transform='translateY(8px)';setTimeout(()=>el.remove(),200);}, 7000);
+  setTimeout(()=>{el.style.opacity='0';el.style.transform='translateY(8px)';setTimeout(()=>el.remove(),200);}, ttl);
+}
+async function _revealPathInFinder(path){
+  if(!path) return;
+  try{ await api('/api/reveal-path', {path: path}); }catch(e){ console.error(e); }
 }
 applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();loadWatchdogTab();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(loadWatchdog,10000);setInterval(loadWatchdogTab,10000);setInterval(checkUpdate,3600000);
 </script></body></html>"""
@@ -7148,6 +7204,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/add-plugin-git": lambda: add_plugin_from_git(data.get("url", "")),
             "/api/bridge-plugin-mcp": lambda: bridge_plugin_mcp_to_desktop(data.get("plugin", ""), data.get("mcp", "")),
             "/api/package-plugin-skill": lambda: package_plugin_skill_for_desktop(data.get("plugin", ""), data.get("skill", "")),
+            "/api/reveal-path": lambda: reveal_path_in_finder(data.get("path", "")),
             "/api/watchdog-config": lambda: save_watchdog_config(data),
             "/api/scan-process": lambda: (True, scan_processes(data.get("pattern", ""))),
         }
