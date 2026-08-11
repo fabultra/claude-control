@@ -153,8 +153,9 @@ class SuggestSkillDescriptionTests(unittest.TestCase):
         du skill + le content du SKILL.md."""
         captured = {}
 
-        def fake_call(prompt, timeout=60):
+        def fake_call(prompt, timeout=120, system_prompt=None):
             captured["prompt"] = prompt
+            captured["system"] = system_prompt
             return "Use this skill when handling invoice processing."
 
         with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
@@ -166,9 +167,11 @@ class SuggestSkillDescriptionTests(unittest.TestCase):
                          "Use this skill when handling invoice processing.")
         self.assertEqual(payload["source"], "claude_cli")
         # Verifie que le system prompt + content sont dans le prompt envoye
-        self.assertIn("descriptions for Claude Code skills", captured["prompt"])
+        # v1.14.1 - la consigne part dans --system-prompt, le message
+        # utilisateur ne porte plus que la matiere.
+        self.assertIn("description` field", captured["system"])
         self.assertIn("invoices", captured["prompt"])
-        self.assertIn("Skill name (folder): demo", captured["prompt"])
+        self.assertIn("Skill folder name: demo", captured["prompt"])
 
     def test_returns_error_for_unknown_skill(self):
         with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
@@ -178,7 +181,7 @@ class SuggestSkillDescriptionTests(unittest.TestCase):
 
     def _stub_cli(self, response_text):
         """v1.9.3 - helper pour stubber le CLI et tester le sanitizer."""
-        return patch.object(app, "_call_claude_cli", lambda prompt, timeout=60: response_text)
+        return patch.object(app, "_call_claude_cli", lambda prompt, timeout=120, system_prompt=None: response_text)
 
     def test_sanitizes_markdown_header_prefix(self):
         """Bug observe v1.9.0/1.9.1 : le LLM retourne parfois '## Use this
@@ -219,7 +222,7 @@ class SuggestSkillDescriptionTests(unittest.TestCase):
 
     def test_handles_cli_timeout(self):
         import subprocess
-        def boom(prompt, timeout=60):
+        def boom(prompt, timeout=120, system_prompt=None):
             raise subprocess.TimeoutExpired("claude", timeout)
         with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
             with patch.object(app, "_call_claude_cli", boom):
@@ -229,47 +232,50 @@ class SuggestSkillDescriptionTests(unittest.TestCase):
 
     def test_lang_fr_adds_french_directive(self):
         """v1.9.6 - le param lang='fr' doit ajouter une directive
-        'Respond in French' dans le system prompt envoye au CLI."""
+        de langue dans le system prompt envoye au CLI (--system-prompt)."""
         captured = {}
-        def fake_call(prompt, timeout=60):
+        def fake_call(prompt, timeout=120, system_prompt=None):
             captured["prompt"] = prompt
+            captured["system"] = system_prompt
             return "Utilise ce skill pour traiter les factures."
         with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
             with patch.object(app, "_call_claude_cli", fake_call):
                 ok, payload = app.suggest_skill_description("demo", lang="fr")
         self.assertTrue(ok, payload)
-        self.assertIn("Respond in French", captured["prompt"])
+        self.assertIn("in French", captured["system"])
         self.assertEqual(payload["lang"], "fr")
 
     def test_lang_en_adds_english_directive(self):
         captured = {}
-        def fake_call(prompt, timeout=60):
+        def fake_call(prompt, timeout=120, system_prompt=None):
             captured["prompt"] = prompt
+            captured["system"] = system_prompt
             return "Use this skill for invoices."
         with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
             with patch.object(app, "_call_claude_cli", fake_call):
                 ok, payload = app.suggest_skill_description("demo", lang="en")
         self.assertTrue(ok)
-        self.assertIn("Respond in English", captured["prompt"])
+        self.assertIn("in English", captured["system"])
 
     def test_lang_none_leaves_prompt_untouched(self):
         """Si lang=None (defaut), pas de directive de langue ajoutee."""
         captured = {}
-        def fake_call(prompt, timeout=60):
+        def fake_call(prompt, timeout=120, system_prompt=None):
             captured["prompt"] = prompt
+            captured["system"] = system_prompt
             return "anything"
         with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
             with patch.object(app, "_call_claude_cli", fake_call):
                 app.suggest_skill_description("demo")
-        self.assertNotIn("Respond in French", captured["prompt"])
-        self.assertNotIn("Respond in English", captured["prompt"])
+        self.assertNotIn("in French", captured["system"])
+        self.assertNotIn("in English", captured["system"])
 
     def test_detects_not_logged_in(self):
         """v1.9.5 - cas reel observe : le CLI exit 1 avec stdout
         'Not logged in / Please run /login'. On detecte ce pattern et
         on retourne un error_code dedie pour que l'UI affiche une
         instruction claire avec 'claude /login' a copier."""
-        def fake(prompt, timeout=60):
+        def fake(prompt, timeout=120, system_prompt=None):
             raise app.ClaudeCliNotLoggedIn(
                 "Claude Code CLI n'est pas authentifie. claude /login"
             )
