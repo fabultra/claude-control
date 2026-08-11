@@ -342,7 +342,7 @@ class BulkRepairTests(unittest.TestCase):
         with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
             ok, msg = app.start_bulk_repair()
         self.assertFalse(ok)
-        self.assertIn("deja en cours", msg)
+        self.assertIn("déjà en cours", msg)
 
     def test_cancel_without_run_is_reported(self):
         ok, msg = app.cancel_bulk_repair()
@@ -522,7 +522,7 @@ class BulkRepairPreflightTests(unittest.TestCase):
         st = app.bulk_repair_status()
         self.assertEqual(st["outcome"], "aborted")
         self.assertEqual(st["done"], 0, "aucun skill ne doit avoir ete traite")
-        self.assertIn("n'a pas repondu", st["abort_reason"])
+        self.assertIn("n'a pas répondu", st["abort_reason"])
         # les SKILL.md sont intacts
         body = (self.skills_dir / "s0" / "SKILL.md").read_text()
         self.assertIn('description: "trop court"', body)
@@ -559,7 +559,7 @@ class BulkRepairPreflightTests(unittest.TestCase):
         st = app.bulk_repair_status()
         self.assertEqual(st["outcome"], "aborted")
         self.assertEqual(calls["n"], 3, "on ne doit pas tenter les 20 skills")
-        self.assertIn("echecs consecutifs", st["abort_reason"])
+        self.assertIn("échecs consécutifs", st["abort_reason"])
 
     def test_consecutive_counter_resets_on_success(self):
         seq = [False, False, True, False, False, True]

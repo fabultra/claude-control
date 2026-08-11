@@ -835,9 +835,9 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
         }
     except subprocess.TimeoutExpired:
         _log("suggest_skill_description: claude CLI timeout")
-        return False, ("Timeout : le CLI Claude n'a pas repondu en 120 s. "
-                       "Teste-le a la main dans un terminal : "
-                       "echo bonjour | claude -p --safe-mode")
+        return False, ("Timeout : le CLI Claude n'a pas répondu en 120 s. "
+                       "Teste-le à la main dans un terminal : "
+                       "echo ping | claude -p --safe-mode")
     except FileNotFoundError as e:
         _log(f"suggest_skill_description: CLI not found : {e}")
         return False, ("Claude Code CLI introuvable dans le PATH. "
@@ -1046,9 +1046,9 @@ def bulk_repair_status():
 def cancel_bulk_repair():
     with _BULK_REPAIR_LOCK:
         if not _BULK_REPAIR["running"]:
-            return False, "Aucune reparation en cours"
+            return False, "Aucune réparation en cours"
         _BULK_REPAIR["cancelled"] = True
-    return True, "Annulation demandee - le skill en cours se termine"
+    return True, "Annulation demandée — le skill en cours se termine"
 
 
 def dismiss_bulk_repair():
@@ -1057,13 +1057,13 @@ def dismiss_bulk_repair():
     fermer."""
     with _BULK_REPAIR_LOCK:
         if _BULK_REPAIR["running"]:
-            return False, "Une reparation est en cours"
+            return False, "Une réparation est en cours"
         _BULK_REPAIR.update({
             "results": [], "done": 0, "total": 0, "phase": "idle",
             "aborted": False, "abort_reason": None, "cancelled": False,
             "started_at": None, "finished_at": None, "started_monotonic": None,
         })
-    return True, "Compte rendu efface"
+    return True, "Compte rendu effacé"
 
 
 def _bulk_repair_probe():
@@ -1085,9 +1085,9 @@ def _bulk_repair_probe():
             timeout=BULK_REPAIR_PROBE_TIMEOUT)
     except subprocess.TimeoutExpired:
         return False, time.monotonic() - started, (
-            f"Le CLI Claude n'a pas repondu a un appel trivial en "
-            f"{BULK_REPAIR_PROBE_TIMEOUT} s. Le lot n'a pas ete lance : il "
-            f"aurait echoue skill apres skill. Teste a la main dans un "
+            f"Le CLI Claude n'a pas répondu à un appel trivial en "
+            f"{BULK_REPAIR_PROBE_TIMEOUT} s. Le lot n'a pas été lancé : il "
+            f"aurait échoué skill après skill. Teste à la main dans un "
             f"terminal : echo ping | claude -p --safe-mode")
     except ClaudeCliNotLoggedIn as e:
         return False, time.monotonic() - started, str(e)
@@ -1096,8 +1096,8 @@ def _bulk_repair_probe():
     elapsed = time.monotonic() - started
     if not (out or "").strip():
         return False, elapsed, (
-            "Le CLI Claude a repondu sans aucun texte. Le lot n'a pas ete "
-            "lance. Teste : echo ping | claude -p --safe-mode")
+            "Le CLI Claude a répondu sans aucun texte. Le lot n'a pas été "
+            "lancé. Teste : echo ping | claude -p --safe-mode")
     return True, elapsed, None
 
 
@@ -1152,13 +1152,13 @@ def _bulk_repair_worker(targets, lang):
             # timeout). Sans ca, les deux donnent le meme "Timeout".
             hint = ""
             if probe_seconds and probe_seconds < 30:
-                hint = (f" Le CLI avait pourtant repondu en "
-                        f"{probe_seconds:.0f} s a un appel trivial : la panne "
-                        f"vient probablement du contenu envoye, pas du CLI.")
+                hint = (f" Le CLI avait pourtant répondu en "
+                        f"{probe_seconds:.0f} s à un appel trivial : la panne "
+                        f"vient probablement du contenu envoyé, pas du CLI.")
             _bulk_repair_abort(
-                f"Arret apres {consecutive_failures} echecs consecutifs "
+                f"Arrêt après {consecutive_failures} échecs consécutifs "
                 f"(dernier : {str(entry.get('error') or '')[:140]})."
-                f"{hint} Les skills restants n'ont pas ete touches.")
+                f"{hint} Les skills restants n'ont pas été touchés.")
             return
     with _BULK_REPAIR_LOCK:
         _BULK_REPAIR["running"] = False
@@ -1178,13 +1178,13 @@ def start_bulk_repair(lang=None, include_synced=False):
     insuffisante. Retourne immediatement ; l'UI suit via /api/repair-all-status."""
     with _BULK_REPAIR_LOCK:
         if _BULK_REPAIR["running"]:
-            return False, "Une reparation est deja en cours"
+            return False, "Une réparation est déjà en cours"
     if not _claude_cli_path():
         return False, ("Claude Code CLI ('claude') introuvable dans le PATH. "
                        "Installer avec : npm install -g @anthropic-ai/claude-code")
     targets = _repairable_user_skills(include_synced=include_synced)
     if not targets:
-        return True, {"message": "Aucun skill a reparer", "total": 0, "started": False}
+        return True, {"message": "Aucun skill à réparer", "total": 0, "started": False}
     with _BULK_REPAIR_LOCK:
         _BULK_REPAIR.update({
             "running": True, "total": len(targets), "done": 0,
@@ -1196,7 +1196,7 @@ def start_bulk_repair(lang=None, include_synced=False):
         })
     threading.Thread(target=_bulk_repair_worker, args=(targets, lang),
                      name="claude-control-bulk-repair", daemon=True).start()
-    return True, {"message": f"Verification du CLI, puis {len(targets)} skill(s)",
+    return True, {"message": f"Vérification du CLI, puis {len(targets)} skill(s)",
                   "total": len(targets), "started": True}
 
 
@@ -6893,13 +6893,13 @@ function _renderHealthBanner(skills){
   // v1.14.1 - un seul bouton pour tout reparer, au lieu de N allers-retours
   // dans la modale de reparation.
   const bulkBtn = (broken+enrich) > 1
-    ? `<button onclick="startBulkRepair(false)" class="text-xs px-2.5 py-1 rounded-full bg-green-700 text-white border border-green-800 hover:bg-green-800" title="${escAttr(tr('bulk_repair_title'))}">${escAttr(tr('bulk_repair_btn').replace('{n}', String(broken+enrich)))}</button>`
+    ? `<button id="bulk-repair-btn" onclick="startBulkRepair(false)" class="text-xs px-2.5 py-1 rounded-full bg-green-700 text-white border border-green-800 hover:bg-green-800 disabled:opacity-40 disabled:cursor-not-allowed" title="${escAttr(tr('bulk_repair_title'))}">${escAttr(tr('bulk_repair_btn').replace('{n}', String(broken+enrich)))}</button>`
     : '';
   // v1.14.1 - skills synchronises depuis le compte Claude : reparables, mais
   // seulement sur action explicite (une resynchro peut ecraser l'ecriture).
   const syncedWeak = skills.filter(s=>s.source==='synced' && s.quality!=='excellent').length;
   const syncedBtn = syncedWeak > 0
-    ? `<button onclick="startBulkRepair(true)" class="text-xs px-2.5 py-1 rounded-full bg-sky-50 text-sky-800 border border-sky-200 hover:bg-sky-100" title="${escAttr(tr('bulk_repair_synced_title'))}">${escAttr(tr('bulk_repair_synced_btn').replace('{n}', String(syncedWeak)))}</button>`
+    ? `<button id="bulk-repair-synced-btn" onclick="startBulkRepair(true)" class="text-xs px-2.5 py-1 rounded-full bg-sky-50 text-sky-800 border border-sky-200 hover:bg-sky-100 disabled:opacity-40 disabled:cursor-not-allowed" title="${escAttr(tr('bulk_repair_synced_title'))}">${escAttr(tr('bulk_repair_synced_btn').replace('{n}', String(syncedWeak)))}</button>`
     : '';
   const banner = document.getElementById('skills-health-banner');
   if(!banner) return;
@@ -6972,6 +6972,13 @@ async function refreshBulkRepair(){
   catch(e){ return; }
   const stale = document.getElementById('bulk-repair-progress');
   if(stale) stale.classList.add('hidden');
+  // v1.14.2 - pendant un lot, le bouton "Reparer les N descriptions" restait
+  // vert et cliquable juste au-dessus de "Reparation en cours 1/93". Cliquer
+  // ne relance rien ("deja en cours") mais rien ne le laissait deviner.
+  ['bulk-repair-btn','bulk-repair-synced-btn'].forEach(id=>{
+    const b = document.getElementById(id);
+    if(b) b.disabled = !!st.running;
+  });
   if(st.outcome === 'idle'){
     const p = document.getElementById('bulk-repair-panel');
     if(p) p.remove();
