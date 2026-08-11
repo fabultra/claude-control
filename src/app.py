@@ -385,16 +385,99 @@ def read_skill_meta(skill_dir):
     end = content.find("\n---", 3)
     if end == -1:
         return meta
-    for line in content[3:end].splitlines():
-        for key in ("category", "description"):
-            m = re.match(rf'^\s*{key}\s*:\s*(.+?)\s*$', line)
+    fm_lines = content[3:end].splitlines()
+    for key, start, stop in _frontmatter_entries(fm_lines):
+        if key in ("category", "description"):
+            meta[key] = _frontmatter_scalar(fm_lines, (key, start, stop)) or None
+        elif key == "tags":
+            m = re.match(r'^\s*tags\s*:\s*\[([^\]]*)\]\s*$', fm_lines[start])
             if m:
-                v = m.group(1).strip().strip('"').strip("'")
-                meta[key] = v or None
-        m = re.match(r'^\s*tags\s*:\s*\[([^\]]*)\]\s*$', line)
-        if m:
-            meta["tags"] = [t.strip().strip('"').strip("'") for t in m.group(1).split(",") if t.strip()]
+                meta["tags"] = [_fm_unquote(t) for t in m.group(1).split(",")
+                                if t.strip()]
     return meta
+
+
+# v1.14.5 - Une cle de frontmatter n'occupe pas forcement une seule ligne.
+# YAML autorise le scalaire replie (`>`), le litteral (`|`), la valeur sur
+# les lignes suivantes et la continuation indentee -- des formes courantes
+# des qu'une description depasse la largeur d'ecran. Le parseur ligne-a-ligne
+# lisait alors ">-" ou "|" comme valeur (1 a 2 caracteres) et l'app declarait
+# "description trop courte" sur des skills parfaitement decrits ; quand la
+# valeur commencait a la ligne suivante, elle les declarait carrement sans
+# description.
+#
+# Plus grave : la reecriture remplacait la seule ligne `description:` et
+# laissait les lignes de continuation orphelines derriere elle, ce qui donne
+# un YAML invalide. Reparer un skill mal juge le cassait pour de bon, avec
+# un message de succes.
+#
+# Lecture et ecriture partagent desormais ce decoupage : ce que l'app sait
+# lire, elle sait le remplacer entierement.
+_FM_KEY_RE = re.compile(r'^(?P<key>[A-Za-z_][A-Za-z0-9_-]*)\s*:(?P<rest>.*)$')
+
+
+def _frontmatter_entries(fm_lines):
+    """v1.14.5 - Decoupe un frontmatter en (cle, debut, fin).
+
+    Une entree s'etend de sa ligne `cle:` jusqu'a la prochaine cle de
+    premier niveau : elle englobe donc toutes ses lignes de continuation.
+    """
+    entries = []
+    for i, line in enumerate(fm_lines):
+        m = _FM_KEY_RE.match(line) if line[:1].strip() else None
+        if m:
+            entries.append([m.group("key"), i, i + 1])
+        elif entries:
+            entries[-1][2] = i + 1
+    return [tuple(e) for e in entries]
+
+
+def _fm_unquote(v):
+    """v1.14.5 - Deballe une valeur scalaire YAML.
+
+    L'app ecrit ses valeurs via json.dumps (_yaml_quote_value) : les relire
+    avec un simple strip('"') rendait litteralement les \\" et \\n d'une
+    description qui en contenait.
+    """
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        try:
+            return json.loads(v)
+        except Exception:
+            return v[1:-1]
+    if len(v) >= 2 and v[0] == v[-1] == "'":
+        return v[1:-1].replace("''", "'")
+    return v
+
+
+def _frontmatter_scalar(fm_lines, entry):
+    """v1.14.5 - Valeur complete d'une entree, quelle que soit sa forme."""
+    _key, start, stop = entry
+    m = _FM_KEY_RE.match(fm_lines[start])
+    rest = (m.group("rest") if m else "").strip()
+    cont = [l.strip() for l in fm_lines[start + 1:stop]]
+    style = rest[:1] if rest[:1] in ("|", ">") else ""
+
+    if not style and rest:
+        # Scalaire simple, eventuellement continue sur les lignes suivantes.
+        return _fm_unquote(" ".join([rest] + [l for l in cont if l]))
+
+    while cont and not cont[-1]:
+        cont.pop()
+    if style == "|":
+        return "\n".join(cont)
+    # Replie ('>') ou valeur commencant a la ligne suivante : les lignes se
+    # joignent par une espace, une ligne vide separe deux paragraphes.
+    paragraphs, current = [], []
+    for line in cont:
+        if line:
+            current.append(line)
+        elif current:
+            paragraphs.append(" ".join(current))
+            current = []
+    if current:
+        paragraphs.append(" ".join(current))
+    return _fm_unquote("\n".join(paragraphs))
 
 
 def _yaml_quote_value(s):
@@ -432,16 +515,18 @@ def _update_skill_frontmatter(content, updates):
     les caracteres speciaux.
     """
     fm_lines, body = _split_skill_frontmatter(content)
-    # Map cle -> index pour replace en place
-    existing_idx = {}
-    for i, line in enumerate(fm_lines):
-        m = re.match(r'^\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s*:', line)
-        if m:
-            existing_idx[m.group(1)] = i
     for key, value in updates.items():
         new_line = f"{key}: {_yaml_quote_value(value)}"
-        if key in existing_idx:
-            fm_lines[existing_idx[key]] = new_line
+        # v1.14.5 - on remplace l'entree ENTIERE, pas sa premiere ligne. Sur
+        # un scalaire multi-ligne, ne remplacer que la ligne `cle:` laissait
+        # ses lignes de continuation derriere elle : le frontmatter devenait
+        # invalide et le skill cessait d'etre lu, alors que l'app annoncait
+        # une reparation reussie. Les index sont recalcules a chaque passe,
+        # une entree remplacee changeant la longueur du bloc.
+        spans = {k: (s, e) for k, s, e in _frontmatter_entries(fm_lines)}
+        if key in spans:
+            start, stop = spans[key]
+            fm_lines[start:stop] = [new_line]
         else:
             fm_lines.append(new_line)
     new_fm = "---\n" + "\n".join(fm_lines) + "\n---\n"
@@ -730,6 +815,9 @@ def _cli_env():
 
 CLI_DIAG_PING_TIMEOUT = 60
 CLI_DIAG_PROBE_TIMEOUT = 45
+# Plancher de la bissection : un appel sain repond en une poignee de
+# secondes, mais un demarrage a froid merite une marge.
+_CLI_DIAG_PROBE_TIMEOUT_MIN = 20
 
 # v1.14.4 - flags de l'appel reel, isoles pour que le diagnostic puisse les
 # RETIRER. Le CLI Claude Code se met a jour tout seul : un flag valide hier
@@ -820,16 +908,24 @@ def _cli_probe(optional, timeout=CLI_DIAG_PROBE_TIMEOUT):
     return {"ok": True, "seconds": secs, "reply": out[:120]}
 
 
-def _blame_cli_flag():
+def _blame_cli_flag(reference_seconds=None):
     """v1.14.4 - Quel flag fait caler l'appel ?
 
     Appele uniquement quand l'appel complet echoue ET que l'appel nu passe :
     a ce stade la panne est forcement dans les flags optionnels. On les
     ajoute un par un et on s'arrete au premier qui bloque -- le cas courant
     coute une seule sonde.
+
+    Le budget par sonde est deduit de l'appel nu qui vient de reussir : s'il
+    a repondu en 7 s, un flag qui depasse 28 s ne repondra pas. Attendre 45 s
+    de plus par flag n'apprendrait rien et ferait patienter l'utilisateur
+    plusieurs minutes devant un ecran fixe.
     """
+    budget = _CLI_DIAG_PROBE_TIMEOUT_MIN if reference_seconds is None else \
+        max(_CLI_DIAG_PROBE_TIMEOUT_MIN,
+            min(CLI_DIAG_PROBE_TIMEOUT, round(reference_seconds * 4)))
     for flag in _CLI_OPTIONAL_FLAGS:
-        if not _cli_probe((flag,))["ok"]:
+        if not _cli_probe((flag,), timeout=budget)["ok"]:
             return flag
     return None
 
@@ -6406,6 +6502,7 @@ fr: {
   repair_skill_diag_btn: "Diagnostiquer le CLI Claude Code",
   repair_skill_timeout_diag: "Timeout — diagnostic du CLI en cours…",
   cli_diag_running: "Test du CLI en cours (mêmes options que la réparation)…",
+  cli_diag_running_hint: "Le diagnostic rejoue de vrais appels et attend qu'ils calent : jusqu'à ~3 min. C'est normal.",
   cli_diag_failed: "échec",
   cli_diag_no_path: "Le binaire claude est introuvable dans le PATH de l'app. Installe-le : npm install -g @anthropic-ai/claude-code",
   cli_diag_binary_ko: "Le binaire claude répond mal :",
@@ -6754,6 +6851,7 @@ en: {
   repair_skill_diag_btn: "Diagnose Claude Code CLI",
   repair_skill_timeout_diag: "Timed out — diagnosing the CLI…",
   cli_diag_running: "Testing the CLI (same options as the repair)…",
+  cli_diag_running_hint: "The diagnostic replays real calls and waits for them to stall: up to ~3 min. This is expected.",
   cli_diag_failed: "failed",
   cli_diag_no_path: "The claude binary is not in the app's PATH. Install it: npm install -g @anthropic-ai/claude-code",
   cli_diag_binary_ko: "The claude binary misbehaves:",
@@ -8014,7 +8112,25 @@ async function diagClaudeCli(target){
   // v1.14.3 - le resultat s'affiche dans l'UI (pas dans un alert() qu'on
   // ne peut ni copier ni relire) et commence par le verdict.
   const box = target ? document.getElementById(target) : null;
-  if (box){ box.classList.remove('hidden'); box.innerHTML = tr('cli_diag_running'); }
+  // v1.14.5 - compteur vivant. Le diagnostic rejoue de vrais appels et
+  // ATTEND qu'ils calent : il dure desormais plusieurs minutes. Un message
+  // fixe pendant tout ce temps est indistinguable d'une app plantee -- ce
+  // qui est particulierement mal venu pour l'ecran cense diagnostiquer un
+  // blocage.
+  let tick = null;
+  if (box){
+    box.classList.remove('hidden');
+    const t0 = Date.now();
+    const paint = () => {
+      const s = Math.round((Date.now() - t0) / 1000);
+      box.innerHTML = '<span>' + escAttr(tr('cli_diag_running')) + '</span> '
+        + '<span class="font-mono text-stone-500">(' + s + 's)</span>'
+        + '<div class="text-[10px] text-stone-500 mt-0.5">'
+        + escAttr(tr('cli_diag_running_hint')) + '</div>';
+    };
+    paint();
+    tick = setInterval(paint, 1000);
+  }
   try {
     const r = await fetch('/api/claude-cli-diagnose');
     const d = await r.json();
@@ -8039,6 +8155,8 @@ async function diagClaudeCli(target){
   } catch(e){
     if (box) box.innerHTML = '<span class="text-red-700">Diag failed: ' + escAttr(e.message) + '</span>';
     else alert('Diag failed: ' + e.message);
+  } finally {
+    if (tick) clearInterval(tick);
   }
 }
 async function suggestSkillDescription(){
