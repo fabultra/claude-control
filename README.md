@@ -20,7 +20,12 @@ Claude Control fixes all that with a clean web UI that runs locally on your Mac.
 
 **MCPs**
 - Toggle any MCP on/off without touching JSON
-- See live running status (green pulse = process alive)
+- See live running status (green pulse = process alive), derived from each
+  MCP's own `command`/`args` — no hardcoded server list
+- **All your MCP sources in one list**: `claude_desktop_config.json`, Desktop
+  Extensions, Claude Code CLI (`~/.claude.json`, user and project scope), and
+  plugin-provided `.mcp.json`. CLI and plugin entries carry a source badge and
+  are read-only — their source of truth isn't the Desktop config
 - **Click "pourquoi ?"** on a non-running MCP → modal with the last error from Claude Desktop logs + a one-line suggested fix (auth, missing binary, missing dependency, port conflict, network, rate limit, ...)
 - **Presets**: save the current selection as `Klide`, `Audit client`, `Boulevard Commun` etc. Switch contexts in one click
 

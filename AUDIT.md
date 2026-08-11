@@ -1,5 +1,24 @@
 # Audit de code — Claude Control v1.13.4
 
+> **Statut : les 12 constats sont corrigés en v1.14.0.**
+> Ce document reste le diagnostic d'origine — il explique *pourquoi* le code
+> a changé. Chaque correctif porte un commentaire `v1.14.0` à l'endroit
+> concerné, et une classe de tests dans `tests/test_v1140_fixes.py` nommée
+> d'après le symptôme qu'elle empêche de revenir.
+>
+> Deux points méritent d'être signalés parce qu'ils vont au-delà de ce que
+> l'audit avait vu :
+> - La détection « running » réécrite (constat 6) souffrait d'un second
+>   défaut, trouvé en la testant sur une vraie sortie `ps` : n'importe quel
+>   process *mentionnant* un nom de MCP (un `grep`, un éditeur, un `bash -c`)
+>   le faisait passer pour actif, et deux MCP partageant un basename de
+>   paquet (`@linear/mcp-server`, `@mailchimp/mcp-server`) se contaminaient.
+>   Corrigé par une liste d'exclusion de binaires et de tokens génériques.
+> - Le constat 9 demandait `escAttr(m.name)`. C'est insuffisant en position
+>   JS inline : le parseur HTML décode les entités *avant* que JS ne voie la
+>   source, donc `&#39;` redevient `'` et casse la chaîne. Il a fallu un
+>   `escJsAttr()` (échappement JS puis HTML).
+
 Audit demandé suite à deux symptômes : **« le CLI ne répond plus »** et **« je ne vois pas tous les MCP »**.
 
 Périmètre : `src/app.py` (7444 lignes), `scripts/`, `tests/`.
