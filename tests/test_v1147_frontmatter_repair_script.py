@@ -153,5 +153,53 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(self.target.read_text(), once)
 
 
+class ScanReportingTests(unittest.TestCase):
+    """v1.14.8 - "Aucun frontmatter casse" ne doit pas pouvoir signifier
+    "je n'ai scanne aucun fichier".
+
+    C'est ce qui a fait conclure a tort que cinq fichiers casses etaient
+    sains : le script rendait le meme verdict rassurant qu'il ait tout
+    examine ou rien du tout.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def _run(self, *argv):
+        old_argv, old_out = sys.argv, sys.stdout
+        sys.argv = ["repair", *argv]
+        import io
+        sys.stdout = io.StringIO()
+        try:
+            code = repair_fm.main()
+            return code, sys.stdout.getvalue()
+        finally:
+            sys.argv, sys.stdout = old_argv, old_out
+
+    def test_nothing_scanned_is_not_a_clean_bill(self):
+        code, out = self._run(str(self.root / "vide"))
+        self.assertEqual(code, 1)
+        self.assertIn("Aucun SKILL.md scanne", out)
+
+    def test_missing_root_is_named(self):
+        missing = self.root / "absent"
+        _code, out = self._run(str(missing))
+        self.assertIn(str(missing), out)
+        self.assertIn("absent", out)
+
+    def test_clean_run_reports_how_many_were_scanned(self):
+        (self.root / "ok").mkdir()
+        (self.root / "ok" / "SKILL.md").write_text(HEALTHY["simple"])
+        code, out = self._run(str(self.root))
+        self.assertEqual(code, 0)
+        self.assertIn("1 SKILL.md scanne", out)
+
+    def test_corrupted_file_is_still_reported(self):
+        (self.root / "ko").mkdir()
+        (self.root / "ko" / "SKILL.md").write_text(CORRUPTED)
+        _code, out = self._run(str(self.root))
+        self.assertIn("A CORRIGER", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -117,12 +117,24 @@ def main():
         print("PyYAML absent : detection structurelle seule, "
               "relis l'apercu avant d'appliquer.\n")
 
+    # Dire ce qui a ete regarde, pas seulement ce qui a ete trouve. Sans ca,
+    # "aucun frontmatter casse" est indistinguable de "je n'ai scanne aucun
+    # fichier" -- et c'est exactement l'ambiguite qui a fait croire que cinq
+    # fichiers casses etaient sains.
+    for root in roots:
+        state = "absent" if not root.exists() else (
+            "pas un dossier" if not root.is_dir() else None)
+        if state:
+            print(f"  {root} : {state}")
+
+    scanned = 0
     touched = 0
     for path in iter_skill_files(roots):
         try:
             text = path.read_text(errors="replace")
         except OSError:
             continue
+        scanned += 1
         fixed = repaired(text)
         if fixed is None:
             continue
@@ -137,8 +149,15 @@ def main():
             shutil.copy2(path, path.with_suffix(".md.bak-frontmatter"))
             path.write_text(fixed)
 
+    if not scanned:
+        print("Aucun SKILL.md scanne. Racines examinees :")
+        for root in roots:
+            print(f"  {root}")
+        print("Passe le bon dossier en argument, par exemple :\n"
+              "  python3 scripts/repair-corrupted-frontmatter.py ~/.claude/skills")
+        return 1
     if not touched:
-        print("Aucun frontmatter casse.")
+        print(f"{scanned} SKILL.md scanne(s), aucun frontmatter casse.")
     elif not args.apply:
         print(f"\n{touched} fichier(s). Relance avec --apply pour ecrire "
               f"(une copie .bak-frontmatter est faite a cote de chacun).")
