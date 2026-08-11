@@ -218,3 +218,64 @@ class DiagnosticDoesNotFallBackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FastPathIsNotRetriedForeverTests(unittest.TestCase):
+    """v1.14.8 - Sur une machine ou une option bloque, chaque generation
+    perdait 30 s a rejouer un appel dont l'echec est deja connu : 40 s au
+    lieu de 10 par skill, et une reparation en lot qui dure des heures."""
+
+    def setUp(self):
+        self.calls = []
+        self._orig_run = app.subprocess.run
+        self._orig_path = app._claude_cli_path
+        app._claude_cli_path = lambda: "/bin/claude"
+        self._shell = dict(app._SHELL_ENV_CACHE)
+        app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
+        app._CLI_FALLBACK["used"] = False
+
+        def fake(cmd, **kw):
+            self.calls.append({"cmd": cmd, "kw": kw})
+            optimise = "--strict-mcp-config" in cmd
+            if optimise:
+                raise subprocess.TimeoutExpired("claude", kw["timeout"])
+            return _Done(stdout="pong")
+
+        app.subprocess.run = fake
+
+    def tearDown(self):
+        app.subprocess.run = self._orig_run
+        app._claude_cli_path = self._orig_path
+        app._SHELL_ENV_CACHE.clear()
+        app._SHELL_ENV_CACHE.update(self._shell)
+        app._CLI_FALLBACK["used"] = False
+
+    def test_first_call_pays_the_fast_path_once(self):
+        self.assertEqual(app._call_claude_cli("x"), "pong")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_next_calls_go_straight_to_the_proven_one(self):
+        app._call_claude_cli("x")
+        self.calls.clear()
+        self.assertEqual(app._call_claude_cli("y"), "pong")
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn("--strict-mcp-config", self.calls[0]["cmd"])
+
+    def test_a_bulk_repair_does_not_pay_it_every_time(self):
+        for _ in range(5):
+            app._call_claude_cli("x")
+        stalled = [c for c in self.calls if "--strict-mcp-config" in c["cmd"]]
+        self.assertEqual(len(stalled), 1)
+
+    def test_the_proven_call_is_not_replayed_twice_when_it_stalls(self):
+        """Sinon l'utilisateur attendrait deux fois le budget complet."""
+        app._CLI_FALLBACK["used"] = True
+
+        def always_stall(cmd, **kw):
+            self.calls.append({"cmd": cmd, "kw": kw})
+            raise subprocess.TimeoutExpired("claude", kw["timeout"])
+
+        app.subprocess.run = always_stall
+        with self.assertRaises(app.ClaudeCliTimeout):
+            app._call_claude_cli("x", timeout=60)
+        self.assertEqual(len(self.calls), 1)

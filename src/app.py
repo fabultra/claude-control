@@ -1202,8 +1202,22 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
     # incertaine et n'en laissait que 60 a celle qui marche.
     first_budget = timeout if not allow_fallback \
         else min(CLI_FAST_PATH_TIMEOUT, timeout)
+
+    # v1.14.8 - une fois que l'appel optimise a cale, on cesse de l'essayer.
+    #
+    # Sur une machine ou une option bloque, chaque generation perdait 30 s a
+    # rejouer un appel dont on sait deja qu'il ne repondra pas -- soit 40 s
+    # au lieu de 10 pour chaque skill, et une reparation en lot qui dure des
+    # heures. L'etat vaut pour la duree du process : un redemarrage de l'app
+    # retente l'appel optimise, donc une mise a jour du CLI qui reparerait la
+    # situation est reprise sans rien avoir a configurer.
+    skip_fast_path = allow_fallback and _CLI_FALLBACK["used"]
+    if skip_fast_path:
+        _log("_call_claude_cli: appel optimise deja connu en echec, "
+             "appel nu directement")
     try:
-        r = _attempt(None, first_budget)
+        r = _attempt((), timeout) if skip_fast_path \
+            else _attempt(None, first_budget)
     except ClaudeCliTimeout as first:
         # v1.14.6 - repli automatique sur l'appel nu.
         #
@@ -1218,7 +1232,10 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
         # Le repli est refuse au diagnostic (allow_fallback=False) : une
         # sonde qui se rattrape toute seule mesurerait autre chose que
         # l'appel de production et ne prouverait plus rien.
-        if not allow_fallback:
+        if not allow_fallback or skip_fast_path:
+            # skip_fast_path : l'essai qui vient de caler ETAIT deja l'appel
+            # nu. Le rejouer a l'identique doublerait l'attente sans rien
+            # changer.
             raise
         _log("_call_claude_cli: repli sur l'appel nu apres timeout")
         _CLI_FALLBACK["used"] = True
