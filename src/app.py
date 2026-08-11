@@ -607,34 +607,144 @@ def open_terminal_claude_login():
         return False, f"Erreur ouverture Terminal : {e}. Lance manuellement 'claude /login'."
 
 
+def _cli_env():
+    """v1.13.1 / v1.14.3 - Environnement des subprocess `claude`.
+
+    Augmente le PATH pour inclure les dirs ou vivent les binaires
+    npm/node/etc. Necessaire quand Claude Control est lance depuis Finder
+    (PATH minimal launchd) : sans ca le CLI claude echoue lui-meme avec
+    'node: command not found'.
+
+    v1.14.3 - extrait de _call_claude_cli pour que le diagnostic tourne dans
+    exactement le meme environnement que l'appel reel. Un diagnostic qui
+    teste un autre PATH que celui du vrai appel ne prouve rien.
+    """
+    env = os.environ.copy()
+    extra = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        str(HOME / ".npm-global/bin"),
+        str(HOME / ".local/bin"),
+        str(HOME / ".bun/bin"),
+        str(HOME / ".volta/bin"),
+    ]
+    nvm_dir = HOME / ".nvm/versions/node"
+    if nvm_dir.is_dir():
+        try:
+            for v in sorted(nvm_dir.iterdir(), reverse=True):
+                extra.append(str(v / "bin"))
+        except Exception:
+            pass
+    cur = env.get("PATH", "")
+    parts = [p for p in extra if p not in cur]
+    if parts:
+        env["PATH"] = ":".join(parts) + (":" + cur if cur else "")
+    return env
+
+
+CLI_DIAG_PING_TIMEOUT = 60
+
+
 def _diagnose_claude_cli():
-    """v1.9.4 - Sanity check : lance 'claude --version' pour verifier que
-    le CLI est non seulement present mais aussi fonctionnel. Retourne dict :
-      {available: bool, path: str?, version: str?, error: str?}
+    """v1.9.4 / v1.14.3 - Diagnostic du CLI Claude Code.
+
+    v1.14.3 - le diagnostic ne lancait que `claude --version`, qui teste le
+    binaire local et ne parle jamais a l'API. Sur la panne qu'il etait
+    justement cense expliquer -- le CLI qui ne repond pas en 120 s -- il
+    repondait "available: YES, version 2.x" et n'apprenait rien a personne.
+
+    Il fait maintenant un vrai aller-retour, avec le binaire, les flags,
+    l'environnement et le cwd EXACTS de _call_claude_cli : c'est la seule
+    facon de reproduire la panne. Trois etages, du moins cher au plus cher,
+    et on s'arrete au premier qui echoue :
+
+      1. le binaire est-il dans le PATH ?
+      2. repond-il a --version (process local, 10 s) ?
+      3. repond-il a un vrai prompt trivial (aller-retour API) ?
+
+    L'etage 3 est celui qui compte : s'il passe alors que la reparation
+    echoue, le CLI va bien et c'est le contenu envoye qui cale. S'il echoue,
+    la panne est dans le CLI ou son authentification, et la sortie partielle
+    dit sur quoi il bloque.
     """
     cli = _claude_cli_path()
+    out = {"available": False, "path": cli or None, "version": None,
+           "ping_ok": False, "ping_seconds": None, "ping_reply": None,
+           "partial": None, "stage": "path", "error": None}
     if not cli:
-        return {"available": False, "path": None, "version": None,
-                "error": "claude not in PATH"}
+        out["error"] = "claude introuvable dans le PATH"
+        return out
+
+    out["stage"] = "version"
     try:
-        r = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=10)
-        version = (r.stdout or "").strip() or (r.stderr or "").strip()
+        r = subprocess.run([cli, "--version"], capture_output=True, text=True,
+                           timeout=10, env=_cli_env())
+        out["version"] = (r.stdout or "").strip() or (r.stderr or "").strip()
         if r.returncode != 0:
-            return {"available": False, "path": cli, "version": None,
-                    "error": f"--version exit {r.returncode}: {(r.stderr or '').strip()[:200]}"}
-        return {"available": True, "path": cli, "version": version, "error": None}
+            out["error"] = (f"--version sort en {r.returncode} : "
+                            f"{(r.stderr or '').strip()[:200]}")
+            return out
     except subprocess.TimeoutExpired:
-        return {"available": False, "path": cli, "version": None,
-                "error": "--version timeout 10s"}
+        out["error"] = "--version ne repond pas en 10 s (binaire bloque)"
+        return out
     except Exception as e:
-        return {"available": False, "path": cli, "version": None,
-                "error": f"{type(e).__name__}: {e}"}
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+    out["available"] = True
+
+    out["stage"] = "ping"
+    started = time.monotonic()
+    try:
+        reply = _call_claude_cli(
+            "Reply with the single word: pong",
+            timeout=CLI_DIAG_PING_TIMEOUT,
+            system_prompt="Reply with exactly one word. No preamble.")
+        out["ping_seconds"] = round(time.monotonic() - started, 1)
+        out["ping_ok"] = True
+        out["ping_reply"] = reply[:120]
+    except ClaudeCliTimeout as e:
+        out["ping_seconds"] = round(time.monotonic() - started, 1)
+        out["partial"] = e.partial or None
+        out["error"] = str(e)
+    except Exception as e:
+        out["ping_seconds"] = round(time.monotonic() - started, 1)
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 class ClaudeCliNotLoggedIn(Exception):
     """v1.9.5 - Cas specifique : le CLI Claude Code repond mais signale
     'Not logged in'. C'est un setup utilisateur (une seule fois) : il
     doit run 'claude /login' dans un terminal pour s'authentifier."""
+
+
+def _decode_partial(raw):
+    """v1.14.3 - subprocess rend la sortie partielle d'un TimeoutExpired en
+    bytes meme quand run() tourne en text=True. Sans decodage, le message
+    d'erreur affichait b'...' a l'utilisateur."""
+    if not raw:
+        return ""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    return raw.strip()
+
+
+class ClaudeCliTimeout(Exception):
+    """v1.14.3 - Le CLI n'a pas repondu dans le temps imparti.
+
+    Porte la sortie partielle : c'est elle qui distingue un CLI qui n'a
+    jamais demarre d'un CLI bloque sur une invite interactive.
+    """
+
+    def __init__(self, timeout, partial=""):
+        self.timeout = timeout
+        self.partial = partial or ""
+        msg = f"Timeout : le CLI Claude n'a pas répondu en {timeout} s."
+        if self.partial:
+            msg += f" Il avait commencé à écrire : « {self.partial[:300]} »"
+        else:
+            msg += " Il n'a rien écrit du tout avant de caler."
+        super().__init__(msg)
 
 
 def _call_claude_cli(prompt, timeout=120, system_prompt=None):
@@ -679,37 +789,26 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None):
     if system_prompt:
         cmd += ["--system-prompt", system_prompt]
     _log(f"_call_claude_cli: cli={cli_path} prompt_len={len(prompt)} timeout={timeout}")
-    # v1.13.1 - augmente le PATH du subprocess pour inclure les dirs ou
-    # vivent les binaires npm/node/etc. Necessaire quand Claude Control
-    # est lance depuis Finder (PATH minimal launchd). Sans ca le CLI
-    # claude peut lui-meme echouer avec 'node: command not found'.
-    env = os.environ.copy()
-    extra = [
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        str(HOME / ".npm-global/bin"),
-        str(HOME / ".local/bin"),
-        str(HOME / ".bun/bin"),
-        str(HOME / ".volta/bin"),
-    ]
-    nvm_dir = HOME / ".nvm/versions/node"
-    if nvm_dir.is_dir():
-        try:
-            for v in sorted(nvm_dir.iterdir(), reverse=True):
-                extra.append(str(v / "bin"))
-        except Exception:
-            pass
-    cur = env.get("PATH", "")
-    parts = [p for p in extra if p not in cur]
-    if parts:
-        env["PATH"] = ":".join(parts) + (":" + cur if cur else "")
+    env = _cli_env()
     # v1.14.1 - cwd neutre. Sinon le CLI herite du cwd du serveur ('/' quand
     # Claude Control est lance depuis Finder) et traite ce repertoire comme
     # le projet courant.
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="claude-control-cli-") as workdir:
-        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                           timeout=timeout, env=env, cwd=workdir)
+    try:
+        with tempfile.TemporaryDirectory(prefix="claude-control-cli-") as workdir:
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                               timeout=timeout, env=env, cwd=workdir)
+    except subprocess.TimeoutExpired as e:
+        # v1.14.3 - la sortie partielle est la seule trace de CE QUE le CLI
+        # faisait quand il a cale, et on la jetait : l'utilisateur voyait
+        # "n'a pas repondu en 120 s" sans jamais savoir pourquoi. subprocess
+        # remplit e.stdout/e.stderr avec ce qui avait ete ecrit avant le
+        # timeout (en bytes, meme avec text=True). Un CLI bloque sur une
+        # invite ("Do you trust the files in this folder?"), une erreur de
+        # proxy ou un message d'auth l'a deja affiche a ce stade.
+        partial = _decode_partial(e.stdout) + _decode_partial(e.stderr)
+        _log(f"_call_claude_cli: TIMEOUT after {timeout}s partial={partial[:400]!r}")
+        raise ClaudeCliTimeout(timeout, partial)
     elapsed = time.monotonic() - started
     stdout = (r.stdout or "").strip()
     stderr = (r.stderr or "").strip()
@@ -833,11 +932,13 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
             "error_code": "cli_not_logged_in",
             "fix_command": "claude /login",
         }
-    except subprocess.TimeoutExpired:
-        _log("suggest_skill_description: claude CLI timeout")
-        return False, ("Timeout : le CLI Claude n'a pas répondu en 120 s. "
-                       "Teste-le à la main dans un terminal : "
-                       "echo ping | claude -p --safe-mode")
+    except ClaudeCliTimeout as e:
+        # v1.14.3 - on ne renvoie plus l'utilisateur vers un terminal : le
+        # message porte ce que le CLI avait ecrit, et l'UI enchaine toute
+        # seule sur un diagnostic live (meme binaire, memes flags, meme env).
+        _log(f"suggest_skill_description: timeout, partial={e.partial[:200]!r}")
+        return False, {"error": str(e), "error_code": "cli_timeout",
+                       "partial": e.partial}
     except FileNotFoundError as e:
         _log(f"suggest_skill_description: CLI not found : {e}")
         return False, ("Claude Code CLI introuvable dans le PATH. "
@@ -1083,12 +1184,15 @@ def _bulk_repair_probe():
             "ping",
             system_prompt="Reply with the single word: pong. Nothing else.",
             timeout=BULK_REPAIR_PROBE_TIMEOUT)
-    except subprocess.TimeoutExpired:
+    except ClaudeCliTimeout as e:
+        # v1.14.3 - la sortie partielle dit sur quoi le CLI bloque ; sans
+        # elle le message se reduisait a "teste a la main dans un terminal".
+        detail = (f" Il avait commencé à écrire : « {e.partial[:200]} »"
+                  if e.partial else " Il n'a rien écrit du tout avant de caler.")
         return False, time.monotonic() - started, (
             f"Le CLI Claude n'a pas répondu à un appel trivial en "
             f"{BULK_REPAIR_PROBE_TIMEOUT} s. Le lot n'a pas été lancé : il "
-            f"aurait échoué skill après skill. Teste à la main dans un "
-            f"terminal : echo ping | claude -p --safe-mode")
+            f"aurait échoué skill après skill.{detail}")
     except ClaudeCliNotLoggedIn as e:
         return False, time.monotonic() - started, str(e)
     except Exception as e:
@@ -6077,6 +6181,14 @@ fr: {
   skills_cli_banner_title: "Pour generer des descriptions automatiquement",
   skills_cli_banner_body: "Installe le CLI Claude Code pour utiliser le bouton « Suggerer via Claude Code » dans la modal de reparation. Pas de cle API requise, le CLI utilise ton abonnement Claude Code existant.",
   repair_skill_diag_btn: "Diagnostiquer le CLI Claude Code",
+  repair_skill_timeout_diag: "Timeout — diagnostic du CLI en cours…",
+  cli_diag_running: "Test du CLI en cours (mêmes options que la réparation)…",
+  cli_diag_failed: "échec",
+  cli_diag_no_path: "Le binaire claude est introuvable dans le PATH de l'app. Installe-le : npm install -g @anthropic-ai/claude-code",
+  cli_diag_binary_ko: "Le binaire claude répond mal :",
+  cli_diag_ping_ok: "Le CLI va bien : il a répondu en {s} s à un appel trivial. La panne vient donc du contenu envoyé pour ce skill, pas du CLI.",
+  cli_diag_ping_stuck: "Le CLI reste bloqué. Il avait commencé à écrire ceci avant de caler — c'est là qu'est la cause : {p}",
+  cli_diag_ping_silent: "Le CLI n'a rien répondu du tout en {s} s, pas même un message d'erreur. Il ne parvient probablement pas à joindre l'API (authentification ou réseau).",
   repair_skill_diag_title: "Diagnostic CLI Claude Code",
   repair_skill_not_logged_in_title: "Connexion Claude Code requise",
   repair_skill_not_logged_in_body: "Lance cette commande dans un terminal pour t'authentifier (une seule fois) :",
@@ -6412,6 +6524,14 @@ en: {
   skills_cli_banner_title: "To generate descriptions automatically",
   skills_cli_banner_body: "Install the Claude Code CLI to use the 'Suggest via Claude Code' button in the repair modal. No API key required, the CLI uses your existing Claude Code subscription.",
   repair_skill_diag_btn: "Diagnose Claude Code CLI",
+  repair_skill_timeout_diag: "Timed out — diagnosing the CLI…",
+  cli_diag_running: "Testing the CLI (same options as the repair)…",
+  cli_diag_failed: "failed",
+  cli_diag_no_path: "The claude binary is not in the app's PATH. Install it: npm install -g @anthropic-ai/claude-code",
+  cli_diag_binary_ko: "The claude binary misbehaves:",
+  cli_diag_ping_ok: "The CLI is fine: it answered a trivial call in {s}s. The failure comes from the content sent for this skill, not the CLI.",
+  cli_diag_ping_stuck: "The CLI is stuck. It had started writing this before stalling — that's the cause: {p}",
+  cli_diag_ping_silent: "The CLI returned nothing at all in {s}s, not even an error. It most likely cannot reach the API (auth or network).",
   repair_skill_diag_title: "Claude Code CLI diagnostic",
   repair_skill_not_logged_in_title: "Claude Code login required",
   repair_skill_not_logged_in_body: "Run this command in a terminal to authenticate (one time only):",
@@ -7634,21 +7754,41 @@ async function openTerminalForLogin(){
     </div>
   `;
 }
-async function diagClaudeCli(){
-  // v1.9.4 - diag du CLI Claude Code, expose path + version + sanity check
-  // pour aider l'utilisateur a comprendre pourquoi le CLI echoue.
+function cliDiagVerdict(d){
+  // v1.14.3 - traduit le diag en UNE phrase qui dit quoi faire. Avant, le
+  // diag affichait "available / path / version" : trois faits vrais dont
+  // aucun ne distingue un CLI sain d'un CLI qui ne repond jamais.
+  if (!d.path) return {tone:'red', text: tr('cli_diag_no_path')};
+  if (!d.available) return {tone:'red', text: tr('cli_diag_binary_ko') + ' ' + (d.error||'')};
+  if (d.ping_ok) return {tone:'green',
+    text: tr('cli_diag_ping_ok').replace('{s}', String(d.ping_seconds))};
+  if (d.partial) return {tone:'red',
+    text: tr('cli_diag_ping_stuck').replace('{p}', d.partial.substring(0,300))};
+  return {tone:'red', text: tr('cli_diag_ping_silent').replace('{s}', String(d.ping_seconds))};
+}
+async function diagClaudeCli(target){
+  // v1.14.3 - le resultat s'affiche dans l'UI (pas dans un alert() qu'on
+  // ne peut ni copier ni relire) et commence par le verdict.
+  const box = target ? document.getElementById(target) : null;
+  if (box){ box.classList.remove('hidden'); box.innerHTML = tr('cli_diag_running'); }
   try {
     const r = await fetch('/api/claude-cli-diagnose');
     const d = await r.json();
-    const lines = [
-      'available: ' + (d.available ? 'YES' : 'NO'),
-      'path: ' + (d.path || '(not in PATH)'),
-      'version: ' + (d.version || '(unknown)'),
-    ];
-    if (d.error) lines.push('error: ' + d.error);
-    alert(tr('repair_skill_diag_title') + '\n\n' + lines.join('\n'));
+    const v = cliDiagVerdict(d);
+    const facts = [
+      'path: ' + (d.path || '—'),
+      'version: ' + (d.version || '—'),
+      'ping: ' + (d.ping_ok ? (d.ping_reply||'ok') : (tr('cli_diag_failed') + (d.ping_seconds!=null ? ' (' + d.ping_seconds + 's)' : ''))),
+    ].join('\n');
+    if (!box){ alert(v.text + '\n\n' + facts); return d; }
+    box.innerHTML = '<strong class="' + (v.tone==='green'?'text-green-700':'text-red-700') + '">'
+      + escAttr(v.text) + '</strong>'
+      + '<pre class="mt-1 text-[10px] bg-stone-100 rounded p-1.5 overflow-x-auto">'
+      + escAttr(facts) + '</pre>';
+    return d;
   } catch(e){
-    alert('Diag failed: ' + e.message);
+    if (box) box.innerHTML = '<span class="text-red-700">Diag failed: ' + escAttr(e.message) + '</span>';
+    else alert('Diag failed: ' + e.message);
   }
 }
 async function suggestSkillDescription(){
@@ -7699,14 +7839,27 @@ async function suggestSkillDescription(){
           'red'
         );
         banner('red', tr('repair_skill_not_logged_in_title'));
-      } else {
-        // v1.9.4 - quand le CLI echoue (autre cause), on affiche un bouton
-        // diag pour l'utilisateur (path + version + sanity check).
+      } else if (j.error_code === 'cli_timeout') {
+        // v1.14.3 - sur timeout, l'app diagnostique elle-meme au lieu de
+        // demander a l'utilisateur d'aller taper une commande dans un
+        // terminal. Le diag rejoue le meme appel avec les memes flags : son
+        // verdict dit si le CLI est en panne ou si c'est ce skill-ci qui cale.
         setMeta(
           '<strong>&#9888; ' + escAttr(msg) + '</strong>'
-          + '<div class="mt-2"><button onclick="diagClaudeCli()" '
+          + '<div id="repair-skill-diag" class="mt-2"></div>',
+          'red'
+        );
+        banner('red', tr('repair_skill_timeout_diag'));
+        diagClaudeCli('repair-skill-diag');
+      } else {
+        // v1.9.4 - quand le CLI echoue (autre cause), on affiche un bouton
+        // diag pour l'utilisateur.
+        setMeta(
+          '<strong>&#9888; ' + escAttr(msg) + '</strong>'
+          + '<div class="mt-2"><button onclick="diagClaudeCli(\'repair-skill-diag\')" '
           + 'class="text-[10px] underline text-stone-600 hover:text-stone-900">'
-          + tr('repair_skill_diag_btn') + '</button></div>',
+          + tr('repair_skill_diag_btn') + '</button></div>'
+          + '<div id="repair-skill-diag" class="mt-2"></div>',
           'red'
         );
         banner('red', msg);

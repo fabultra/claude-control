@@ -515,7 +515,7 @@ class BulkRepairPreflightTests(unittest.TestCase):
         for i in range(5):
             self._skill(f"s{i}")
         with patch.object(app, "_call_claude_cli",
-                          side_effect=subprocess.TimeoutExpired("claude", 90)):
+                          side_effect=app.ClaudeCliTimeout(90, "")):
             app._BULK_REPAIR.update({"running": True, "total": 5, "done": 0,
                                      "phase": "preflight"})
             app._bulk_repair_worker(self._targets(5), None)
