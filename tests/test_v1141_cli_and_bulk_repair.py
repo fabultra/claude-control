@@ -42,10 +42,18 @@ class CallClaudeCliTests(unittest.TestCase):
         app.subprocess.run = fake_run
         self._orig_path = app._claude_cli_path
         app._claude_cli_path = lambda: "/usr/local/bin/claude"
+        # v1.14.4 - _cli_env() peut consulter le shell de connexion (un
+        # subprocess de plus, qui atterrirait dans self.calls[0] et decalerait
+        # toutes les assertions). Le cache est amorce ici : ces tests portent
+        # sur l'appel au binaire claude, pas sur la recuperation d'env.
+        self._orig_shell_cache = dict(app._SHELL_ENV_CACHE)
+        app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
 
     def tearDown(self):
         app.subprocess.run = self._orig_run
         app._claude_cli_path = self._orig_path
+        app._SHELL_ENV_CACHE.clear()
+        app._SHELL_ENV_CACHE.update(self._orig_shell_cache)
 
     def test_prompt_goes_through_stdin_not_argv(self):
         app._call_claude_cli("---\nname: demo\n---\nbody")

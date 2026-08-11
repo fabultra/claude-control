@@ -4,6 +4,8 @@ import http.server, io, json, os, re, shutil, socketserver, subprocess, sys, tem
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+import urllib.error
+import urllib.request
 
 MAX_ZIP_SIZE = 50 * 1024 * 1024  # 50 Mo
 
@@ -607,8 +609,70 @@ def open_terminal_claude_login():
         return False, f"Erreur ouverture Terminal : {e}. Lance manuellement 'claude /login'."
 
 
+# v1.14.4 - Variables dont le CLI a besoin pour JOINDRE l'API. Lance depuis
+# Finder, Claude Control herite de l'environnement minimal de launchd : le
+# PATH n'est pas la seule chose qui manque. Un proxy d'entreprise, un CA
+# interne ou une base URL Anthropic vivent dans le .zshrc de l'utilisateur et
+# sont invisibles a l'app -- le CLI part alors joindre une API qu'il ne peut
+# pas atteindre et bloque sans rien ecrire.
+#
+# Liste volontairement fermee : on recupere le reseau et l'authentification,
+# pas tout le shell. Importer un environnement entier dans un subprocess
+# change son comportement de facons qu'on ne controle plus.
+_CLI_ENV_INHERIT = (
+    "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+    "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "CLAUDE_CONFIG_DIR",
+)
+
+_SHELL_ENV_CACHE = {"done": False, "env": {}}
+
+# Variables recuperees lors du dernier _cli_env(). Le diagnostic les affiche :
+# si l'appel ne marche QUE parce qu'on a rapatrie HTTPS_PROXY, c'est ca la
+# cause, et l'utilisateur doit le savoir.
+_CLI_ENV_RECOVERED = {"vars": []}
+
+
+def _login_shell_env(timeout=8):
+    """v1.14.4 - Environnement du shell de connexion de l'utilisateur.
+
+    Resultat mis en cache : un seul lancement de shell par process.
+
+    `-lic` lit .zprofile ET .zshrc -- la plupart des exports proxy vivent
+    dans le second, que seul un shell interactif charge. Mais un shell
+    interactif peut lui-meme bloquer sur une invite : stdin est ferme et le
+    timeout est court, on ne remplace pas un hang par un autre. En cas
+    d'echec on retombe sur `-lc`, puis sur rien du tout.
+    """
+    if _SHELL_ENV_CACHE["done"]:
+        return _SHELL_ENV_CACHE["env"]
+    env = {}
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    for flags in ("-lic", "-lc"):
+        try:
+            r = subprocess.run([shell, flags, "env"], capture_output=True,
+                               text=True, timeout=timeout,
+                               stdin=subprocess.DEVNULL)
+        except Exception:
+            continue
+        if r.returncode != 0 or not r.stdout:
+            continue
+        for line in r.stdout.splitlines():
+            k, sep, v = line.partition("=")
+            if sep and k and k.isidentifier():
+                env[k] = v
+        if env:
+            break
+    _SHELL_ENV_CACHE["env"] = env
+    _SHELL_ENV_CACHE["done"] = True
+    return env
+
+
 def _cli_env():
-    """v1.13.1 / v1.14.3 - Environnement des subprocess `claude`.
+    """v1.13.1 / v1.14.3 / v1.14.4 - Environnement des subprocess `claude`.
 
     Augmente le PATH pour inclure les dirs ou vivent les binaires
     npm/node/etc. Necessaire quand Claude Control est lance depuis Finder
@@ -618,6 +682,13 @@ def _cli_env():
     v1.14.3 - extrait de _call_claude_cli pour que le diagnostic tourne dans
     exactement le meme environnement que l'appel reel. Un diagnostic qui
     teste un autre PATH que celui du vrai appel ne prouve rien.
+
+    v1.14.4 - le PATH n'etait que la moitie du probleme. Le meme launchd
+    minimal prive aussi le CLI des variables reseau/auth du shell : il
+    demarre, trouve node, puis bloque a l'aller-retour API sans rien ecrire
+    -- exactement le symptome observe (`--version` instantane, ping mort a
+    60 s). On rapatrie les variables manquantes depuis le shell de connexion,
+    sans jamais ecraser celles deja presentes.
     """
     env = os.environ.copy()
     extra = [
@@ -639,10 +710,128 @@ def _cli_env():
     parts = [p for p in extra if p not in cur]
     if parts:
         env["PATH"] = ":".join(parts) + (":" + cur if cur else "")
+
+    # v1.14.4 - meme cause que le PATH, autre consequence : sans les
+    # variables reseau/auth du shell, le CLI demarre puis bloque a
+    # l'aller-retour API. On ne remplit que ce qui manque -- une variable
+    # deja definie dans l'environnement de l'app fait autorite.
+    missing = [k for k in _CLI_ENV_INHERIT if not env.get(k)]
+    recovered = []
+    if missing:
+        shell_env = _login_shell_env()
+        for k in missing:
+            v = shell_env.get(k)
+            if v:
+                env[k] = v
+                recovered.append(k)
+    _CLI_ENV_RECOVERED["vars"] = recovered
     return env
 
 
 CLI_DIAG_PING_TIMEOUT = 60
+CLI_DIAG_PROBE_TIMEOUT = 45
+
+# v1.14.4 - flags de l'appel reel, isoles pour que le diagnostic puisse les
+# RETIRER. Le CLI Claude Code se met a jour tout seul : un flag valide hier
+# peut changer de semantique aujourd'hui. Un appel qui marchait la veille se
+# met alors a bloquer sans rien ecrire, pendant que `--version` reste
+# instantane -- et rien dans l'app ne permettait de le voir.
+#
+# `_CLI_CORE_FLAGS` est le minimum sans lequel l'appel n'a plus de sens
+# (mode print, sortie texte). Les autres sont des optimisations : chacune
+# peut etre retiree pour un test, ce qui rend le coupable identifiable.
+_CLI_CORE_FLAGS = ("-p", "--output-format", "text")
+_CLI_OPTIONAL_FLAGS = ("--safe-mode", "--no-session-persistence",
+                       "--disable-slash-commands")
+
+
+def _cli_cmd(cli_path, optional=None, system_prompt=None):
+    """v1.14.4 - Construit la commande. `optional=()` donne l'appel nu."""
+    flags = list(_CLI_CORE_FLAGS)
+    flags += list(_CLI_OPTIONAL_FLAGS if optional is None else optional)
+    cmd = [cli_path] + flags
+    if system_prompt:
+        cmd += ["--system-prompt", system_prompt]
+    return cmd
+
+
+API_REACHABILITY_URL = "https://api.anthropic.com/v1/models"
+
+
+def _check_api_reachable(env=None, timeout=12):
+    """v1.14.4 - api.anthropic.com est-elle joignable DEPUIS L'APP ?
+
+    Le ping CLI qui echoue dit que l'aller-retour n'aboutit pas, jamais
+    pourquoi. Ce test separe les deux seules causes possibles : soit la
+    requete ne sort pas de la machine (reseau, proxy, CA), soit elle sort et
+    c'est le CLI qui bloque en aval (authentification).
+
+    Un 401 est un SUCCES ici : on n'envoie aucune clef, et une reponse
+    d'erreur de l'API prouve qu'on l'a jointe. Seule l'absence de reponse
+    compte comme un echec.
+    """
+    env = _cli_env() if env is None else env
+    proxies = {}
+    for scheme in ("http", "https"):
+        v = env.get(scheme.upper() + "_PROXY") or env.get(scheme + "_proxy")
+        if v:
+            proxies[scheme] = v
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler(proxies))
+    try:
+        with opener.open(API_REACHABILITY_URL, timeout=timeout) as r:
+            return True, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return True, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _cli_probe(optional, timeout=CLI_DIAG_PROBE_TIMEOUT):
+    """v1.14.4 - Un aller-retour reel avec un jeu de flags donne.
+
+    Meme binaire, meme env, meme cwd que l'appel de production : seuls les
+    flags varient. C'est ce qui permet d'attribuer la panne a un flag plutot
+    qu'a l'environnement.
+    """
+    cli = _claude_cli_path()
+    if not cli:
+        return {"ok": False, "seconds": None, "error": "claude introuvable"}
+    cmd = _cli_cmd(cli, optional=optional,
+                   system_prompt="Reply with exactly one word. No preamble.")
+    started = time.monotonic()
+    try:
+        with tempfile.TemporaryDirectory(prefix="claude-control-probe-") as wd:
+            r = subprocess.run(cmd, input="Reply with the single word: pong",
+                               capture_output=True, text=True,
+                               timeout=timeout, env=_cli_env(), cwd=wd)
+    except subprocess.TimeoutExpired as e:
+        return {"ok": False, "seconds": round(time.monotonic() - started, 1),
+                "error": f"timeout {timeout}s",
+                "partial": _decode_partial(e.stdout) + _decode_partial(e.stderr)}
+    except Exception as e:
+        return {"ok": False, "seconds": round(time.monotonic() - started, 1),
+                "error": f"{type(e).__name__}: {e}"}
+    secs = round(time.monotonic() - started, 1)
+    out = (r.stdout or "").strip()
+    if r.returncode != 0:
+        return {"ok": False, "seconds": secs,
+                "error": f"exit {r.returncode}: {(r.stderr or '').strip()[:200]}"}
+    return {"ok": True, "seconds": secs, "reply": out[:120]}
+
+
+def _blame_cli_flag():
+    """v1.14.4 - Quel flag fait caler l'appel ?
+
+    Appele uniquement quand l'appel complet echoue ET que l'appel nu passe :
+    a ce stade la panne est forcement dans les flags optionnels. On les
+    ajoute un par un et on s'arrete au premier qui bloque -- le cas courant
+    coute une seule sonde.
+    """
+    for flag in _CLI_OPTIONAL_FLAGS:
+        if not _cli_probe((flag,))["ok"]:
+            return flag
+    return None
 
 
 def _diagnose_claude_cli():
@@ -670,7 +859,12 @@ def _diagnose_claude_cli():
     cli = _claude_cli_path()
     out = {"available": False, "path": cli or None, "version": None,
            "ping_ok": False, "ping_seconds": None, "ping_reply": None,
-           "partial": None, "stage": "path", "error": None}
+           "partial": None, "stage": "path", "error": None,
+           # v1.14.4
+           "network_ok": None, "network_detail": None,
+           "minimal_ok": None, "minimal_seconds": None,
+           "blamed_flag": None, "env_recovered": [],
+           "not_logged_in": False}
     if not cli:
         out["error"] = "claude introuvable dans le PATH"
         return out
@@ -706,9 +900,41 @@ def _diagnose_claude_cli():
         out["ping_seconds"] = round(time.monotonic() - started, 1)
         out["partial"] = e.partial or None
         out["error"] = str(e)
+    except ClaudeCliNotLoggedIn as e:
+        # Le CLI a repondu et dit lui-meme ce qui ne va pas : verdict acquis,
+        # inutile de payer les sondes suivantes.
+        out["ping_seconds"] = round(time.monotonic() - started, 1)
+        out["not_logged_in"] = True
+        out["error"] = str(e)
+        return out
     except Exception as e:
         out["ping_seconds"] = round(time.monotonic() - started, 1)
         out["error"] = f"{type(e).__name__}: {e}"
+    out["env_recovered"] = list(_CLI_ENV_RECOVERED["vars"])
+    if out["ping_ok"]:
+        return out
+
+    # v1.14.4 - le ping echoue : jusqu'ici le diagnostic s'arretait ici, sur
+    # "il ne repond pas", ce qui est le point de depart du probleme et non
+    # une reponse. Deux sondes de plus separent les trois causes possibles.
+
+    # 1. La requete sort-elle seulement de la machine ?
+    out["stage"] = "network"
+    out["network_ok"], out["network_detail"] = _check_api_reachable()
+    if not out["network_ok"]:
+        return out
+
+    # 2. Le reseau est bon : l'appel NU passe-t-il ? Si oui, la panne est
+    #    dans les flags de l'app -- typiquement un flag dont une mise a jour
+    #    du CLI a change la semantique, ce qui explique un appel qui
+    #    fonctionnait la veille et bloque le lendemain.
+    out["stage"] = "minimal"
+    minimal = _cli_probe(())
+    out["minimal_ok"] = minimal["ok"]
+    out["minimal_seconds"] = minimal.get("seconds")
+    if minimal["ok"]:
+        out["stage"] = "blame"
+        out["blamed_flag"] = _blame_cli_flag()
     return out
 
 
@@ -781,13 +1007,10 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None):
     cli_path = _claude_cli_path()
     if not cli_path:
         raise FileNotFoundError("claude CLI not in PATH")
-    cmd = [cli_path, "-p",
-           "--safe-mode",
-           "--no-session-persistence",
-           "--disable-slash-commands",
-           "--output-format", "text"]
-    if system_prompt:
-        cmd += ["--system-prompt", system_prompt]
+    # v1.14.4 - flags isoles dans _cli_cmd : le diagnostic doit pouvoir
+    # rejouer exactement cet appel en les retirant, sinon un flag devenu
+    # toxique apres une mise a jour du CLI reste indetectable.
+    cmd = _cli_cmd(cli_path, system_prompt=system_prompt)
     _log(f"_call_claude_cli: cli={cli_path} prompt_len={len(prompt)} timeout={timeout}")
     env = _cli_env()
     # v1.14.1 - cwd neutre. Sinon le CLI herite du cwd du serveur ('/' quand
@@ -6189,6 +6412,11 @@ fr: {
   cli_diag_ping_ok: "Le CLI va bien : il a répondu en {s} s à un appel trivial. La panne vient donc du contenu envoyé pour ce skill, pas du CLI.",
   cli_diag_ping_stuck: "Le CLI reste bloqué. Il avait commencé à écrire ceci avant de caler — c'est là qu'est la cause : {p}",
   cli_diag_ping_silent: "Le CLI n'a rien répondu du tout en {s} s, pas même un message d'erreur. Il ne parvient probablement pas à joindre l'API (authentification ou réseau).",
+  cli_diag_net_ko: "L'app ne joint pas api.anthropic.com ({d}). Le CLI ne peut donc rien recevoir : la cause est le réseau ou le proxy de l'environnement dans lequel tourne Claude Control, pas le CLI lui-même.",
+  cli_diag_flag_blamed: "Trouvé : l'appel passe sans les options de l'app, et cale dès qu'on ajoute {f}. C'est cette option qui bloque — typiquement parce qu'une mise à jour du CLI en a changé le comportement.",
+  cli_diag_flag_generic: "L'appel nu répond en {s} s, l'appel complet non : la panne vient des options utilisées par l'app, pas du CLI ni du réseau.",
+  cli_diag_auth: "Le réseau est hors de cause (api.anthropic.com répond), mais aucun appel n'aboutit, même le plus simple. Il reste l'authentification : le CLI n'accède pas à son jeton quand c'est l'app qui le lance.",
+  cli_diag_not_logged_in: "Le CLI répond et signale qu'il n'est pas authentifié. Lance « claude /login » dans un terminal, une seule fois.",
   repair_skill_diag_title: "Diagnostic CLI Claude Code",
   repair_skill_not_logged_in_title: "Connexion Claude Code requise",
   repair_skill_not_logged_in_body: "Lance cette commande dans un terminal pour t'authentifier (une seule fois) :",
@@ -6532,6 +6760,11 @@ en: {
   cli_diag_ping_ok: "The CLI is fine: it answered a trivial call in {s}s. The failure comes from the content sent for this skill, not the CLI.",
   cli_diag_ping_stuck: "The CLI is stuck. It had started writing this before stalling — that's the cause: {p}",
   cli_diag_ping_silent: "The CLI returned nothing at all in {s}s, not even an error. It most likely cannot reach the API (auth or network).",
+  cli_diag_net_ko: "The app cannot reach api.anthropic.com ({d}). The CLI therefore receives nothing: the cause is the network or proxy of the environment Claude Control runs in, not the CLI itself.",
+  cli_diag_flag_blamed: "Found it: the call succeeds without the app's options, and stalls as soon as {f} is added. That option is the blocker — typically because a CLI update changed its behaviour.",
+  cli_diag_flag_generic: "The bare call answers in {s}s, the full one does not: the failure comes from the options the app uses, not from the CLI or the network.",
+  cli_diag_auth: "The network is ruled out (api.anthropic.com answers), yet no call succeeds, not even the simplest one. Authentication is what remains: the CLI cannot reach its token when the app launches it.",
+  cli_diag_not_logged_in: "The CLI answers and reports it is not authenticated. Run 'claude /login' in a terminal, once.",
   repair_skill_diag_title: "Claude Code CLI diagnostic",
   repair_skill_not_logged_in_title: "Claude Code login required",
   repair_skill_not_logged_in_body: "Run this command in a terminal to authenticate (one time only):",
@@ -7762,6 +7995,17 @@ function cliDiagVerdict(d){
   if (!d.available) return {tone:'red', text: tr('cli_diag_binary_ko') + ' ' + (d.error||'')};
   if (d.ping_ok) return {tone:'green',
     text: tr('cli_diag_ping_ok').replace('{s}', String(d.ping_seconds))};
+  // v1.14.4 - ordonne du plus concluant au moins concluant. Les trois
+  // premiers cas nomment une cause ; les deux derniers ne font que decrire
+  // le symptome, et ne servent que si les sondes n'ont rien pu etablir.
+  if (d.not_logged_in) return {tone:'red', text: tr('cli_diag_not_logged_in')};
+  if (d.network_ok === false) return {tone:'red',
+    text: tr('cli_diag_net_ko').replace('{d}', d.network_detail||'')};
+  if (d.blamed_flag) return {tone:'red',
+    text: tr('cli_diag_flag_blamed').replace('{f}', d.blamed_flag)};
+  if (d.minimal_ok === true) return {tone:'red',
+    text: tr('cli_diag_flag_generic').replace('{s}', String(d.minimal_seconds))};
+  if (d.minimal_ok === false) return {tone:'red', text: tr('cli_diag_auth')};
   if (d.partial) return {tone:'red',
     text: tr('cli_diag_ping_stuck').replace('{p}', d.partial.substring(0,300))};
   return {tone:'red', text: tr('cli_diag_ping_silent').replace('{s}', String(d.ping_seconds))};
@@ -7775,11 +8019,17 @@ async function diagClaudeCli(target){
     const r = await fetch('/api/claude-cli-diagnose');
     const d = await r.json();
     const v = cliDiagVerdict(d);
-    const facts = [
+    const rows = [
       'path: ' + (d.path || '—'),
       'version: ' + (d.version || '—'),
       'ping: ' + (d.ping_ok ? (d.ping_reply||'ok') : (tr('cli_diag_failed') + (d.ping_seconds!=null ? ' (' + d.ping_seconds + 's)' : ''))),
-    ].join('\n');
+    ];
+    // v1.14.4 - les sondes ne s'affichent que si elles ont tourne.
+    if (d.network_detail) rows.push('api.anthropic.com: ' + (d.network_ok ? 'ok' : 'KO') + ' (' + d.network_detail + ')');
+    if (d.minimal_ok != null) rows.push('appel nu / bare call: ' + (d.minimal_ok ? 'ok (' + d.minimal_seconds + 's)' : tr('cli_diag_failed')));
+    if (d.blamed_flag) rows.push('option en cause: ' + d.blamed_flag);
+    if (d.env_recovered && d.env_recovered.length) rows.push('env shell: ' + d.env_recovered.join(', '));
+    const facts = rows.join('\n');
     if (!box){ alert(v.text + '\n\n' + facts); return d; }
     box.innerHTML = '<strong class="' + (v.tone==='green'?'text-green-700':'text-red-700') + '">'
       + escAttr(v.text) + '</strong>'
