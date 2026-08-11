@@ -279,3 +279,92 @@ class FastPathIsNotRetriedForeverTests(unittest.TestCase):
         with self.assertRaises(app.ClaudeCliTimeout):
             app._call_claude_cli("x", timeout=60)
         self.assertEqual(len(self.calls), 1)
+
+
+class NestedSessionEnvIsStrippedTests(unittest.TestCase):
+    """v1.14.9 - Depuis l'app, api.anthropic.com repond (HTTP 401) et le
+    binaire est sain, mais meme l'appel NU cale -- alors qu'il repond dans le
+    terminal de l'utilisateur. Il ne reste que ce que l'app transmet.
+
+    Si Claude Control a ete demarre depuis une session Claude Code, son
+    environnement porte CLAUDECODE=1 et les CLAUDE_CODE_* de cette session.
+    Le CLI enfant en herite et ne se comporte plus comme un appel autonome.
+    Un terminal ordinaire ne les a pas.
+    """
+
+    def setUp(self):
+        self._shell = dict(app._SHELL_ENV_CACHE)
+        app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
+
+    def tearDown(self):
+        app._SHELL_ENV_CACHE.clear()
+        app._SHELL_ENV_CACHE.update(self._shell)
+
+    def _env(self, os_env):
+        with patch.object(app.os, "environ", dict(os_env)):
+            return app._cli_env()
+
+    def test_claudecode_marker_is_removed(self):
+        self.assertNotIn("CLAUDECODE",
+                         self._env({"PATH": "/usr/bin", "CLAUDECODE": "1"}))
+
+    def test_claude_code_prefixed_vars_are_removed(self):
+        env = self._env({"PATH": "/usr/bin",
+                         "CLAUDE_CODE_ENTRYPOINT": "cli",
+                         "CLAUDE_CODE_SSE_PORT": "1234"})
+        self.assertEqual([k for k in env if k.startswith("CLAUDE_CODE_")], [])
+
+    def test_unrelated_variables_survive(self):
+        env = self._env({"PATH": "/usr/bin", "HOME": "/Users/x",
+                         "CLAUDECODE": "1"})
+        self.assertEqual(env["HOME"], "/Users/x")
+        self.assertIn("/usr/bin", env["PATH"])
+
+    def test_anthropic_credentials_are_not_stripped(self):
+        """Elles servent a l'authentification : les retirer casserait
+        l'appel au lieu de le reparer."""
+        env = self._env({"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-x"})
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-x")
+
+
+class StableWorkdirTests(unittest.TestCase):
+    """Chaque appel tournait dans un dossier temporaire NEUF, sous
+    /var/folders. Le CLI traite le repertoire courant comme le projet
+    courant : un chemin jamais vu a chaque appel."""
+
+    def test_workdir_is_stable_across_calls(self):
+        self.assertEqual(app._cli_workdir(), app._cli_workdir())
+
+    def test_workdir_is_not_a_throwaway_temp_dir(self):
+        import tempfile
+        self.assertFalse(
+            app._cli_workdir().startswith(tempfile.gettempdir()),
+            "le cwd ne doit plus etre un dossier temporaire jetable")
+
+    def test_workdir_exists_after_the_call(self):
+        self.assertTrue(Path(app._cli_workdir()).is_dir())
+
+    def test_probe_and_production_share_it(self):
+        """Une sonde qui tourne ailleurs que la production ne prouve rien."""
+        calls = []
+
+        def fake(cmd, **kw):
+            calls.append(kw.get("cwd"))
+            return _Done(stdout="pong")
+
+        orig_run, orig_path = app.subprocess.run, app._claude_cli_path
+        shell = dict(app._SHELL_ENV_CACHE)
+        app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
+        app.subprocess.run = fake
+        app._claude_cli_path = lambda: "/bin/claude"
+        fallback = app._CLI_FALLBACK["used"]
+        app._CLI_FALLBACK["used"] = False
+        try:
+            app._call_claude_cli("x")
+            app._cli_probe(())
+        finally:
+            app.subprocess.run, app._claude_cli_path = orig_run, orig_path
+            app._CLI_FALLBACK["used"] = fallback
+            app._SHELL_ENV_CACHE.clear()
+            app._SHELL_ENV_CACHE.update(shell)
+        self.assertEqual(len(set(calls)), 1, calls)
