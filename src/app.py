@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Claude Control - app locale pour gerer MCPs et Skills de Claude Desktop."""
-import http.server, io, json, os, re, shutil, socketserver, subprocess, sys, tempfile, threading, time, traceback, webbrowser, zipfile
+import http.server, io, json, os, re, shutil, socketserver, subprocess, sys, tempfile, threading, time, traceback, unicodedata, webbrowser, zipfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -446,6 +446,24 @@ def _update_skill_frontmatter(content, updates):
     return new_fm + body
 
 
+def _find_skill_dir(name):
+    """v1.14.1 - Localise le dossier d'un skill par son nom.
+
+    Cherche dans skills/, skills-disabled/, puis skills/synced/ (les skills
+    synchronises depuis le compte Claude). Avant, les deux appelants
+    (repair_skill et suggest_skill_description) dupliquaient une boucle qui
+    ignorait synced/ : un skill synchronise etait donc affiche mais
+    "introuvable" des qu'on essayait de le reparer.
+    """
+    if not name or "/" in str(name) or "\\" in str(name) or ".." in str(name) or str(name).startswith("."):
+        return None
+    for base in (SKILLS_DIR, SKILLS_DISABLED_DIR, SKILLS_DIR / SYNCED_SKILLS_DIRNAME):
+        candidate = base / name
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def repair_skill(name, description=None, name_override=None):
     """v1.9.0 - Repare un skill en (re-)ecrivant son frontmatter avec la
     description fournie. Backup zip cree avant ecriture (cf. delete_skill).
@@ -463,12 +481,7 @@ def repair_skill(name, description=None, name_override=None):
         return False, "Nom de skill invalide"
     if not description or not str(description).strip():
         return False, "Description requise"
-    target = None
-    for base in (SKILLS_DIR, SKILLS_DISABLED_DIR):
-        candidate = base / name
-        if candidate.exists() and candidate.is_dir():
-            target = candidate
-            break
+    target = _find_skill_dir(name)
     if not target:
         return False, f"Skill '{name}' introuvable"
     md = target / "SKILL.md"
@@ -624,19 +637,48 @@ class ClaudeCliNotLoggedIn(Exception):
     doit run 'claude /login' dans un terminal pour s'authentifier."""
 
 
-def _call_claude_cli(prompt, timeout=60):
-    """v1.9.3 / v1.9.4 / v1.9.5 - Invoque le CLI Claude Code en mode print.
+def _call_claude_cli(prompt, timeout=120, system_prompt=None):
+    """v1.9.3 / v1.9.4 / v1.9.5 / v1.14.1 - Invoque le CLI Claude Code en
+    mode print.
 
-    v1.9.5 : detecte specifiquement le cas 'Not logged in' (cas reel
-    observe sur la machine de Fabien) et leve ClaudeCliNotLoggedIn pour
-    qu'on puisse afficher une instruction claire cote UI plutot qu'un
-    message generique.
+    v1.14.1 - trois changements, chacun corrige une facon dont l'appel
+    pouvait "ne pas repondre" :
+
+    1. LE PROMPT PASSE PAR STDIN, plus par argv. `claude -p <prompt>` casse
+       des que le prompt commence par un tiret : commander le prend pour une
+       option et sort en `error: unknown option`. Un SKILL.md commence par
+       `---` (frontmatter), donc des qu'on passe du contenu de skill
+       directement, l'appel echoue avant meme de demarrer. Passer par stdin
+       supprime aussi toute limite ARG_MAX.
+
+    2. `--safe-mode` : demarre sans MCP, hooks, plugins, CLAUDE.md ni
+       commandes custom. Le CLI lancait sinon TOUTE la config MCP de
+       l'utilisateur avant de repondre -- sur une machine qui a une
+       vingtaine de MCPs dont certains en echec, le demarrage seul pouvait
+       depasser le timeout. On genere une phrase de description : aucun de
+       ces composants n'est utile. Important : contrairement a `--bare`,
+       `--safe-mode` garde l'authentification OAuth, donc pas besoin de clef
+       API.
+
+    3. `--no-session-persistence` : sans ca, chaque suggestion ecrivait une
+       session JSONL dans ~/.claude/projects -- le repertoire meme que
+       get_skill_usage parcourt. L'app alimentait le volume qui la ralentit.
+
+    `system_prompt` remplace le system prompt par defaut (--system-prompt),
+    ce qui reduit le contexte et rend la consigne beaucoup plus fiable que
+    de la prefixer au message utilisateur.
     """
     cli_path = _claude_cli_path()
     if not cli_path:
         raise FileNotFoundError("claude CLI not in PATH")
-    cmd = [cli_path, "-p", prompt, "--output-format", "text"]
-    _log(f"_call_claude_cli: argv={cmd[:2]} prompt_len={len(prompt)}")
+    cmd = [cli_path, "-p",
+           "--safe-mode",
+           "--no-session-persistence",
+           "--disable-slash-commands",
+           "--output-format", "text"]
+    if system_prompt:
+        cmd += ["--system-prompt", system_prompt]
+    _log(f"_call_claude_cli: cli={cli_path} prompt_len={len(prompt)} timeout={timeout}")
     # v1.13.1 - augmente le PATH du subprocess pour inclure les dirs ou
     # vivent les binaires npm/node/etc. Necessaire quand Claude Control
     # est lance depuis Finder (PATH minimal launchd). Sans ca le CLI
@@ -661,28 +703,43 @@ def _call_claude_cli(prompt, timeout=60):
     parts = [p for p in extra if p not in cur]
     if parts:
         env["PATH"] = ":".join(parts) + (":" + cur if cur else "")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    # v1.14.1 - cwd neutre. Sinon le CLI herite du cwd du serveur ('/' quand
+    # Claude Control est lance depuis Finder) et traite ce repertoire comme
+    # le projet courant.
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="claude-control-cli-") as workdir:
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                           timeout=timeout, env=env, cwd=workdir)
+    elapsed = time.monotonic() - started
     stdout = (r.stdout or "").strip()
     stderr = (r.stderr or "").strip()
+    _log(f"_call_claude_cli: exit={r.returncode} in {elapsed:.1f}s out_len={len(stdout)}")
     if r.returncode != 0:
-        _log(f"_call_claude_cli: exit={r.returncode} stdout={stdout[:300]!r} stderr={stderr[:300]!r}")
-        # v1.9.5 - cas 'Not logged in' detecte par pattern
+        _log(f"_call_claude_cli: stdout={stdout[:300]!r} stderr={stderr[:300]!r}")
         combined = (stdout + " " + stderr).lower()
+        # v1.9.5 - cas 'Not logged in' detecte par pattern
         if "not logged in" in combined or "please run /login" in combined or "please log in" in combined:
             raise ClaudeCliNotLoggedIn(
                 "Claude Code CLI n'est pas authentifie sur ce systeme. "
                 "Ouvre un terminal et lance la commande : claude /login"
             )
-        if not stdout and not stderr:
-            hint = (
-                "Sortie vide. Causes possibles : (1) le CLI necessite une "
-                "session OAuth deja active (run 'claude' dans un terminal "
-                "pour t'authentifier), (2) le CLI est lance hors d'un TTY "
-                "et refuse de prompter, (3) le PATH du process Claude "
-                "Control ne contient pas l'emplacement attendu de la "
-                "config CLI."
+        # v1.14.1 - deux erreurs de demarrage tres bavardes cote CLI mais
+        # opaques cote UI : on les nomme.
+        if "unknown option" in combined:
+            raise RuntimeError(
+                "Le CLI a pris une partie du prompt pour une option "
+                f"(exit {r.returncode}). Detail : {(stderr or stdout)[:200]}"
             )
-            raise RuntimeError(f"claude CLI exit {r.returncode} (stdout+stderr vides). {hint}")
+        if "credit balance" in combined or "rate limit" in combined or "quota" in combined:
+            raise RuntimeError(
+                f"Le CLI Claude a refuse la requete (quota / rate limit) : "
+                f"{(stderr or stdout)[:200]}"
+            )
+        if not stdout and not stderr:
+            raise RuntimeError(
+                f"claude CLI exit {r.returncode} sans aucune sortie apres "
+                f"{elapsed:.0f}s. Verifie l'authentification avec : claude /login"
+            )
         details = []
         if stderr: details.append(f"stderr: {stderr[:300]}")
         if stdout: details.append(f"stdout: {stdout[:300]}")
@@ -690,14 +747,31 @@ def _call_claude_cli(prompt, timeout=60):
     return stdout
 
 
+# v1.14.1 - prompt reecrit.
+#
+# L'ancien demandait explicitement "a single sentence (40-150 chars)" et
+# "Keep it under 150 chars". C'est la cause directe des skills a description
+# trop courte : l'app demandait des descriptions courtes, puis _skill_quality
+# les notait "excellent" des 30 caracteres. Les deux bouts poussaient dans le
+# mauvais sens.
+#
+# Une description n'est pas un resume : c'est le SEUL signal qui decide si
+# Claude declenche le skill. Elle doit contenir les mots que l'utilisateur
+# va reellement employer. D'ou : ce que fait le skill + quand le declencher
+# + les termes declencheurs concrets.
 _SUGGEST_SYSTEM_PROMPT = (
-    "You write concise, action-oriented descriptions for Claude Code skills. "
-    "A skill description is a single sentence (40-150 chars) that tells Claude "
-    "WHEN to trigger this skill. It should start with a verb in present tense "
-    "('Use this skill when...', 'Helps with...', 'Generates...'). Avoid generic "
-    "phrasing. Read the SKILL.md content provided and produce ONLY the "
-    "description text - no quotes, no preamble, no explanation, just the "
-    "description string itself. Keep it under 150 chars."
+    "You write the `description` field of a Claude Code SKILL.md frontmatter. "
+    "That description is the ONLY signal Claude uses to decide whether to "
+    "trigger the skill, so it must be discoverable, not merely accurate.\n\n"
+    "Rules:\n"
+    "- Say WHAT the skill does AND WHEN to trigger it.\n"
+    "- Include the concrete words a user would actually type: synonyms, "
+    "domain jargon, tool and product names, file extensions, error strings.\n"
+    "- Aim for 200-450 characters, one to three sentences. Start with a verb.\n"
+    "- End with an explicit list of trigger terms.\n"
+    "- Describe ONLY capabilities present in the SKILL.md. Invent nothing.\n"
+    "- Output ONLY the description text: no quotes, no preamble, no markdown, "
+    "no key name, no explanation."
 )
 
 
@@ -716,12 +790,7 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
     if not _claude_cli_path():
         return False, ("Claude Code CLI ('claude') introuvable dans le PATH. "
                        "Installer avec : npm install -g @anthropic-ai/claude-code")
-    target = None
-    for base in (SKILLS_DIR, SKILLS_DISABLED_DIR):
-        candidate = base / name
-        if candidate.exists() and candidate.is_dir():
-            target = candidate
-            break
+    target = _find_skill_dir(name)
     if not target:
         return False, f"Skill '{name}' introuvable"
     md = target / "SKILL.md"
@@ -737,18 +806,22 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
     # v1.9.6 - directive de langue dans le system prompt si lang fourni.
     lang_directive = ""
     if lang == "fr":
-        lang_directive = "\n\nIMPORTANT: Respond in French (Francais)."
+        lang_directive = "\n\nIMPORTANT: Write the description in French."
     elif lang == "en":
-        lang_directive = "\n\nIMPORTANT: Respond in English."
+        lang_directive = "\n\nIMPORTANT: Write the description in English."
+    # v1.14.1 - la consigne part dans --system-prompt, le message utilisateur
+    # ne porte plus que la matiere. Avant, tout etait concatene dans le
+    # prompt utilisateur, ce qui diluait la consigne et rendait la sortie
+    # beaucoup plus bavarde (d'ou l'heuristique de nettoyage plus bas).
+    system_prompt = _SUGGEST_SYSTEM_PROMPT + lang_directive
     prompt = (
-        _SUGGEST_SYSTEM_PROMPT + lang_directive + "\n\n"
-        f"Skill name (folder): {name}\n\n"
+        f"Skill folder name: {name}\n\n"
         f"SKILL.md content:\n```\n{content}\n```\n\n"
-        f"Generate the description string."
+        f"Write the description field value now, and nothing else."
     )
     _log(f"suggest_skill_description: name={name} chars_sent={len(content)} lang={lang}")
     try:
-        raw_response = _call_claude_cli(prompt)
+        raw_response = _call_claude_cli(prompt, system_prompt=system_prompt)
     except ClaudeCliNotLoggedIn as e:
         # v1.9.5 - cas specifique 'Not logged in' : on retourne un code
         # error_code que l'UI peut utiliser pour afficher des instructions
@@ -761,8 +834,10 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
             "fix_command": "claude /login",
         }
     except subprocess.TimeoutExpired:
-        _log("suggest_skill_description: claude CLI timeout 60s")
-        return False, "Timeout : le CLI Claude n'a pas repondu en 60s"
+        _log("suggest_skill_description: claude CLI timeout")
+        return False, ("Timeout : le CLI Claude n'a pas repondu en 120 s. "
+                       "Teste-le a la main dans un terminal : "
+                       "echo bonjour | claude -p --safe-mode")
     except FileNotFoundError as e:
         _log(f"suggest_skill_description: CLI not found : {e}")
         return False, ("Claude Code CLI introuvable dans le PATH. "
@@ -793,24 +868,42 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
     raw = (raw_response or "")
     cleaned_lines = [_strip_line(ln) for ln in raw.splitlines()]
     cleaned_lines = [ln for ln in cleaned_lines if ln]
-    if cleaned_lines:
-        # Heuristique : prefer lines that don't end with ':' (preamble) and
-        # don't start with 'Sure', 'Here', 'Of course' (filler). Sort by
-        # (is_preamble ASC, length DESC) -> first non-preamble + longest.
-        preamble_starts = ("sure", "here", "of course", "absolutely",
-                           "certainly", "yes,", "let me", "i'll", "let's")
-        def _is_preamble(line):
-            ll = line.lower().strip()
-            if ll.endswith(":"):
-                return True
-            for p in preamble_starts:
-                if ll.startswith(p):
-                    return True
-            return False
-        cleaned_lines.sort(key=lambda ln: (_is_preamble(ln), -len(ln)))
-        suggestion = cleaned_lines[0].strip()
-    else:
+    # v1.14.1 - on JOINT les lignes restantes au lieu de n'en garder qu'une.
+    #
+    # L'ancienne heuristique triait par longueur et prenait la ligne la plus
+    # longue. C'etait cohérent tant que la description tenait en une phrase
+    # de moins de 150 caracteres ; maintenant qu'on demande 200-450
+    # caracteres sur une a trois phrases, un retour a la ligne du modele
+    # aurait silencieusement ampute la description.
+    preamble_starts = ("sure", "here", "of course", "absolutely",
+                       "certainly", "yes,", "let me", "i'll", "let's",
+                       "voici", "bien sur", "d'accord", "parfait")
+    # v1.14.1 - les cloture aussi : maintenant qu'on joint les lignes au lieu
+    # d'en garder une seule, un "Hope this helps." final finirait dans la
+    # description ecrite sur disque.
+    closing_starts = ("hope this helps", "hope that helps", "let me know",
+                      "feel free", "n'hesite", "n'hésite", "j'espere",
+                      "j'espère", "dis-moi", "note that", "note :", "note:")
+
+    def _is_filler(line):
+        ll = line.lower().strip()
+        if ll.endswith(":"):
+            return True
+        return (any(ll.startswith(p) for p in preamble_starts)
+                or any(ll.startswith(c) for c in closing_starts))
+
+    kept = [ln for ln in cleaned_lines if not _is_filler(ln)]
+    if not kept:
+        kept = cleaned_lines
+    suggestion = re.sub(r"\s+", " ", " ".join(kept)).strip()
+    if not suggestion:
         suggestion = _strip_line(raw)
+    # Garde-fou : une description qui depasse largement la consigne trahit un
+    # modele parti en explication. On coupe a la derniere phrase complete.
+    if len(suggestion) > 700:
+        cut = suggestion[:700]
+        dot = max(cut.rfind(". "), cut.rfind(" ! "), cut.rfind(" ? "))
+        suggestion = (cut[:dot + 1] if dot > 200 else cut).strip()
     if not suggestion:
         _log(f"suggest_skill_description: empty after sanitization (raw was {raw_response[:200]!r})")
         return False, f"API a retourne une suggestion vide ou non parsable. Raw : {(raw_response or '')[:150]!r}"
@@ -821,6 +914,138 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
         "raw_chars": len(raw_response or ""),
         "lang": lang,
     }
+
+
+# === REPARATION EN LOT ===
+#
+# v1.14.1 - reparer 24 skills a la main = 24 clics et 24 modales. Chaque
+# appel CLI prend ~7 s, donc un lot depasse largement le timeout d'une
+# requete HTTP (et bloquerait un thread du serveur). D'ou : un job de fond
+# avec un endpoint de progression que l'UI interroge.
+_BULK_REPAIR = {
+    "running": False, "total": 0, "done": 0, "current": None,
+    "results": [], "started_at": None, "finished_at": None,
+    "cancelled": False, "lang": None,
+}
+_BULK_REPAIR_LOCK = threading.Lock()
+
+
+def _repairable_user_skills(include_synced=False):
+    """Skills dont la description ne suffit pas a declencher le skill.
+
+    Par defaut : uniquement les skills locaux de l'utilisateur. Les skills
+    de plugin et Desktop sont toujours exclus (on n'ecrit pas dans leur
+    source).
+
+    `include_synced` ajoute ceux de skills/synced/. C'est un opt-in explicite
+    et non le defaut : ces skills sont synchronises depuis le compte Claude,
+    donc une reecriture locale peut etre ecrasee a la prochaine synchro. Le
+    backup .zip est cree comme pour les autres, mais l'utilisateur doit
+    savoir ce qu'il fait.
+    """
+    out = []
+    bases = [(SKILLS_DIR, True), (SKILLS_DISABLED_DIR, False)]
+    if include_synced:
+        bases.append((SKILLS_DIR / SYNCED_SKILLS_DIRNAME, True))
+    for base, active in bases:
+        if not base.is_dir():
+            continue
+        for d in sorted(base.iterdir()):
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            # v1.14.1 - un dossier sans SKILL.md n'est pas un skill mais un
+            # conteneur (cf. skills/synced/). Sans ce filtre, la reparation
+            # en lot ecrivait un SKILL.md a la racine du conteneur.
+            if not (d / "SKILL.md").exists():
+                continue
+            meta = read_skill_meta(d)
+            quality, reason = _skill_quality_detail(meta.get("description"))
+            if d.name == SYNCED_SKILLS_DIRNAME:
+                continue
+            if quality in ("broken", "enrich"):
+                out.append({"name": d.name, "quality": quality, "reason": reason,
+                            "active": active,
+                            "source": "synced" if base.name == SYNCED_SKILLS_DIRNAME else "user",
+                            "description": meta.get("description") or ""})
+    return out
+
+
+def bulk_repair_status():
+    with _BULK_REPAIR_LOCK:
+        snap = dict(_BULK_REPAIR)
+        snap["results"] = list(_BULK_REPAIR["results"])
+    if not snap["running"] and not snap["results"]:
+        snap["pending"] = len(_repairable_user_skills())
+        snap["pending_synced"] = len(
+            [s for s in _repairable_user_skills(include_synced=True)
+             if s["source"] == "synced"])
+    return snap
+
+
+def cancel_bulk_repair():
+    with _BULK_REPAIR_LOCK:
+        if not _BULK_REPAIR["running"]:
+            return False, "Aucune reparation en cours"
+        _BULK_REPAIR["cancelled"] = True
+    return True, "Annulation demandee - le skill en cours se termine"
+
+
+def _bulk_repair_worker(targets, lang):
+    for item in targets:
+        with _BULK_REPAIR_LOCK:
+            if _BULK_REPAIR["cancelled"]:
+                break
+            _BULK_REPAIR["current"] = item["name"]
+        entry = {"name": item["name"], "before": item["description"]}
+        try:
+            ok, payload = suggest_skill_description(item["name"], lang=lang)
+            if not ok:
+                msg = payload.get("error") if isinstance(payload, dict) else str(payload)
+                entry.update({"ok": False, "error": msg})
+            else:
+                suggestion = payload["suggestion"]
+                ok2, msg2 = repair_skill(item["name"], description=suggestion)
+                entry.update({"ok": bool(ok2), "after": suggestion,
+                              "error": None if ok2 else str(msg2)})
+        except Exception as e:
+            _log(f"bulk_repair: {item['name']} : {type(e).__name__} : {e}")
+            entry.update({"ok": False, "error": f"{type(e).__name__} : {e}"})
+        with _BULK_REPAIR_LOCK:
+            _BULK_REPAIR["results"].append(entry)
+            _BULK_REPAIR["done"] += 1
+    with _BULK_REPAIR_LOCK:
+        _BULK_REPAIR["running"] = False
+        _BULK_REPAIR["current"] = None
+        _BULK_REPAIR["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        done, total = _BULK_REPAIR["done"], _BULK_REPAIR["total"]
+        failed = sum(1 for r in _BULK_REPAIR["results"] if not r.get("ok"))
+    _notify("Reparation des skills terminee",
+            f"{done}/{total} traites, {failed} en echec")
+
+
+def start_bulk_repair(lang=None, include_synced=False):
+    """Lance la reparation de tous les skills utilisateur a description
+    insuffisante. Retourne immediatement ; l'UI suit via /api/repair-all-status."""
+    with _BULK_REPAIR_LOCK:
+        if _BULK_REPAIR["running"]:
+            return False, "Une reparation est deja en cours"
+    if not _claude_cli_path():
+        return False, ("Claude Code CLI ('claude') introuvable dans le PATH. "
+                       "Installer avec : npm install -g @anthropic-ai/claude-code")
+    targets = _repairable_user_skills(include_synced=include_synced)
+    if not targets:
+        return True, {"message": "Aucun skill a reparer", "total": 0, "started": False}
+    with _BULK_REPAIR_LOCK:
+        _BULK_REPAIR.update({
+            "running": True, "total": len(targets), "done": 0,
+            "current": None, "results": [], "cancelled": False, "lang": lang,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        })
+    threading.Thread(target=_bulk_repair_worker, args=(targets, lang),
+                     name="claude-control-bulk-repair", daemon=True).start()
+    return True, {"message": f"Reparation de {len(targets)} skill(s) lancee",
+                  "total": len(targets), "started": True}
 
 
 def _list_desktop_skills():
@@ -900,19 +1125,90 @@ def _list_plugin_skills():
     return items
 
 
+# v1.14.1 - Claude Code range les skills synchronises depuis le compte de
+# l'utilisateur dans ~/.claude/skills/synced/<nom>/SKILL.md.
+#
+# C'est un dossier CONTENEUR, pas un skill. Consequence avant ce correctif :
+#   - 'synced' apparaissait comme UN skill sans SKILL.md donc "casse",
+#   - et les dizaines de skills qu'il contient etaient invisibles dans l'app.
+# Ils sont en lecture seule ici : la source de verite est le compte, une
+# edition locale serait ecrasee a la prochaine synchro.
+SYNCED_SKILLS_DIRNAME = "synced"
+
+
+def _list_synced_skills():
+    items = []
+    base = SKILLS_DIR / SYNCED_SKILLS_DIRNAME
+    if not base.is_dir():
+        return items
+    try:
+        for d in sorted(base.iterdir()):
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            if not (d / "SKILL.md").exists():
+                continue
+            items.append({"name": d.name, "_dir": d, "_source": "synced",
+                          "_enabled": True, "meta": read_skill_meta(d)})
+    except Exception as e:
+        _log(f"_list_synced_skills: {e}")
+    return items
+
+
+# v1.14.1 - une description ne declenche de facon fiable que si elle dit
+# QUAND l'utiliser. Ces marqueurs couvrent les tournures FR et EN usuelles.
+#
+# Les marqueurs sont ecrits SANS accent et compares sur une forme repliee
+# (cf. _fold_accents) : sinon "A utiliser" et "À utiliser" divergent. Ils
+# sont aussi volontairement tronques -- "declench" couvre declencher,
+# declencheur et declenchement ; "des qu" couvre "des que" comme
+# "des qu'on". Une premiere version listait les formes completes et
+# classait "enrich" des descriptions parfaitement bonnes : un skill
+# fraichement repare restait rouge, ce qui donnait l'impression que la
+# reparation ne marchait pas.
+_TRIGGER_CUES = (
+    "use when", "use this", "used when", "when the user", "when you",
+    "trigger", "for any request", "whenever", "invoke", "call this",
+    "utiliser", "declench", "quand ", "des qu", "lorsqu", "pour toute",
+    "s'applique", "mobiliser", "sert a", "en cas de",
+)
+
+
+def _fold_accents(s):
+    """Minuscule sans accents, pour comparer des marqueurs FR de facon stable."""
+    decomposed = unicodedata.normalize("NFD", (s or "").lower())
+    return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+
+# Seuil de longueur. 30 caracteres (valeur v1.7.7) qualifiait "excellent"
+# une description comme "Debug Railway" -- assez pour remplir le champ, pas
+# assez pour que Claude sache quand declencher le skill. 120 caracteres est
+# le plancher observe des descriptions qui portent reellement un quand + des
+# termes declencheurs.
+_SKILL_DESC_MIN_CHARS = 120
+
+
 def _skill_quality(description):
-    """v1.7.7 - Classifie un skill par qualite de description, qui est le
-    seul facteur qui determine si Claude le declenche automatiquement.
+    """v1.7.7 / v1.14.1 - Classifie un skill par qualite de description, qui
+    est le seul facteur qui determine si Claude le declenche automatiquement.
     - 'broken'    : pas de description -> ne se declenche jamais
-    - 'enrich'    : description < 30 chars -> peu fiable
-    - 'excellent' : description >= 30 chars
+    - 'enrich'    : trop courte, ou ne dit pas QUAND declencher
+    - 'excellent' : assez longue ET porte un marqueur de declenchement
     """
+    return _skill_quality_detail(description)[0]
+
+
+def _skill_quality_detail(description):
+    """Retourne (quality, reason). `reason` est un code stable que l'UI
+    traduit, pour que l'utilisateur sache quoi corriger."""
     desc = (description or "").strip()
     if not desc:
-        return "broken"
-    if len(desc) < 30:
-        return "enrich"
-    return "excellent"
+        return "broken", "no_description"
+    folded = _fold_accents(desc)
+    has_cue = any(cue in folded for cue in _TRIGGER_CUES)
+    if len(desc) < _SKILL_DESC_MIN_CHARS:
+        return "enrich", "too_short"
+    if not has_cue:
+        return "enrich", "no_trigger_terms"
+    return "excellent", "ok"
 
 
 # v1.14.0 - etat "running" des Desktop Extensions, mis en cache.
@@ -1066,9 +1362,12 @@ def get_state():
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
     active_skills = sorted([d.name for d in SKILLS_DIR.iterdir()
-                            if d.is_dir() and (d / "SKILL.md").exists() and not d.name.startswith(".")])
+                            if d.is_dir() and (d / "SKILL.md").exists()
+                            and not d.name.startswith(".")
+                            and d.name != SYNCED_SKILLS_DIRNAME])
     disabled_skills = sorted([d.name for d in SKILLS_DISABLED_DIR.iterdir()
-                              if d.is_dir() and not d.name.startswith(".")])
+                              if d.is_dir() and not d.name.startswith(".")
+                              and (d / "SKILL.md").exists()])
     # v1.7.7 - usage counts par skill via parsing JSONL des sessions Claude Code,
     # injecte par skill pour rendre actionable la qualite vs usage dans la tab.
     try:
@@ -1087,7 +1386,8 @@ def get_state():
             "tags": meta["tags"],
             "source": source,
             "editable": source == "user",
-            "quality": _skill_quality(meta["description"]),
+            "quality": _skill_quality_detail(meta["description"])[0],
+            "quality_reason": _skill_quality_detail(meta["description"])[1],
             "usage_count": int(usage_counts.get(name, 0)),
         }
     skills = [_skill_entry(n, SKILLS_DIR, True, "user") for n in active_skills]
@@ -1108,7 +1408,8 @@ def get_state():
             "tags": meta["tags"],
             "source": it["_source"],
             "editable": False,
-            "quality": _skill_quality(meta["description"]),
+            "quality": _skill_quality_detail(meta["description"])[0],
+            "quality_reason": _skill_quality_detail(meta["description"])[1],
             "usage_count": int(usage_counts.get(it["name"], 0)),
         })
     # v1.13.3 - skills decompresses par Claude Desktop dans son dir local-
@@ -1116,7 +1417,25 @@ def get_state():
     # ainsi que les bundled Anthropic. Precedence : user > plugin > desktop
     # (si meme nom existe deja, on n'ajoute pas le desktop pour eviter le
     # bruit visuel).
+    # v1.14.1 - skills synchronises depuis le compte (skills/synced/).
     seen_names = {s["name"] for s in skills}
+    for it in _list_synced_skills():
+        if it["name"] in seen_names:
+            continue
+        seen_names.add(it["name"])
+        meta = it["meta"]
+        skills.append({
+            "name": it["name"], "active": True,
+            "category": meta["category"],
+            "auto_category": _auto_category(meta["description"], it["name"]) if not meta["category"] else None,
+            "description": meta["description"],
+            "tags": meta["tags"],
+            "source": "synced",
+            "editable": False,
+            "quality": _skill_quality_detail(meta["description"])[0],
+            "quality_reason": _skill_quality_detail(meta["description"])[1],
+            "usage_count": int(usage_counts.get(it["name"], 0)),
+        })
     for it in _list_desktop_skills():
         if it["name"] in seen_names:
             continue
@@ -1130,7 +1449,8 @@ def get_state():
             "tags": meta["tags"],
             "source": it["_source"],  # "desktop"
             "editable": False,
-            "quality": _skill_quality(meta["description"]),
+            "quality": _skill_quality_detail(meta["description"])[0],
+            "quality_reason": _skill_quality_detail(meta["description"])[1],
             "usage_count": int(usage_counts.get(it["name"], 0)),
         })
     mcps_list = (
@@ -5476,10 +5796,10 @@ fr: {
   plugin_add_btn: "+ Ajouter un plugin (Git)",
   plugin_add_modal_title: "Ajouter un plugin via Git",
   plugin_add_modal_help: "Le repo sera cloné dans ~/.claude/plugins/cache/manual/, plugin.json sera lu pour le nom et la version, puis enregistré comme <name>@manual et activé.",
-  confirm_delete_skill: "Supprimer le skill « {name} » ?\\n\\n• Le dossier ~/.claude/skills/{name}/ va être effacé\\n• Un backup ZIP est créé dans ~/.claude/backups/claude-control/ — tu peux toujours restaurer\\n• Si tu veux juste désactiver sans effacer, décoche la case à la place",
-  confirm_delete_mcp: "Supprimer le MCP « {name} » de ta config ?\\n\\n• L'entrée disparaît de claude_desktop_config.json\\n• Le binaire / package reste sur ton disque\\n• Si tu veux juste désactiver, décoche la case à la place",
-  confirm_delete_plugin: "Supprimer le plugin « {name} » ET ses fichiers cache ?\\n\\n• L'entrée disparaît de installed_plugins.json\\n• Le dossier ~/.claude/plugins/cache/.../ est zippé (backup) puis effacé\\n• Annule ici si tu veux garder les fichiers (autre étape ensuite)",
-  confirm_delete_plugin_metadata_only: "Supprimer seulement l'enregistrement du plugin « {name} » ?\\n\\n• Le plugin disparaît de installed_plugins.json\\n• Les fichiers cache restent intacts sur ton disque\\n• Tu peux le réenregistrer plus tard sans re-cloner",
+  confirm_delete_skill: "Supprimer le skill « {name} » ?\n\n• Le dossier ~/.claude/skills/{name}/ va être effacé\n• Un backup ZIP est créé dans ~/.claude/backups/claude-control/ — tu peux toujours restaurer\n• Si tu veux juste désactiver sans effacer, décoche la case à la place",
+  confirm_delete_mcp: "Supprimer le MCP « {name} » de ta config ?\n\n• L'entrée disparaît de claude_desktop_config.json\n• Le binaire / package reste sur ton disque\n• Si tu veux juste désactiver, décoche la case à la place",
+  confirm_delete_plugin: "Supprimer le plugin « {name} » ET ses fichiers cache ?\n\n• L'entrée disparaît de installed_plugins.json\n• Le dossier ~/.claude/plugins/cache/.../ est zippé (backup) puis effacé\n• Annule ici si tu veux garder les fichiers (autre étape ensuite)",
+  confirm_delete_plugin_metadata_only: "Supprimer seulement l'enregistrement du plugin « {name} » ?\n\n• Le plugin disparaît de installed_plugins.json\n• Les fichiers cache restent intacts sur ton disque\n• Tu peux le réenregistrer plus tard sans re-cloner",
   source_user_skills: "Skills utilisateur",
   general_category: "Général",
   auto_cat_hint: "(catégorie auto)",
@@ -5531,7 +5851,7 @@ fr: {
   mcp_conflict_match_name_title: "Match par nom normalise (insensible casse + tirets/espaces)",
   mcp_conflict_match_package_title: "Match par package npm partage (signal fort)",
   mcp_conflict_match_both_title: "Match par nom ET package npm (certitude maximale)",
-  confirm_resolve_mcp_conflict: "Retirer l'entree '{classic}' de claude_desktop_config.json ?\\n\\nL'extension '{ext}' reste en place et continue de fournir le MCP. Un backup horodate du config est cree avant la modification.\\n\\nCe nettoyage evite les doublons (2 instances en parallele = concurrence + duplicate tool calls = risque de freeze UI).\\n\\nCONFIRMER ?",
+  confirm_resolve_mcp_conflict: "Retirer l'entree '{classic}' de claude_desktop_config.json ?\n\nL'extension '{ext}' reste en place et continue de fournir le MCP. Un backup horodate du config est cree avant la modification.\n\nCe nettoyage evite les doublons (2 instances en parallele = concurrence + duplicate tool calls = risque de freeze UI).\n\nCONFIRMER ?",
   btn_restart_mcp: "Redémarrer ce MCP (sans toucher à Claude)",
   btn_restart_mcp_short: "Redémarrer",
   btn_stop_mcp_short: "Stopper",
@@ -5543,8 +5863,8 @@ fr: {
   mcp_checkbox_title: "Coché = chargé au prochain démarrage de Claude Desktop. Décoché ne stoppe pas immédiatement le process en cours, utilise Stopper pour ça.",
   mcp_readonly_tooltip: "MCP en lecture seule : sa source de vérité n'est pas claude_desktop_config.json (Claude Code CLI ~/.claude.json, ou plugin). Modifie-le à la source, ou utilise le bouton « Ajouter à Claude Desktop » de l'onglet Plugins.",
   state_load_failed: "Impossible de charger l'état des MCPs et Skills.",
-  confirm_stop_mcp: "Stopper le MCP « {name} » à chaud ?\\n\\n• Le process en cours est tué immédiatement\\n• La config reste intacte (le checkbox ne change pas)\\n• Au prochain redémarrage de Claude Desktop, il sera relancé automatiquement\\n• Pour désactiver durablement, décoche la case en plus\\n\\nCONFIRMER ?",
-  confirm_delete_extension: "Supprimer l'extension « {name} » ?\\n\\n• Le dossier d'install est zippé en backup puis supprimé\\n• Le fichier de settings est sauvegardé puis supprimé\\n• L'entrée disparaît de extensions-installations.json\\n\\nNote : si Claude Desktop la ré-installe automatiquement (cas des extensions Anthropic-managed comme PowerPoint, Word, Control Mac), désinstalle-la via Settings → Extensions de Claude Desktop.\\n\\nCONFIRMER ?",
+  confirm_stop_mcp: "Stopper le MCP « {name} » à chaud ?\n\n• Le process en cours est tué immédiatement\n• La config reste intacte (le checkbox ne change pas)\n• Au prochain redémarrage de Claude Desktop, il sera relancé automatiquement\n• Pour désactiver durablement, décoche la case en plus\n\nCONFIRMER ?",
+  confirm_delete_extension: "Supprimer l'extension « {name} » ?\n\n• Le dossier d'install est zippé en backup puis supprimé\n• Le fichier de settings est sauvegardé puis supprimé\n• L'entrée disparaît de extensions-installations.json\n\nNote : si Claude Desktop la ré-installe automatiquement (cas des extensions Anthropic-managed comme PowerPoint, Word, Control Mac), désinstalle-la via Settings → Extensions de Claude Desktop.\n\nCONFIRMER ?",
   mcp_col_running: "En cours d'execution",
   mcp_col_stopped: "Inactifs",
   mcp_col_running_empty: "Aucun MCP en cours d'execution",
@@ -5559,6 +5879,15 @@ fr: {
   skills_health_title: "Santé de tes skills",
   skills_health_ready: "prêts à se déclencher",
   skills_health_all_good: "Tous tes skills sont en bonne forme",
+  bulk_repair_btn: "Réparer les {n} descriptions",
+  bulk_repair_title: "Génère une vraie description (ce que fait le skill + quand le déclencher) pour chaque skill signalé, via le CLI Claude Code. Environ 7 s par skill.",
+  confirm_bulk_repair: "Régénérer la description de tous les skills signalés ?\n\n• Chaque SKILL.md est sauvegardé en .zip avant écriture\n• Environ 7 secondes par skill, ça tourne en arrière-plan\n• Tu peux annuler en cours de route\n\nCONTINUER ?",
+  bulk_repair_running: "Réparation en cours",
+  bulk_repair_done: "Réparation terminée",
+  bulk_repair_cancel: "Annuler",
+  bulk_repair_synced_btn: "+ {n} skills synchronisés",
+  bulk_repair_synced_title: "Ces skills viennent de la synchronisation de ton compte Claude (~/.claude/skills/synced/). Les réparer localement fonctionne, mais une resynchro peut écraser la modification.",
+  confirm_bulk_repair_synced: "Réparer AUSSI les skills synchronisés depuis ton compte Claude ?\n\n⚠ Ils vivent dans ~/.claude/skills/synced/ : une resynchronisation du compte peut écraser la nouvelle description.\n\n• Un backup .zip est créé pour chacun\n• Environ 7 secondes par skill\n\nCONTINUER ?",
   chip_broken_action: "à corriger (sans description)",
   chip_enrich_action: "à enrichir (description courte)",
   chip_duplicate_action: "doublons à nettoyer",
@@ -5605,13 +5934,13 @@ fr: {
   selected_count: "sélectionné(s)",
   bulk_disable_btn: "Désactiver",
   bulk_delete_btn: "Supprimer",
-  confirm_bulk_disable: "Désactiver les {n} skills sélectionnés ?\\n\\nIls passent dans skills-disabled. Toujours réactivables un par un ensuite.\\n\\nCONFIRMER ?",
-  confirm_bulk_delete: "Supprimer définitivement les {n} skills sélectionnés ?\\n\\nUn backup zip individuel par skill est créé dans ~/.claude/backups/claude-control/.\\n\\nCONFIRMER ?",
+  confirm_bulk_disable: "Désactiver les {n} skills sélectionnés ?\n\nIls passent dans skills-disabled. Toujours réactivables un par un ensuite.\n\nCONFIRMER ?",
+  confirm_bulk_delete: "Supprimer définitivement les {n} skills sélectionnés ?\n\nUn backup zip individuel par skill est créé dans ~/.claude/backups/claude-control/.\n\nCONFIRMER ?",
   skills_empty_with_filters: "Aucun skill ne correspond aux filtres actifs.",
   btn_reset_filters: "Réinitialiser les filtres",
   source_badge_user: "perso",
   source_badge_plugin: "plugin",
-  confirm_restart_mcp: "Redémarrer le MCP « {name} » ?\\n\\nLe process sera tué puis Claude Desktop le respawn automatiquement (toggle config). Tes conversations Claude restent intactes.",
+  confirm_restart_mcp: "Redémarrer le MCP « {name} » ?\n\nLe process sera tué puis Claude Desktop le respawn automatiquement (toggle config). Tes conversations Claude restent intactes.",
   claude_running: "Claude tourne",
   claude_stopped: "Claude arrêté",
   tab_overview: "Vue d'ensemble",
@@ -5789,10 +6118,10 @@ en: {
   plugin_add_btn: "+ Add plugin (Git)",
   plugin_add_modal_title: "Add a plugin via Git",
   plugin_add_modal_help: "The repo will be cloned into ~/.claude/plugins/cache/manual/, plugin.json will be read for name and version, then registered as <name>@manual and enabled.",
-  confirm_delete_skill: 'Delete skill "{name}"?\\n\\n• The folder ~/.claude/skills/{name}/ will be removed\\n• A ZIP backup is created in ~/.claude/backups/claude-control/ — you can restore it\\n• To just disable it without removing, uncheck the box instead',
-  confirm_delete_mcp: 'Delete MCP "{name}" from your config?\\n\\n• The entry is removed from claude_desktop_config.json\\n• The binary / package stays on your disk\\n• To just disable it, uncheck the box instead',
-  confirm_delete_plugin: 'Delete plugin "{name}" AND its cache files?\\n\\n• The entry is removed from installed_plugins.json\\n• The folder under ~/.claude/plugins/cache/.../ is zipped (backup) and removed\\n• Cancel here to keep the files (next step asks)',
-  confirm_delete_plugin_metadata_only: 'Delete only the plugin "{name}" entry?\\n\\n• The plugin disappears from installed_plugins.json\\n• Cache files stay on your disk\\n• You can re-register it later without re-cloning',
+  confirm_delete_skill: 'Delete skill "{name}"?\n\n• The folder ~/.claude/skills/{name}/ will be removed\n• A ZIP backup is created in ~/.claude/backups/claude-control/ — you can restore it\n• To just disable it without removing, uncheck the box instead',
+  confirm_delete_mcp: 'Delete MCP "{name}" from your config?\n\n• The entry is removed from claude_desktop_config.json\n• The binary / package stays on your disk\n• To just disable it, uncheck the box instead',
+  confirm_delete_plugin: 'Delete plugin "{name}" AND its cache files?\n\n• The entry is removed from installed_plugins.json\n• The folder under ~/.claude/plugins/cache/.../ is zipped (backup) and removed\n• Cancel here to keep the files (next step asks)',
+  confirm_delete_plugin_metadata_only: 'Delete only the plugin "{name}" entry?\n\n• The plugin disappears from installed_plugins.json\n• Cache files stay on your disk\n• You can re-register it later without re-cloning',
   source_user_skills: "User skills",
   general_category: "General",
   auto_cat_hint: "(auto-category)",
@@ -5844,7 +6173,7 @@ en: {
   mcp_conflict_match_name_title: "Match by normalized name (case + dashes/spaces insensitive)",
   mcp_conflict_match_package_title: "Match by shared npm package (strong signal)",
   mcp_conflict_match_both_title: "Match by name AND npm package (maximum certainty)",
-  confirm_resolve_mcp_conflict: "Remove '{classic}' from claude_desktop_config.json?\\n\\nExtension '{ext}' stays in place and keeps providing the MCP. A timestamped config backup is created before the change.\\n\\nThis cleanup avoids duplicates (2 parallel instances = concurrency + duplicate tool calls = UI freeze risk).\\n\\nCONFIRM?",
+  confirm_resolve_mcp_conflict: "Remove '{classic}' from claude_desktop_config.json?\n\nExtension '{ext}' stays in place and keeps providing the MCP. A timestamped config backup is created before the change.\n\nThis cleanup avoids duplicates (2 parallel instances = concurrency + duplicate tool calls = UI freeze risk).\n\nCONFIRM?",
   btn_restart_mcp: "Restart this MCP (without touching Claude)",
   btn_restart_mcp_short: "Restart",
   btn_stop_mcp_short: "Stop",
@@ -5856,8 +6185,8 @@ en: {
   mcp_checkbox_title: "Checked = loaded at next Claude Desktop start. Unchecking does NOT immediately stop the running process; use Stop for that.",
   mcp_readonly_tooltip: "Read-only MCP: its source of truth is not claude_desktop_config.json (Claude Code CLI ~/.claude.json, or a plugin). Edit it at the source, or use the \"Add to Claude Desktop\" button in the Plugins tab.",
   state_load_failed: "Could not load MCP and Skill state.",
-  confirm_stop_mcp: 'Stop MCP "{name}" hot?\\n\\n• The running process is killed immediately\\n• The config stays intact (checkbox unchanged)\\n• At next Claude Desktop start, it will be respawned automatically\\n• To disable persistently, uncheck the box too\\n\\nCONFIRM?',
-  confirm_delete_extension: 'Delete extension "{name}"?\\n\\n• The install dir is zip-backed up then deleted\\n• The settings file is backed up then deleted\\n• The entry is removed from extensions-installations.json\\n\\nNote: if Claude Desktop re-installs it automatically (case of Anthropic-managed extensions like PowerPoint, Word, Control Mac), uninstall it via Settings → Extensions in Claude Desktop.\\n\\nCONFIRM?',
+  confirm_stop_mcp: 'Stop MCP "{name}" hot?\n\n• The running process is killed immediately\n• The config stays intact (checkbox unchanged)\n• At next Claude Desktop start, it will be respawned automatically\n• To disable persistently, uncheck the box too\n\nCONFIRM?',
+  confirm_delete_extension: 'Delete extension "{name}"?\n\n• The install dir is zip-backed up then deleted\n• The settings file is backed up then deleted\n• The entry is removed from extensions-installations.json\n\nNote: if Claude Desktop re-installs it automatically (case of Anthropic-managed extensions like PowerPoint, Word, Control Mac), uninstall it via Settings → Extensions in Claude Desktop.\n\nCONFIRM?',
   mcp_col_running: "Running",
   mcp_col_stopped: "Stopped",
   mcp_col_running_empty: "No MCP currently running",
@@ -5872,6 +6201,15 @@ en: {
   skills_health_title: "Skills health",
   skills_health_ready: "ready to trigger",
   skills_health_all_good: "All your skills are in good shape",
+  bulk_repair_btn: "Repair {n} descriptions",
+  bulk_repair_title: "Generates a real description (what the skill does + when to trigger it) for every flagged skill, via the Claude Code CLI. About 7s per skill.",
+  confirm_bulk_repair: "Regenerate the description of every flagged skill?\n\n• Each SKILL.md is backed up as .zip before writing\n• About 7 seconds per skill, runs in the background\n• You can cancel while it runs\n\nCONTINUE?",
+  bulk_repair_running: "Repairing",
+  bulk_repair_done: "Repair finished",
+  bulk_repair_cancel: "Cancel",
+  bulk_repair_synced_btn: "+ {n} synced skills",
+  bulk_repair_synced_title: "These skills come from your Claude account sync (~/.claude/skills/synced/). Repairing them locally works, but a re-sync may overwrite the change.",
+  confirm_bulk_repair_synced: "ALSO repair skills synced from your Claude account?\n\n⚠ They live in ~/.claude/skills/synced/: an account re-sync may overwrite the new description.\n\n• A .zip backup is created for each\n• About 7 seconds per skill\n\nCONTINUE?",
   chip_broken_action: "to fix (no description)",
   chip_enrich_action: "to enrich (short description)",
   chip_duplicate_action: "duplicates to clean",
@@ -5918,13 +6256,13 @@ en: {
   selected_count: "selected",
   bulk_disable_btn: "Disable",
   bulk_delete_btn: "Delete",
-  confirm_bulk_disable: "Disable the {n} selected skills?\\n\\nThey move to skills-disabled. Re-enable any one of them later.\\n\\nCONFIRM?",
-  confirm_bulk_delete: "Permanently delete the {n} selected skills?\\n\\nAn individual zip backup per skill is created under ~/.claude/backups/claude-control/.\\n\\nCONFIRM?",
+  confirm_bulk_disable: "Disable the {n} selected skills?\n\nThey move to skills-disabled. Re-enable any one of them later.\n\nCONFIRM?",
+  confirm_bulk_delete: "Permanently delete the {n} selected skills?\n\nAn individual zip backup per skill is created under ~/.claude/backups/claude-control/.\n\nCONFIRM?",
   skills_empty_with_filters: "No skill matches the active filters.",
   btn_reset_filters: "Reset filters",
   source_badge_user: "yours",
   source_badge_plugin: "plugin",
-  confirm_restart_mcp: 'Restart MCP "{name}"?\\n\\nThe process will be killed and Claude Desktop will respawn it automatically (config toggle). Your Claude conversations stay intact.',
+  confirm_restart_mcp: 'Restart MCP "{name}"?\n\nThe process will be killed and Claude Desktop will respawn it automatically (config toggle). Your Claude conversations stay intact.',
   claude_running: "Claude running",
   claude_stopped: "Claude stopped",
   tab_overview: "Overview",
@@ -6374,6 +6712,17 @@ function _renderHealthBanner(skills){
   const chipEnrich = enrich>0 ? `<button onclick="focusOnSkillQuality('enrich')" class="text-xs px-2.5 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100">${enrich} ${tr('chip_enrich_action')}</button>` : '';
   const chipDup = dups>0 ? `<button onclick="cleanupDuplicateUserSkills()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${dups} ${tr('chip_duplicate_action')}</button>` : '';
   const allOk = (broken+enrich+dups)===0 ? `<span class="text-xs text-green-700">${tr('skills_health_all_good')}</span>` : '';
+  // v1.14.1 - un seul bouton pour tout reparer, au lieu de N allers-retours
+  // dans la modale de reparation.
+  const bulkBtn = (broken+enrich) > 1
+    ? `<button onclick="startBulkRepair(false)" class="text-xs px-2.5 py-1 rounded-full bg-green-700 text-white border border-green-800 hover:bg-green-800" title="${escAttr(tr('bulk_repair_title'))}">${escAttr(tr('bulk_repair_btn').replace('{n}', String(broken+enrich)))}</button>`
+    : '';
+  // v1.14.1 - skills synchronises depuis le compte Claude : reparables, mais
+  // seulement sur action explicite (une resynchro peut ecraser l'ecriture).
+  const syncedWeak = skills.filter(s=>s.source==='synced' && s.quality!=='excellent').length;
+  const syncedBtn = syncedWeak > 0
+    ? `<button onclick="startBulkRepair(true)" class="text-xs px-2.5 py-1 rounded-full bg-sky-50 text-sky-800 border border-sky-200 hover:bg-sky-100" title="${escAttr(tr('bulk_repair_synced_title'))}">${escAttr(tr('bulk_repair_synced_btn').replace('{n}', String(syncedWeak)))}</button>`
+    : '';
   const banner = document.getElementById('skills-health-banner');
   if(!banner) return;
   banner.innerHTML = `
@@ -6382,8 +6731,69 @@ function _renderHealthBanner(skills){
       <span class="text-xs text-stone-500">${excellent}/${total} ${tr('skills_health_ready')}</span>
     </div>
     <div class="w-full h-2 rounded-full bg-stone-100 overflow-hidden mb-3"><div class="h-full ${barColor}" style="width:${ratio}%"></div></div>
-    <div class="flex flex-wrap gap-2">${chipBroken}${chipEnrich}${chipDup}${allOk}</div>
+    <div class="flex flex-wrap gap-2 items-center">${chipBroken}${chipEnrich}${chipDup}${allOk}${bulkBtn}${syncedBtn}</div>
+    <div id="bulk-repair-progress" class="mt-3 hidden"></div>
   `;
+  refreshBulkRepair();
+}
+
+// v1.14.1 - reparation en lot. Reparer 24 skills un par un demandait 24
+// clics et 24 modales ; chaque appel CLI prend ~7 s, donc le lot tourne en
+// tache de fond cote serveur et l'UI suit la progression.
+let BULK_REPAIR_TIMER = null;
+async function startBulkRepair(includeSynced){
+  const key = includeSynced ? 'confirm_bulk_repair_synced' : 'confirm_bulk_repair';
+  if(!confirm(tr(key))) return;
+  try{
+    const j = await api('/api/repair-all-skills', {lang: CURRENT_LANG, include_synced: !!includeSynced});
+    banner(j.success?'blue':'red', j.message);
+    if(j.success) pollBulkRepair();
+  }catch(e){ banner('red', String(e.message || e)); }
+}
+async function cancelBulkRepair(){
+  try{ const j = await api('/api/repair-all-cancel', {}); banner('blue', j.message); }
+  catch(e){ banner('red', String(e.message || e)); }
+}
+function pollBulkRepair(){
+  if(BULK_REPAIR_TIMER) return;
+  BULK_REPAIR_TIMER = setInterval(refreshBulkRepair, 2000);
+  refreshBulkRepair();
+}
+async function refreshBulkRepair(){
+  const el = document.getElementById('bulk-repair-progress');
+  if(!el) return;
+  let st;
+  try{ st = await fetchJSON('/api/repair-all-status'); }
+  catch(e){ return; }
+  if(!st.running && !(st.results||[]).length){
+    el.classList.add('hidden'); el.innerHTML = '';
+    if(BULK_REPAIR_TIMER){ clearInterval(BULK_REPAIR_TIMER); BULK_REPAIR_TIMER = null; }
+    return;
+  }
+  if(st.running && !BULK_REPAIR_TIMER) pollBulkRepair();
+  const pct = st.total ? Math.round(st.done / st.total * 100) : 0;
+  const failed = (st.results||[]).filter(r=>!r.ok);
+  const head = st.running
+    ? `${tr('bulk_repair_running')} ${st.done}/${st.total}${st.current ? ' — ' + escAttr(st.current) : ''}`
+    : `${tr('bulk_repair_done')} ${st.done}/${st.total}`;
+  const cancelBtn = st.running
+    ? `<button onclick="cancelBulkRepair()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${escAttr(tr('bulk_repair_cancel'))}</button>` : '';
+  const errList = failed.length
+    ? `<ul class="mt-2 text-xs text-red-700 list-disc pl-5">` +
+      failed.slice(0, 8).map(r=>`<li><span class="font-mono">${escAttr(r.name)}</span> — ${escAttr(String(r.error||'').slice(0,160))}</li>`).join('') +
+      (failed.length > 8 ? `<li>+${failed.length - 8}</li>` : '') + `</ul>`
+    : '';
+  el.classList.remove('hidden');
+  el.innerHTML = `
+    <div class="flex items-center justify-between gap-2 mb-1">
+      <span class="text-xs text-stone-600">${head}</span>${cancelBtn}
+    </div>
+    <div class="w-full h-1.5 rounded-full bg-stone-100 overflow-hidden"><div class="h-full bg-green-600" style="width:${pct}%"></div></div>
+    ${errList}`;
+  if(!st.running && BULK_REPAIR_TIMER){
+    clearInterval(BULK_REPAIR_TIMER); BULK_REPAIR_TIMER = null;
+    loadState();
+  }
 }
 // v1.10.0 - applique tous les filtres SAUF celui specifie. Permet aux
 // counts de la sidebar de refleter le nombre reel de skills qu'on verrait
@@ -7806,6 +8216,7 @@ _CONFIG_MUTATING_ROUTES = {
     "/api/watchdog-config", "/api/save-claude-md", "/api/save-command",
     "/api/toggle-skill", "/api/toggle-command", "/api/delete-skill",
     "/api/repair-skill", "/api/delete-user-skill-duplicates",
+    "/api/repair-all-skills", "/api/repair-all-cancel",
     "/api/package-plugin-skill",
 }
 
@@ -7906,6 +8317,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(read_settings_raw())
         elif path == "/api/overview":
             self._json(get_overview())
+        elif path == "/api/repair-all-status":
+            self._json(bulk_repair_status())
         elif path == "/api/skill-suggestions":
             self._json(skill_optimization_suggestions())
         elif path.startswith("/api/skill-content/"):
@@ -8001,6 +8414,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/save-settings": lambda: save_settings(data.get("content", "")),
             "/api/delete-skill": lambda: delete_skill(data.get("name", "")),
             "/api/repair-skill": lambda: repair_skill(data.get("name", ""), data.get("description"), data.get("name_override")),
+            "/api/repair-all-skills": lambda: start_bulk_repair(
+                data.get("lang"), bool(data.get("include_synced", False))),
+            "/api/repair-all-cancel": lambda: cancel_bulk_repair(),
             "/api/suggest-skill-description": lambda: suggest_skill_description(data.get("name", ""), lang=data.get("lang")),
             "/api/delete-user-skill-duplicates": lambda: delete_user_skill_duplicates(),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),

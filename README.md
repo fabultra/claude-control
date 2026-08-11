@@ -31,6 +31,16 @@ Claude Control fixes all that with a clean web UI that runs locally on your Mac.
 
 **Skills**
 - Toggle on/off (moves between `~/.claude/skills/` and `~/.claude/skills-disabled/`)
+- **Sees every skill source**: your own `~/.claude/skills/`, skills synced from
+  your Claude account (`~/.claude/skills/synced/`), plugin skills, and Claude
+  Desktop skills — each with a source badge
+- **Description health**: a description only triggers reliably if it says WHEN
+  to use it, so skills are flagged when the description is too short or never
+  states a trigger
+- **Repair all in one click**: generates a real description (what it does +
+  when to trigger it, with concrete trigger terms) for every flagged skill via
+  the Claude Code CLI, running in the background with progress and a per-skill
+  `.zip` backup
 - **Group by category** via a `category:` field in the skill's `SKILL.md` frontmatter, with collapsible sections
 - **Live search** by name and `description` — categories with no match are hidden, counters update
 
