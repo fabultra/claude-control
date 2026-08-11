@@ -67,8 +67,11 @@ class PartialOutputIsKeptTests(unittest.TestCase):
         self.assertIn("rien écrit", str(e))
 
     def test_timeout_value_is_in_the_message(self):
+        """v1.14.7 - quand les deux essais calent, le message annonce
+        l'attente TOTALE (essai court + appel nu), pas le budget d'un seul."""
         e = self._timeout_with()
-        self.assertIn("120", str(e))
+        self.assertEqual(e.timeout, app.CLI_FAST_PATH_TIMEOUT + 120)
+        self.assertIn(str(app.CLI_FAST_PATH_TIMEOUT + 120), str(e))
 
 
 class SuggestSurfacesTimeoutTests(unittest.TestCase):

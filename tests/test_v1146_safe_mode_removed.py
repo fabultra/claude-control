@@ -113,12 +113,27 @@ class FallbackTests(unittest.TestCase):
         app._call_claude_cli("---\nfrontmatter")
         self.assertEqual(self.calls[1]["kw"]["input"], "---\nfrontmatter")
 
-    def test_fallback_budget_is_smaller_than_the_first_attempt(self):
-        """Sinon un CLI totalement mort ferait attendre 240 s."""
+    def test_the_proven_call_gets_the_budget(self):
+        """v1.14.7 - budgets inverses. L'appel optimise n'est qu'une
+        optimisation et n'a droit qu'a un essai court ; l'appel nu est la
+        seule forme prouvee et recoit tout le budget. Avant, l'app misait
+        120 s sur la variante incertaine et n'en laissait que 60 a celle qui
+        marche."""
         self._stall_then_answer()
         app._call_claude_cli("x", timeout=120)
-        self.assertLess(self.calls[1]["kw"]["timeout"],
-                        self.calls[0]["kw"]["timeout"])
+        self.assertEqual(self.calls[0]["kw"]["timeout"],
+                         app.CLI_FAST_PATH_TIMEOUT)
+        self.assertEqual(self.calls[1]["kw"]["timeout"], 120)
+
+    def test_bare_attempt_carries_the_instruction_in_the_prompt(self):
+        """--system-prompt a ete ajoute par le meme commit que --safe-mode et
+        n'a jamais ete valide sur le CLI concerne : le repli ne doit pas en
+        heriter. La consigne repasse par stdin, seul canal prouve."""
+        self._stall_then_answer()
+        app._call_claude_cli("CORPS", system_prompt="SOIS BREF")
+        self.assertNotIn("--system-prompt", self.calls[1]["cmd"])
+        self.assertIn("SOIS BREF", self.calls[1]["kw"]["input"])
+        self.assertIn("CORPS", self.calls[1]["kw"]["input"])
 
     def test_fallback_is_recorded(self):
         self._stall_then_answer()
@@ -131,18 +146,17 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertFalse(app._CLI_FALLBACK["used"])
 
-    def test_both_stalling_reports_the_first_budget(self):
-        """L'utilisateur a attendu 120 s puis 60 s. Annoncer "60 s"
-        sous-declarerait l'attente et designerait l'appel nu, alors que
-        c'est l'appel complet qui a echoue d'abord."""
+    def test_both_stalling_reports_the_total_wait(self):
+        """Annoncer le budget d'un seul essai sous-declarerait ce que
+        l'utilisateur a reellement patiente."""
         def behaviour(n, cmd, kw):
             raise subprocess.TimeoutExpired("claude", kw["timeout"])
 
         self._run_with(behaviour)
         with self.assertRaises(app.ClaudeCliTimeout) as ctx:
             app._call_claude_cli("x", timeout=120)
-        self.assertEqual(ctx.exception.timeout, 120)
-        self.assertIn("120", str(ctx.exception))
+        self.assertEqual(ctx.exception.timeout,
+                         app.CLI_FAST_PATH_TIMEOUT + 120)
 
     def test_partial_output_of_the_first_attempt_survives(self):
         def behaviour(n, cmd, kw):

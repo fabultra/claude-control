@@ -820,6 +820,12 @@ def _cli_env():
 
 CLI_DIAG_PING_TIMEOUT = 60
 CLI_DIAG_PROBE_TIMEOUT = 45
+
+# v1.14.7 - budget accorde a l'appel optimise. Court par construction : sur
+# une machine ou il fonctionne, il repond en une dizaine de secondes ; s'il
+# depasse ca, il ne repondra pas, et l'attente ne doit pas etre payee sur le
+# budget de l'appel prouve.
+CLI_FAST_PATH_TIMEOUT = 30
 # Plancher de la bissection : un appel sain repond en une poignee de
 # secondes, mais un demarrage a froid merite une marge.
 _CLI_DIAG_PROBE_TIMEOUT_MIN = 20
@@ -912,12 +918,22 @@ def _cli_probe(optional, timeout=CLI_DIAG_PROBE_TIMEOUT):
     cli = _claude_cli_path()
     if not cli:
         return {"ok": False, "seconds": None, "error": "claude introuvable"}
+    # v1.14.7 - la sonde nue doit l'etre VRAIMENT. Elle gardait
+    # `--system-prompt`, une option ajoutee par le meme commit que
+    # `--safe-mode` et jamais validee sur le CLI concerne : si c'est elle qui
+    # bloque, la sonde "appel nu" calait aussi et le diagnostic concluait
+    # "authentification" a tort.
+    guidance = "Reply with exactly one word. No preamble."
+    bare = optional is not None and len(tuple(optional)) == 0
     cmd = _cli_cmd(cli, optional=optional,
-                   system_prompt="Reply with exactly one word. No preamble.")
+                   system_prompt=None if bare else guidance)
+    payload = "Reply with the single word: pong"
+    if bare:
+        payload = f"{guidance}\n\n---\n\n{payload}"
     started = time.monotonic()
     try:
         with tempfile.TemporaryDirectory(prefix="claude-control-probe-") as wd:
-            r = subprocess.run(cmd, input="Reply with the single word: pong",
+            r = subprocess.run(cmd, input=payload,
                                capture_output=True, text=True,
                                timeout=timeout, env=_cli_env(), cwd=wd)
     except subprocess.TimeoutExpired as e:
@@ -1141,7 +1157,18 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
         # v1.14.4 - flags isoles dans _cli_cmd : le diagnostic doit pouvoir
         # rejouer exactement cet appel en les retirant, sinon une option
         # devenue toxique reste indetectable.
-        cmd = _cli_cmd(cli_path, optional=optional, system_prompt=system_prompt)
+        #
+        # v1.14.7 - l'appel nu est NU. `--system-prompt` etait conservé par
+        # le repli alors qu'il a ete ajoute par le meme commit que
+        # `--safe-mode` et n'a jamais ete valide sur le CLI concerne : le
+        # repli pouvait donc heriter de l'option qui bloque. La consigne
+        # repasse dans le prompt, qui est le seul canal prouve.
+        bare = optional is not None and len(tuple(optional)) == 0
+        cmd = _cli_cmd(cli_path, optional=optional,
+                       system_prompt=None if bare else system_prompt)
+        payload = prompt
+        if bare and system_prompt:
+            payload = f"{system_prompt}\n\n---\n\n{prompt}"
         _log(f"_call_claude_cli: cli={cli_path} prompt_len={len(prompt)} "
              f"timeout={budget} options={'completes' if optional is None else 'nues'}")
         # v1.14.1 - cwd neutre. Sinon le CLI herite du cwd du serveur ('/'
@@ -1150,7 +1177,7 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
         started = time.monotonic()
         try:
             with tempfile.TemporaryDirectory(prefix="claude-control-cli-") as workdir:
-                res = subprocess.run(cmd, input=prompt, capture_output=True,
+                res = subprocess.run(cmd, input=payload, capture_output=True,
                                      text=True, timeout=budget, env=env,
                                      cwd=workdir)
         except subprocess.TimeoutExpired as e:
@@ -1168,8 +1195,15 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
         return res
 
     started_total = time.monotonic()
+    # v1.14.7 - budgets inverses. L'appel optimise n'est qu'une
+    # optimisation : il n'a droit qu'a un essai court. L'appel nu est la
+    # seule forme prouvee sur les machines concernees, et recoit tout le
+    # budget. Avant, l'inverse -- l'app misait 120 s sur la variante
+    # incertaine et n'en laissait que 60 a celle qui marche.
+    first_budget = timeout if not allow_fallback \
+        else min(CLI_FAST_PATH_TIMEOUT, timeout)
     try:
-        r = _attempt(None, timeout)
+        r = _attempt(None, first_budget)
     except ClaudeCliTimeout as first:
         # v1.14.6 - repli automatique sur l'appel nu.
         #
@@ -1189,13 +1223,13 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
         _log("_call_claude_cli: repli sur l'appel nu apres timeout")
         _CLI_FALLBACK["used"] = True
         try:
-            r = _attempt((), max(30, timeout // 2))
-        except ClaudeCliTimeout:
-            # Les deux essais ont cale : on remonte le PREMIER. Annoncer le
-            # budget du repli ferait etat de 60 s la ou l'utilisateur a
-            # attendu 180 s, et designerait l'appel nu alors que c'est
-            # l'appel complet qui a echoue d'abord.
-            raise first
+            r = _attempt((), timeout)
+        except ClaudeCliTimeout as second:
+            # Les deux essais ont cale : on annonce l'attente TOTALE.
+            # Remonter le budget d'un seul essai sous-declarerait ce que
+            # l'utilisateur a effectivement patiente.
+            raise ClaudeCliTimeout(first_budget + timeout,
+                                   first.partial or second.partial)
     elapsed = time.monotonic() - started_total
     stdout = (r.stdout or "").strip()
     stderr = (r.stderr or "").strip()
