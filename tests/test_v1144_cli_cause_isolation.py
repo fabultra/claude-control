@@ -98,11 +98,27 @@ class CommandBuildingTests(unittest.TestCase):
                 patch.object(app.subprocess, "run", fake_run):
             out = app._cli_probe(())
         self.assertTrue(out["ok"])
-        self.assertEqual(calls[0]["kw"]["input"],
-                         "Reply with the single word: pong")
+        self.assertIn("Reply with the single word: pong",
+                      calls[0]["kw"]["input"])
         self.assertIn("claude-control-probe", str(calls[0]["kw"]["cwd"]))
         for arg in calls[0]["cmd"]:
             self.assertNotIn("Reply with the single word", arg)
+
+    def test_bare_probe_carries_no_system_prompt_flag(self):
+        """Sinon la sonde "appel nu" heriterait d'une option jamais validee,
+        et un diagnostic la designerait a tort comme un probleme d'auth."""
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append({"cmd": cmd, "kw": kw})
+            return type("R", (), {"stdout": "pong", "stderr": "",
+                                  "returncode": 0})()
+
+        with patch.object(app, "_claude_cli_path", lambda: "/bin/claude"), \
+                patch.object(app.subprocess, "run", fake_run):
+            app._cli_probe(())
+        self.assertNotIn("--system-prompt", calls[0]["cmd"])
+        self.assertIn("one word", calls[0]["kw"]["input"])
 
 
 class LoginShellEnvTests(unittest.TestCase):

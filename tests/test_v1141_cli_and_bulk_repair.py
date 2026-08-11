@@ -105,9 +105,26 @@ class CallClaudeCliTests(unittest.TestCase):
         self.assertIsNotNone(cwd)
         self.assertIn("claude-control-cli", str(cwd))
 
-    def test_default_timeout_is_generous(self):
-        app._call_claude_cli("x")
-        self.assertGreaterEqual(self.calls[0]["kw"]["timeout"], 120)
+    def test_the_proven_call_gets_a_generous_timeout(self):
+        """v1.14.7 - le budget genereux va desormais a l'appel NU, seul
+        prouve sur les CLI concernes. L'appel optimise n'a qu'un essai
+        court : le depasser signifie qu'il ne repondra pas."""
+        calls = self.calls
+        orig = app.subprocess.run
+
+        def stall_then_answer(cmd, **kw):
+            calls.append({"cmd": cmd, "kw": kw})
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired("claude", kw["timeout"])
+            return _FakeCompleted(stdout="une description")
+
+        app.subprocess.run = stall_then_answer
+        try:
+            app._call_claude_cli("x")
+        finally:
+            app.subprocess.run = orig
+        self.assertEqual(calls[0]["kw"]["timeout"], app.CLI_FAST_PATH_TIMEOUT)
+        self.assertGreaterEqual(calls[1]["kw"]["timeout"], 120)
 
     def test_unknown_option_error_is_named(self):
         app.subprocess.run = lambda cmd, **kw: _FakeCompleted(
