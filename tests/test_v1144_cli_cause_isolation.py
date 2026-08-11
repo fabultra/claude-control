@@ -55,19 +55,30 @@ class CommandBuildingTests(unittest.TestCase):
     """Le refactor qui rend les flags retirables ne doit rien changer a
     l'appel de production."""
 
-    def test_production_flags_are_unchanged(self):
+    def test_production_flags(self):
         cmd = app._cli_cmd("/bin/claude")
-        for flag in ("-p", "--safe-mode", "--no-session-persistence",
+        for flag in ("-p", "--strict-mcp-config", "--no-session-persistence",
                      "--disable-slash-commands"):
             self.assertIn(flag, cmd)
         self.assertEqual(cmd[cmd.index("--output-format") + 1], "text")
+        self.assertNotIn("--safe-mode", cmd)
 
     def test_bare_call_drops_only_the_optional_flags(self):
         cmd = app._cli_cmd("/bin/claude", optional=())
         self.assertIn("-p", cmd)
         self.assertIn("--output-format", cmd)
-        for flag in app._CLI_OPTIONAL_FLAGS:
-            self.assertNotIn(flag, cmd)
+        for group in app._CLI_OPTIONAL_FLAGS:
+            for member in group:
+                self.assertNotIn(member, cmd)
+
+    def test_valued_options_keep_their_value(self):
+        """Les options sont groupees : une bissection qui separerait
+        --mcp-config de sa valeur produirait une commande invalide."""
+        for group in app._CLI_OPTIONAL_FLAGS:
+            cmd = app._cli_cmd("/bin/claude", optional=(group,))
+            if "--mcp-config" in cmd:
+                self.assertEqual(cmd[cmd.index("--mcp-config") + 1],
+                                 '{"mcpServers":{}}')
 
     def test_system_prompt_is_a_flag_not_a_prefix(self):
         cmd = app._cli_cmd("/bin/claude", system_prompt="SOIS BREF")
@@ -253,12 +264,14 @@ class ApiReachabilityTests(unittest.TestCase):
 
 
 class FlagBlameTests(unittest.TestCase):
-    def test_names_the_first_flag_that_stalls(self):
+    def test_names_the_first_group_that_stalls(self):
+        target = app._CLI_OPTIONAL_FLAGS[0]
+
         def probe(optional, **kw):
-            return {"ok": optional != ("--safe-mode",), "seconds": 1}
+            return {"ok": optional != (target,), "seconds": 1}
 
         with patch.object(app, "_cli_probe", probe):
-            self.assertEqual(app._blame_cli_flag(), "--safe-mode")
+            self.assertEqual(app._blame_cli_flag(), " ".join(target))
 
     def test_returns_none_when_each_flag_is_fine_alone(self):
         with patch.object(app, "_cli_probe",
