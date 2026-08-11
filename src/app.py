@@ -12,6 +12,7 @@ HOME = Path.home()
 CONFIG_PATH = HOME / "Library/Application Support/Claude/claude_desktop_config.json"
 EXTENSIONS_INSTALL_FILE = HOME / "Library/Application Support/Claude/extensions-installations.json"
 EXTENSIONS_SETTINGS_DIR = HOME / "Library/Application Support/Claude/Claude Extensions Settings"
+CLI_CONFIG_PATH = HOME / ".claude.json"   # v1.14.0 - MCPs de Claude Code CLI
 SKILLS_DIR = HOME / ".claude/skills"
 SKILLS_DISABLED_DIR = HOME / ".claude/skills-disabled"
 COMMANDS_DIR = HOME / ".claude/commands"
@@ -32,10 +33,22 @@ VERSION_FILE = HOME / "dev/claude-control/version.txt"
 GITHUB_REPO_FILE = HOME / "dev/claude-control/.github-repo"
 LOG_FILE = HOME / "Library/Logs/claude-control.log"
 
+# v1.14.0 - chemin exact du binaire Claude Desktop. Sert d'ancre aux pkill :
+# un motif non ancre ("Claude") matche la ligne de commande complete de TOUS
+# les process de l'utilisateur (sessions Claude Code CLI, `tail` sur un log
+# dans ~/Library/Logs/Claude/, etc.) et pas seulement l'app.
+CLAUDE_DESKTOP_BIN = "/Applications/Claude.app/Contents/MacOS/Claude"
+
 # v1.6.6 : tracking en memoire des derniers restarts MCP/extension pour
 # afficher "Dernier restart : il y a X min" dans la carte Action rapide.
 # Reset au redemarrage du serveur Claude Control.
 _LAST_RESTARTS = {}
+
+# v1.14.0 - le serveur est multi-thread (cf. main()). Toute sequence
+# lire-modifier-ecrire sur un fichier de config doit tenir ce verrou, sinon
+# deux requetes concurrentes (deux toggles rapides, ou un toggle pendant un
+# apply_preset) se marchent dessus et la derniere ecriture ecrase l'autre.
+_CONFIG_LOCK = threading.RLock()
 
 
 def _log(msg):
@@ -47,14 +60,62 @@ def _log(msg):
         pass
 
 
+def _atomic_write_text(path, text):
+    """v1.14.0 - Ecriture atomique : fichier temporaire dans le meme
+    repertoire puis os.replace() (atomique sur POSIX).
+
+    Avant, tous les save_* ouvraient la cible en "w", ce qui la tronque
+    immediatement. Si le dump echouait a mi-parcours, ou si le process etait
+    tue entre-temps (restart_self, pkill), claude_desktop_config.json
+    restait tronque et Claude Desktop ne chargeait plus aucun MCP.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def _atomic_write_json(path, data, indent=2):
+    _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=indent))
+
+
+def _osa_quote(s, limit):
+    """v1.14.0 - Echappe une chaine destinee a une chaine litterale
+    AppleScript.
+
+    L'ordre compte : les antislashs D'ABORD, les guillemets ensuite. L'ordre
+    inverse (bug v1.6.6) transformait `"` en `\\"` puis son antislash en
+    `\\\\`, soit `\\\\"` -> un antislash echappe SUIVI d'un guillemet nu, qui
+    ferme la chaine. Comme AppleScript expose `do shell script`, une chaine
+    controlee par un tiers (nom de MCP issu d'un import) devenait une
+    execution de commande.
+
+    La troncature se fait AVANT l'echappement, sinon elle peut couper au
+    milieu d'une sequence et laisser un antislash orphelin en fin de chaine.
+    """
+    s = (s or "")[:limit]
+    s = re.sub(r"[\r\n\t]", " ", s)
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _notify(title, message):
     """Affiche une notification macOS native via osascript. Best-effort,
     silencieux si echec. v1.6.6 : utilise pour signaler la fin d'un restart
     MCP/extension meme quand l'UI Claude Control n'est pas au premier plan."""
     try:
-        safe_title = (title or "").replace('"', '\\"').replace('\\', '\\\\')[:120]
-        safe_msg = (message or "").replace('"', '\\"').replace('\\', '\\\\')[:300]
-        script = f'display notification "{safe_msg}" with title "{safe_title}"'
+        script = (f'display notification "{_osa_quote(message, 300)}" '
+                  f'with title "{_osa_quote(title, 120)}"')
         subprocess.run(["osascript", "-e", script], capture_output=True, timeout=3)
     except Exception:
         pass
@@ -63,38 +124,220 @@ def _notify(title, message):
 def load_config():
     if not CONFIG_PATH.exists():
         return {"mcpServers": {}, "_disabledMcps": {}}
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8-sig") as f:
         return json.load(f)
 
 
-def save_config(config):
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    if CONFIG_PATH.exists():
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup = BACKUP_DIR / f"config.{ts}.json"
-        with open(CONFIG_PATH) as src, open(backup, "w") as dst:
-            dst.write(src.read())
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f, indent=2)
+def load_config_safe():
+    """v1.14.0 - Variante non levante de load_config, pour les chemins de
+    lecture (get_state / get_overview). Retourne (config, error_str|None).
 
-
-def get_running_mcps():
+    Avant, un claude_desktop_config.json malforme (virgule en trop apres une
+    edition manuelle) faisait lever json.load -> 500 sur /api/state -> le JS
+    ne catchait rien -> la liste MCP gardait son dernier rendu SANS message.
+    Symptome vecu : "mes MCPs ont disparu", sans explication.
+    """
     try:
-        r = subprocess.run(["ps", "auxww"], capture_output=True, text=True, timeout=5)
-    except Exception:
-        return set()
-    keywords = {"mongodb-mcp": "klide-mongodb", "mailchimp-mcp": "mailchimp",
-                "sekoia-geo": "sekoia-geo", "compass-mcp": "compass",
-                "thedotmack/plugin": "claude-mem-search", "mcp-pdf": "pdf"}
-    running = set()
-    for line in r.stdout.splitlines():
+        return load_config(), None
+    except Exception as e:
+        _log(f"load_config failed: {type(e).__name__}: {e}")
+        return {"mcpServers": {}, "_disabledMcps": {}}, f"{CONFIG_PATH.name} illisible : {e}"
+
+
+def save_config(config):
+    with _CONFIG_LOCK:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        if CONFIG_PATH.exists():
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = BACKUP_DIR / f"config.{ts}.json"
+            try:
+                shutil.copy2(CONFIG_PATH, backup)
+            except Exception:
+                pass
+        _atomic_write_json(CONFIG_PATH, config)
+
+
+# === DETECTION DES PROCESS MCP ===
+
+# v1.14.0 - snapshot `ps auxww` mutualise. Avant, chaque /api/state relancait
+# un `ps` plus, par extension, jusqu'a 3 `pgrep` + 3 `lsof` + un `ps -p` par
+# PID -- soit ~50 fork/exec par appel, toutes les 5 s, et autant via
+# /api/overview. Un seul snapshot par fenetre de _PS_TTL secondes suffit.
+_PS_CACHE = {"ts": 0.0, "lines": []}
+_PS_LOCK = threading.Lock()
+_PS_COMPUTE_LOCK = threading.Lock()
+_PS_TTL = 8
+
+
+def _ps_snapshot(force=False):
+    """Lignes de `ps auxww`, mises en cache _PS_TTL secondes.
+
+    Single-flight : si plusieurs threads arrivent en meme temps sur un cache
+    froid, un seul lance `ps`, les autres attendent et lisent le resultat.
+    """
+    now = time.time()
+    if not force:
+        with _PS_LOCK:
+            if _PS_CACHE["lines"] and now - _PS_CACHE["ts"] < _PS_TTL:
+                return _PS_CACHE["lines"]
+    with _PS_COMPUTE_LOCK:
+        if not force:
+            with _PS_LOCK:
+                if _PS_CACHE["lines"] and time.time() - _PS_CACHE["ts"] < _PS_TTL:
+                    return _PS_CACHE["lines"]
+        try:
+            r = subprocess.run(["ps", "auxww"], capture_output=True, text=True, timeout=5)
+            lines = r.stdout.splitlines()
+        except Exception:
+            lines = []
+        with _PS_LOCK:
+            _PS_CACHE["ts"] = time.time()
+            _PS_CACHE["lines"] = lines
+        return lines
+
+
+# Tokens trop generiques pour identifier un MCP : ils matchent n'importe quel
+# process node/python de la machine et produiraient des faux "running".
+# 'mcp-server' & co sont dedans parce qu'ils sont le basename de tres
+# nombreux paquets (@linear/mcp-server, @mailchimp/mcp-server...) : les
+# garder ferait passer un MCP pour actif des qu'un AUTRE MCP tourne.
+_GENERIC_PROCESS_TOKENS = {
+    "npx", "node", "nodejs", "python", "python3", "uvx", "uv", "bun", "deno",
+    "java", "ruby", "tsx", "ts-node", "run", "start", "serve", "server",
+    "index.js", "server.js", "main.js", "cli.js", "main.py", "server.py",
+    "__main__.py", "dist", "build", "src", "bin", "lib", "app.py",
+    "mcp", "mcp-server", "mcp_server", "mcpserver", "mcp-servers",
+    "server.ts", "index.ts", "stdio", "latest",
+}
+
+# Binaires dont la ligne de commande MENTIONNE du texte sans l'executer comme
+# un serveur MCP. Sans ce filtre, un `grep sekoia-geo`, un editeur ouvert sur
+# la config, ou un `bash -c` portant un script entier en argv suffisent a
+# faire passer un MCP pour "running".
+_NON_MCP_PROCESS_BINARIES = {
+    "bash", "sh", "zsh", "dash", "fish", "csh", "tcsh", "ksh", "login",
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "tail", "head",
+    "cat", "less", "more", "tee", "xargs", "find", "fd", "watch", "tr",
+    "vim", "nvim", "vi", "emacs", "nano", "code", "ps", "pgrep", "pkill",
+    "lsof", "open", "osascript", "man", "git", "ssh", "sudo", "env", "which",
+}
+
+
+def _mcp_match_tokens(name, entry):
+    """v1.14.0 - Tokens distinctifs permettant de reconnaitre le process d'un
+    MCP dans la sortie de `ps`.
+
+    Remplace la table de mots-cles codee en dur de get_running_mcps (6
+    entrees, valables uniquement sur une machine precise) : tout MCP absent
+    de cette table avait running=False en permanence et atterrissait dans la
+    colonne "Inactifs" meme quand il tournait parfaitement.
+
+    On derive les tokens de la command/args reelles du MCP, en ecartant les
+    launchers generiques (npx, node, index.js...) qui matcheraient tout.
+    """
+    tokens = set()
+    n = str(name or "").strip()
+    if len(n) >= 4 and n.lower() not in _GENERIC_PROCESS_TOKENS:
+        tokens.add(n)
+    if isinstance(entry, dict):
+        parts = [str(entry.get("command") or "")]
+        for a in (entry.get("args") or []):
+            if isinstance(a, (str, int, float)):
+                parts.append(str(a))
+        for raw in parts:
+            p = raw.strip()
+            if not p or p.startswith("-"):
+                continue
+            if "/" in p:
+                tokens.add(p)
+                base = Path(p).name
+                if len(base) >= 5 and base.lower() not in _GENERIC_PROCESS_TOKENS:
+                    tokens.add(base)
+            elif len(p) >= 5 and p.lower() not in _GENERIC_PROCESS_TOKENS:
+                tokens.add(p)
+    return {t for t in tokens if len(t) >= 4}
+
+
+def _invalidate_process_caches():
+    """v1.14.0 - A appeler apres toute action qui change l'etat des process
+    (start/stop/restart MCP ou extension). Sans ca, l'UI garderait jusqu'a
+    _EXT_RUNNING_TTL secondes un statut perime juste apres l'action de
+    l'utilisateur -- le pire moment pour mentir."""
+    with _PS_LOCK:
+        _PS_CACHE["ts"] = 0.0
+        _PS_CACHE["lines"] = []
+    with _EXT_RUNNING_LOCK:
+        _EXT_RUNNING_CACHE["ts"] = 0.0
+        _EXT_RUNNING_CACHE["data"] = {}
+
+
+def _ps_candidate_lines():
+    """Lignes de `ps auxww` susceptibles d'etre un serveur MCP, en minuscules.
+
+    On ecarte notre propre process, le disclaimer Claude, et les binaires de
+    _NON_MCP_PROCESS_BINARIES (shells, grep, editeurs...) qui ne font que
+    porter du texte dans leur argv.
+
+    Format `ps auxww` : USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME
+    COMMAND -> 10 colonnes avant la commande, identique sur macOS et Linux.
+    """
+    lines = _ps_snapshot()
+    if not lines:
+        return []
+    my_pid = str(os.getpid())
+    out = []
+    for line in lines:
         if "Helpers/disclaimer" in line:
             continue
-        for kw, label in keywords.items():
-            if kw in line:
-                running.add(label)
+        cols = line.split(None, 10)
+        if len(cols) < 11:
+            continue
+        if cols[1] == my_pid:
+            continue
+        cmd = cols[10].strip()
+        if not cmd:
+            continue
+        first = cmd.split(None, 1)[0]
+        if Path(first).name.lower() in _NON_MCP_PROCESS_BINARIES:
+            continue
+        if "claude-control/app.py" in cmd:
+            continue
+        out.append(cmd.lower())
+    return out
+
+
+def _running_from_mapping(mapping, lines=None):
+    """Sous-ensemble des cles de `mapping` ({nom: definition}) dont un process
+    correspondant est visible dans `ps`."""
+    if not isinstance(mapping, dict) or not mapping:
+        return set()
+    if lines is None:
+        lines = _ps_candidate_lines()
+    if not lines:
+        return set()
+    running = set()
+    for name, entry in mapping.items():
+        toks = [t.lower() for t in _mcp_match_tokens(name, entry)]
+        if not toks:
+            continue
+        for cmd in lines:
+            if any(t in cmd for t in toks):
+                running.add(name)
+                break
     return running
+
+
+def get_running_mcps(config=None):
+    """v1.14.0 - Retourne l'ensemble des noms de MCP (cles de config) dont un
+    process correspondant est visible dans `ps auxww`.
+
+    Avant : table de 6 mots-cles codes en dur -> tout autre MCP etait
+    signale "pas demarre" a vie. Maintenant : matching sur les tokens
+    derives de la config de chaque MCP.
+    """
+    if config is None:
+        config, _err = load_config_safe()
+    return _running_from_mapping(config.get("mcpServers") or {})
 
 
 _AUTO_CAT_RULES = [
@@ -250,7 +493,9 @@ def repair_skill(name, description=None, name_override=None):
     }
     new_content = _update_skill_frontmatter(original_content, updates)
     try:
-        md.write_text(new_content)
+        # v1.14.0 - ecriture atomique : un write_text interrompu laissait le
+        # SKILL.md de l'utilisateur tronque.
+        _atomic_write_text(md, new_content)
     except Exception as e:
         return False, f"Erreur ecriture : {e}"
     return True, f"Skill '{name}' repare (description = {len(updates['description'])} chars, backup : {backup.name})"
@@ -670,11 +915,154 @@ def _skill_quality(description):
     return "excellent"
 
 
+# v1.14.0 - etat "running" des Desktop Extensions, mis en cache.
+#
+# Avant, get_state() appelait _extension_pids() pour CHAQUE extension a chaque
+# requete. _extension_pids essaie jusqu'a 3 empreintes via pgrep (timeout 3 s
+# chacune) puis 3 fallbacks lsof + un `ps -p` par PID. Or le code documente
+# lui-meme (cf. dc_status) que sur Claude Desktop moderne les extensions
+# tournent dans des Helper Node anonymes que pgrep ne matche jamais : le pire
+# cas etait donc le cas nominal, soit ~6 fork/exec par extension, 12 fois par
+# minute via /api/state et autant via /api/overview.
+_EXT_RUNNING_CACHE = {"ts": 0.0, "data": {}}
+_EXT_RUNNING_LOCK = threading.Lock()
+_EXT_RUNNING_COMPUTE_LOCK = threading.Lock()
+_EXT_RUNNING_TTL = 15
+
+
+def _compute_extension_running_map(extensions):
+    out = {}
+    for e in extensions:
+        running = False
+        try:
+            running = bool(_extension_pids(e["name"]))
+        except Exception:
+            running = False
+        if not running:
+            # Critere UI permissif (cf. v1.8.3) : log present et pas de
+            # shutdown gracieux = extension chargee, en standby legitime.
+            try:
+                log = _find_mcp_log(e["name"])
+                if log and log.exists() and not _log_shows_graceful_shutdown(log):
+                    running = True
+            except Exception:
+                pass
+        out[e["id"]] = running
+    return out
+
+
+def _extension_running_map(extensions, force=False):
+    """Map {extension_id: running}, mise en cache _EXT_RUNNING_TTL secondes.
+
+    Single-flight, comme _ps_snapshot : sur cache froid un seul thread paie
+    le cout des pgrep/lsof, les autres attendent et lisent le resultat.
+    """
+    if not extensions:
+        return {}
+    if not force:
+        with _EXT_RUNNING_LOCK:
+            if _EXT_RUNNING_CACHE["data"] and time.time() - _EXT_RUNNING_CACHE["ts"] < _EXT_RUNNING_TTL:
+                return dict(_EXT_RUNNING_CACHE["data"])
+    with _EXT_RUNNING_COMPUTE_LOCK:
+        if not force:
+            with _EXT_RUNNING_LOCK:
+                if _EXT_RUNNING_CACHE["data"] and time.time() - _EXT_RUNNING_CACHE["ts"] < _EXT_RUNNING_TTL:
+                    return dict(_EXT_RUNNING_CACHE["data"])
+        data = _compute_extension_running_map(extensions)
+        with _EXT_RUNNING_LOCK:
+            _EXT_RUNNING_CACHE["ts"] = time.time()
+            _EXT_RUNNING_CACHE["data"] = dict(data)
+        return data
+
+
+def _list_cli_mcps():
+    """v1.14.0 - MCPs declares pour Claude Code CLI dans ~/.claude.json.
+
+    Couvre le scope utilisateur (`claude mcp add`) et le scope projet
+    (cle `projects.<chemin>.mcpServers`). Ces MCPs n'apparaissaient nulle
+    part dans l'app : seul claude_desktop_config.json etait lu, alors que
+    l'onglet Plugins parlait deja de Claude Code. Lecture seule : la source
+    de verite est ~/.claude.json, pas la config Desktop.
+    """
+    if not CLI_CONFIG_PATH.exists():
+        return []
+    try:
+        data = json.loads(CLI_CONFIG_PATH.read_text(encoding="utf-8-sig", errors="replace"))
+    except Exception as e:
+        _log(f"_list_cli_mcps: {CLI_CONFIG_PATH} illisible : {e}")
+        return []
+    if not isinstance(data, dict):
+        return []
+    found = {}   # nom -> (definition, scope)
+    user_servers = data.get("mcpServers")
+    if isinstance(user_servers, dict):
+        for n, v in user_servers.items():
+            if isinstance(v, dict):
+                found[n] = (v, "cli")
+    projects = data.get("projects")
+    if isinstance(projects, dict):
+        for proj_path, proj in projects.items():
+            if not isinstance(proj, dict):
+                continue
+            servers = proj.get("mcpServers")
+            if not isinstance(servers, dict):
+                continue
+            for n, v in servers.items():
+                if isinstance(v, dict) and n not in found:
+                    found[n] = (v, f"cli:{Path(str(proj_path)).name or proj_path}")
+    if not found:
+        return []
+    running = _running_from_mapping({n: d for n, (d, _s) in found.items()})
+    return [
+        {"name": n, "active": True, "running": n in running,
+         "type": "cli", "source": scope, "editable": False}
+        for n, (_d, scope) in sorted(found.items())
+    ]
+
+
+def _list_plugin_mcps():
+    """v1.14.0 - MCPs fournis par les plugins Claude Code (<plugin>/.mcp.json).
+
+    Ils etaient lus depuis v1.11.0 mais n'apparaissaient que dans l'onglet
+    Plugins. Lecture seule ici : pour que Claude Desktop les charge il faut
+    passer par le bouton "bridge" existant.
+    """
+    try:
+        installed = _load_installed_plugins()
+    except Exception:
+        return []
+    if not installed:
+        return []
+    settings = _load_settings()
+    enabled_map = settings.get("enabledPlugins", {}) if isinstance(settings, dict) else {}
+    found = {}
+    for full_name, entries in installed.items():
+        if not enabled_map.get(full_name, True):
+            continue
+        if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
+            continue
+        try:
+            servers = _read_plugin_mcp_servers(entries[0].get("installPath", ""))
+        except Exception:
+            continue
+        for n, v in servers.items():
+            if n not in found:
+                found[n] = (v, f"plugin:{full_name}")
+    if not found:
+        return []
+    running = _running_from_mapping({n: d for n, (d, _s) in found.items()})
+    return [
+        {"name": n, "active": True, "running": n in running,
+         "type": "plugin", "source": scope, "editable": False}
+        for n, (_d, scope) in sorted(found.items())
+    ]
+
+
 def get_state():
-    config = load_config()
+    config, config_error = load_config_safe()
     active = config.get("mcpServers", {})
     disabled = config.get("_disabledMcps", {})
-    running = get_running_mcps()
+    running = get_running_mcps(config)
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
     active_skills = sorted([d.name for d in SKILLS_DIR.iterdir()
@@ -746,10 +1134,26 @@ def get_state():
             "usage_count": int(usage_counts.get(it["name"], 0)),
         })
     mcps_list = (
-        [{"name": n, "active": True, "running": n in running, "type": "classic"} for n in sorted(active.keys())]
-        + [{"name": n, "active": False, "running": False, "type": "classic"} for n in sorted(disabled.keys())]
+        [{"name": n, "active": True, "running": n in running, "type": "classic",
+          "source": "desktop", "editable": True} for n in sorted(active.keys())]
+        + [{"name": n, "active": False, "running": False, "type": "classic",
+            "source": "desktop", "editable": True} for n in sorted(disabled.keys())]
     )
+    # v1.14.0 - MCPs qui n'apparaissaient nulle part dans l'onglet MCP :
+    #   - ~/.claude.json          -> ceux ajoutes via `claude mcp add` (user + projet)
+    #   - <plugin>/.mcp.json      -> lus depuis toujours, mais affiches uniquement
+    #                                dans l'onglet Plugins
+    # Ils sont en lecture seule ici : leur source de verite n'est pas
+    # claude_desktop_config.json, donc ni toggle ni suppression.
+    desktop_names = {m["name"] for m in mcps_list}
+    for extra in _list_cli_mcps() + _list_plugin_mcps():
+        if extra["name"] in desktop_names:
+            # deja gere cote Claude Desktop (cas d'un MCP "bridge")
+            continue
+        desktop_names.add(extra["name"])
+        mcps_list.append(extra)
     extensions = _list_extensions()
+    ext_running = _extension_running_map(extensions)
     for e in extensions:
         # v1.8.3 - critere "running" pour AFFICHAGE UI : permissif sans
         # seuil mtime court. Bug D 2026-05-06 : 8 extensions MCPB en
@@ -759,32 +1163,28 @@ def get_state():
         # peu sollicites). Ce seuil a un sens pour le watchdog (detecter
         # un freeze sur cible monitoree) mais pas pour l'UI (statut
         # "chargee et prete a etre appelee").
-        # Critere UI permissif :
-        #   1. PIDs trouves via fingerprint -> running (rare pour les
-        #      Helper Nodes anonymes, mais valide quand applicable)
-        #   2. Sinon, log file existe ET pas de shutdown gracieux dans
-        #      la queue -> running (extension chargee, en standby)
-        #   3. Sinon -> not running
-        running_ext = bool(_extension_pids(e["name"]))
-        if not running_ext:
-            try:
-                log = _find_mcp_log(e["name"])
-                if log and log.exists() and not _log_shows_graceful_shutdown(log):
-                    running_ext = True
-            except Exception:
-                pass
+        # v1.14.0 - le calcul lui-meme (et son cache) vit dans
+        # _extension_running_map / _compute_extension_running_map.
         mcps_list.append({
             "name": e["name"],
             "active": e["enabled"],
-            "running": running_ext,
+            "running": bool(ext_running.get(e["id"], False)),
             "type": "extension",
+            "source": "extension",
+            "editable": True,
             "extension_id": e["id"],
             "version": e["version"],
         })
-    return {
+    out = {
         "mcps": mcps_list,
         "skills": skills,
     }
+    # v1.14.0 - remonte l'erreur de config au lieu de la laisser lever : le JS
+    # affiche desormais un bandeau au lieu de garder silencieusement la
+    # derniere liste rendue.
+    if config_error:
+        out["config_error"] = config_error
+    return out
 
 
 def toggle_mcp(name):
@@ -902,6 +1302,9 @@ def delete_user_skill_duplicates():
 
 def restart_mcp(name):
     """Redémarre un MCP ou Desktop Extension sans toucher à Claude Desktop."""
+    # v1.14.0 - l'action change l'etat des process : on vide les caches
+    # pour que le prochain /api/state dise la verite immediatement.
+    _invalidate_process_caches()
     if not name:
         return False, "Nom MCP requis"
     config = load_config()
@@ -950,6 +1353,9 @@ def start_mcp(name):
     FSEvents. Pas de kill (rien a tuer). Pour les extensions : toggle
     settings off->on de la meme maniere.
     """
+    # v1.14.0 - l'action change l'etat des process : on vide les caches
+    # pour que le prochain /api/state dise la verite immediatement.
+    _invalidate_process_caches()
     if not name:
         return False, "Nom MCP requis"
     config = load_config()
@@ -1000,6 +1406,9 @@ def stop_mcp(name):
     anonymes - kill PID peut ne rien faire (no PIDs trouves). Dans ce cas
     on retourne un message honnete plutot qu'un faux succes.
     """
+    # v1.14.0 - l'action change l'etat des process : on vide les caches
+    # pour que le prochain /api/state dise la verite immediatement.
+    _invalidate_process_caches()
     if not name:
         return False, "Nom MCP requis"
     config = load_config()
@@ -1103,7 +1512,7 @@ def delete_extension(name):
                     del data[ext_id]
                     changed = True
             if changed:
-                EXTENSIONS_INSTALL_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+                _atomic_write_json(EXTENSIONS_INSTALL_FILE, data)
         except Exception as e:
             return False, f"Suppression registry echouee : {e}"
     return True, (f"Extension '{name}' supprimee (backup zip de l'install dir + json registry). "
@@ -1150,8 +1559,7 @@ def delete_plugin(full_name, delete_files=False):
     shutil.copy2(INSTALLED_PLUGINS_FILE, BACKUP_DIR / f"installed_plugins.json.{ts}")
     del plugins_dict[full_name]
     data["plugins"] = plugins_dict
-    with open(INSTALLED_PLUGINS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(INSTALLED_PLUGINS_FILE, data)
     settings = _load_settings()
     if isinstance(settings.get("enabledPlugins"), dict) and full_name in settings["enabledPlugins"]:
         del settings["enabledPlugins"][full_name]
@@ -1255,8 +1663,7 @@ def add_plugin_from_git(url):
         "gitCommitSha": "",
     }]
     INSTALLED_PLUGINS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(INSTALLED_PLUGINS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(INSTALLED_PLUGINS_FILE, data)
     settings = _load_settings()
     settings.setdefault("enabledPlugins", {})[full_name] = True
     _save_settings(settings)
@@ -1307,7 +1714,19 @@ def list_commands():
     return commands
 
 
+def _safe_component(name):
+    """v1.14.0 - True si `name` peut servir de composant de chemin sans
+    s'echapper du repertoire parent. Les noms viennent de requetes HTTP."""
+    n = str(name or "")
+    return bool(n) and "/" not in n and "\\" not in n and ".." not in n and not n.startswith(".")
+
+
 def get_command(name, source):
+    # v1.14.0 - `name` venait de la query string et etait interpole dans un
+    # chemin sans validation : '../../..' permettait de lire n'importe quel
+    # fichier .md de la machine via /api/command/.
+    if not _safe_component(name):
+        return False, "Nom de command invalide"
     if source == "user":
         for base in (COMMANDS_DIR, COMMANDS_DISABLED_DIR):
             p = base / f"{name}.md"
@@ -1420,9 +1839,7 @@ def save_watchdog_config(updates):
     cfg["dc_inactivity_threshold_seconds"] = max(60, int(cfg.get("dc_inactivity_threshold_seconds", 120) or 120))
     cfg["dc_verify_after_toggle_seconds"] = max(10, int(cfg.get("dc_verify_after_toggle_seconds", 30) or 30))
     cfg["dc_cooldown_after_dismiss_seconds"] = max(120, int(cfg.get("dc_cooldown_after_dismiss_seconds", 300) or 300))
-    WATCHDOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(WATCHDOG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    _atomic_write_json(WATCHDOG_FILE, cfg)
     return True, cfg
 
 
@@ -1557,11 +1974,13 @@ def _mcp_log_says_frozen(name, within_seconds):
     log = _find_mcp_log(name)
     if not log or not log.exists():
         return False
-    try:
-        text = log.read_text(errors="replace")
-    except Exception:
+    # v1.14.0 - _read_log_tail (seek borne) au lieu de read_text(). Avant, on
+    # chargeait le fichier ENTIER en memoire pour n'en lire que les 4000
+    # derniers caracteres -- sur un mcp-server-*.log de plusieurs centaines de
+    # Mo, dans la boucle watchdog.
+    tail = "\n".join(_read_log_tail(log, max_lines=80, max_bytes=8_000)).lower()
+    if not tail:
         return False
-    tail = text[-4000:].lower()
     return any(k in tail for k in (
         "transport closed unexpectedly",
         "process exiting early",
@@ -1686,9 +2105,7 @@ def _save_extension_settings(ext_id, settings):
     if canonical is not None:
         out["isEnabled"] = canonical
         out["enabled"] = canonical
-    f.parent.mkdir(parents=True, exist_ok=True)
-    with open(f, "w") as out_f:
-        json.dump(out, out_f, indent=2)
+    _atomic_write_json(f, out)
 
 
 def _list_extensions():
@@ -1932,6 +2349,9 @@ def resolve_mcp_conflict(classic_name, action="remove_classic"):
 
 def toggle_extension(name, enabled=None):
     """Toggle une extension via son fichier de settings (avec backup)."""
+    # v1.14.0 - l'action change l'etat des process : on vide les caches
+    # pour que le prochain /api/state dise la verite immediatement.
+    _invalidate_process_caches()
     if not name:
         return False, "Nom requis"
     extensions = _list_extensions()
@@ -2156,6 +2576,9 @@ def diagnose_extensions():
 def restart_extension(name):
     """Bounce une extension : kill le process via fingerprints, puis toggle off/on
     son setting (Claude Desktop respawn)."""
+    # v1.14.0 - l'action change l'etat des process : on vide les caches
+    # pour que le prochain /api/state dise la verite immediatement.
+    _invalidate_process_caches()
     extensions = _list_extensions()
     target = next((e for e in extensions if e["name"] == name or e["id"] == name), None)
     if not target:
@@ -2250,8 +2673,11 @@ def restart_claude_desktop():
     ferme toutes les conversations en cours - a utiliser quand le toggle
     settings best-effort n'a pas suffi.
     """
+    # v1.14.0 - l'action change l'etat des process : on vide les caches
+    # pour que le prochain /api/state dise la verite immediatement.
+    _invalidate_process_caches()
     try:
-        subprocess.run(["pkill", "-9", "-f", "/Applications/Claude.app/Contents/MacOS/Claude"],
+        subprocess.run(["pkill", "-9", "-f", CLAUDE_DESKTOP_BIN],
                        capture_output=True, timeout=5)
         time.sleep(2)
         subprocess.run(["open", "-a", "Claude"], capture_output=True, timeout=5)
@@ -2928,7 +3354,12 @@ def _watchdog_loop():
                     elif cfg["freeze_detection"]:
                         if not _claude_responsive(timeout=cfg["freeze_timeout"]):
                             _watchdog_event("restart", f"Claude Desktop unresponsive >{cfg['freeze_timeout']}s, restarting")
-                            subprocess.run(["pkill", "-9", "-f", "Claude"], check=False)
+                            # v1.14.0 - motif ancre sur le binaire (cf.
+                            # CLAUDE_DESKTOP_BIN). Avant : `pkill -9 -f Claude`,
+                            # execute AUTOMATIQUEMENT toutes les 30 s des qu'un
+                            # osascript lent faisait croire a un freeze -- ce qui
+                            # tuait aussi les sessions Claude Code CLI.
+                            subprocess.run(["pkill", "-9", "-f", CLAUDE_DESKTOP_BIN], check=False)
                             time.sleep(2)
                             subprocess.run(["open", "-a", "Claude"], check=False)
                 elif target == "custom":
@@ -2983,7 +3414,64 @@ def start_watchdog():
 
 
 
-def get_skill_usage(days=30):
+# === USAGE DES SKILLS ===
+
+# v1.14.0 - _compute_skill_usage parcourt TOUT ~/.claude/projects/**/*.jsonl
+# et fait un json.loads par ligne. Sur une machine qui utilise Claude Code
+# quotidiennement ce repertoire pese plusieurs Go.
+#
+# Avant, il n'y avait aucun cache et trois appelants sur le chemin chaud :
+#   - get_state()     -> /api/state,    poll toutes les 5 s
+#   - get_overview()  -> /api/overview, poll toutes les 10 s, et il appelait
+#                        get_skill_usage DEUX fois (via get_state puis
+#                        directement)
+# soit 24 scans complets par minute. Des que le scan depassait 5 s, chaque
+# tick relancait le scan entier avant la fin du precedent : les threads
+# s'empilaient, le GIL saturait, l'app cessait de repondre -- et le seuil
+# etait franchi progressivement a mesure que l'historique grossissait.
+#
+# Correctif : cache TTL + single-flight (un seul scan a la fois, les autres
+# threads attendent et lisent le resultat) + budget temps sur le scan lui-meme
+# pour qu'un cache froid reste borne.
+_SKILL_USAGE_CACHE = {"ts": 0.0, "days": None, "data": None}
+_SKILL_USAGE_LOCK = threading.Lock()
+_SKILL_USAGE_COMPUTE_LOCK = threading.Lock()
+_SKILL_USAGE_TTL = 300          # 5 min : c'est une statistique, pas un etat temps reel
+_SKILL_USAGE_MAX_SECONDS = 20   # budget d'un scan a froid
+
+
+def _skill_usage_cached(days):
+    with _SKILL_USAGE_LOCK:
+        c = _SKILL_USAGE_CACHE
+        if (c["data"] is not None and c["days"] == days
+                and time.time() - c["ts"] < _SKILL_USAGE_TTL):
+            return c["data"]
+    return None
+
+
+def get_skill_usage(days=30, force=False):
+    """Usage des skills, avec cache TTL et single-flight (cf. bloc ci-dessus).
+
+    La signature reste `get_skill_usage(days=30)` : elle est monkeypatchee
+    telle quelle par les tests.
+    """
+    if not force:
+        cached = _skill_usage_cached(days)
+        if cached is not None:
+            return cached
+    with _SKILL_USAGE_COMPUTE_LOCK:
+        if not force:
+            # un autre thread a pu calculer pendant qu'on attendait le verrou
+            cached = _skill_usage_cached(days)
+            if cached is not None:
+                return cached
+        data = _compute_skill_usage(days=days)
+        with _SKILL_USAGE_LOCK:
+            _SKILL_USAGE_CACHE.update({"ts": time.time(), "days": days, "data": data})
+        return data
+
+
+def _compute_skill_usage(days=30):
     """Parcourt ~/.claude/projects/*/*.jsonl et compte les invocations du tool
     `Skill`. Tolerant aux changements de schema : ignore silencieusement chaque
     ligne malformee. Retourne un classement et de la metadata pour le fallback.
@@ -3011,7 +3499,21 @@ def get_skill_usage(days=30):
                 "parse_errors": 0, "sessions": 0, "ok": False,
                 "reason": "projects_dir_missing",
                 "projects_path": str(PROJECTS_LOGS_DIR)}
-    for jsonl in PROJECTS_LOGS_DIR.rglob("*.jsonl"):
+    # v1.14.0 - budget temps : meme a froid, le scan ne monopolise pas un
+    # thread indefiniment. On scanne les fichiers les plus recents d'abord
+    # pour que la troncature eventuelle sacrifie les donnees les moins utiles,
+    # et on signale la troncature dans le payload plutot que de mentir.
+    deadline = time.monotonic() + _SKILL_USAGE_MAX_SECONDS
+    truncated = False
+    try:
+        all_files = sorted(PROJECTS_LOGS_DIR.rglob("*.jsonl"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        all_files = list(PROJECTS_LOGS_DIR.rglob("*.jsonl"))
+    for jsonl in all_files:
+        if time.monotonic() > deadline:
+            truncated = True
+            break
         try:
             mtime = jsonl.stat().st_mtime
         except Exception:
@@ -3100,6 +3602,8 @@ def get_skill_usage(days=30):
         "sessions": len(sessions_seen),
         "days_window": days,
         "ok": True,
+        # v1.14.0 - True si le budget temps a coupe le scan avant la fin.
+        "truncated": truncated,
         # v1.10.4 - diag breakdown
         "assistant_msgs": assistant_msgs,
         "tool_use_blocks": tool_use_blocks,
@@ -3308,8 +3812,7 @@ def save_settings(content):
             shutil.copy2(SETTINGS_FILE, backup)
         except Exception:
             pass
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(content)
+    _atomic_write_text(SETTINGS_FILE, content)
     return True, f"settings.json enregistré ({len(content)} caractères)"
 
 
@@ -3334,8 +3837,7 @@ def save_claude_md(content):
             shutil.copy2(CLAUDE_MD_FILE, backup)
         except Exception:
             pass
-    CLAUDE_MD_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CLAUDE_MD_FILE.write_text(content)
+    _atomic_write_text(CLAUDE_MD_FILE, content)
     return True, f"CLAUDE.md enregistré ({len(content)} caractères)"
 
 
@@ -3357,15 +3859,25 @@ def save_command(name, content):
             shutil.copy2(target, backup)
         except Exception:
             pass
-    target.write_text(content)
+    _atomic_write_text(target, content)
     return True, f"Command '{name}' enregistrée"
 
 
 def restart_claude():
-    subprocess.run(["pkill", "-9", "-f", "Claude"], check=False)
-    time.sleep(2.5)
-    subprocess.run(["open", "-a", "Claude"], check=False)
-    return True, "Claude Desktop redemarre"
+    """v1.14.0 - delegue a restart_claude_desktop().
+
+    Avant, cette fonction faisait `pkill -9 -f Claude` : un motif non ancre,
+    qui matche la ligne de commande complete de TOUS les process de
+    l'utilisateur. Etaient tues au passage, entre autres, le subprocess
+    `claude -p <contenu de SKILL.md>` lance par _call_claude_cli (le contenu
+    d'un skill contient presque toujours le mot "Claude"), toute session
+    Claude Code lancee depuis un chemin contenant "Claude", ou un
+    `tail -f ~/Library/Logs/Claude/main.log`.
+
+    restart_claude_desktop() ancre sur le chemin complet du binaire. Une
+    seule implementation, une seule portee.
+    """
+    return restart_claude_desktop()
 
 
 _MCP_FIX_RULES = [
@@ -3453,17 +3965,28 @@ def read_mcp_error(name, lang="fr"):
         msg = (f"Dossier {CLAUDE_LOGS_DIR} introuvable. Claude Desktop n'a probablement jamais démarré." if lang == "fr"
                else f"Folder {CLAUDE_LOGS_DIR} not found. Claude Desktop probably never started.")
         return {"name": name, "error": None, "suggestion": msg, "log_path": None}
-    candidates = sorted(CLAUDE_LOGS_DIR.glob(f"mcp-server-{name}*.log"))
-    candidates += sorted(CLAUDE_LOGS_DIR.glob(f"*{name}*.log"))
+    # v1.14.0 - `name` vient de l'URL et etait interpole tel quel dans un
+    # glob : un nom contenant '/' ou '..' sortait de CLAUDE_LOGS_DIR. On
+    # neutralise les separateurs et les metacaracteres de glob.
+    safe_name = re.sub(r"[/\\\[\]*?]", "", str(name)).replace("..", "")
+    if not safe_name:
+        msg = "Nom MCP invalide" if lang == "fr" else "Invalid MCP name"
+        return {"name": name, "error": None, "suggestion": msg, "log_path": None}
+    candidates = sorted(CLAUDE_LOGS_DIR.glob(f"mcp-server-{safe_name}*.log"))
+    candidates += sorted(CLAUDE_LOGS_DIR.glob(f"*{safe_name}*.log"))
     candidates += [CLAUDE_LOGS_DIR / "mcp.log", CLAUDE_LOGS_DIR / "main.log"]
     seen = set()
     for log_file in candidates:
         if not log_file.exists() or log_file in seen:
             continue
         seen.add(log_file)
-        try:
-            content = log_file.read_text(errors="replace")
-        except Exception:
+        # v1.14.0 - _read_log_tail au lieu de read_text(). Les candidats
+        # incluent mcp.log et main.log, qui atteignent facilement plusieurs
+        # centaines de Mo ; on chargeait le fichier entier puis splitlines()
+        # puis une comprehension de filtrage (~3x la taille en RAM) pour
+        # n'utiliser que les 300 dernieres lignes (cf. _scan_log_for_error).
+        content = "\n".join(_read_log_tail(log_file, max_lines=600, max_bytes=256_000))
+        if not content:
             continue
         filter_name = name if log_file.name in ("mcp.log", "main.log") else None
         excerpt = _scan_log_for_error(content, filter_name)
@@ -3880,9 +4403,7 @@ def load_presets():
 
 
 def save_presets_file(data):
-    PRESETS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(PRESETS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(PRESETS_FILE, data)
 
 
 def list_presets():
@@ -3956,8 +4477,7 @@ def _save_settings(data):
         with open(SETTINGS_FILE) as src, open(backup, "w") as dst:
             dst.write(src.read())
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(SETTINGS_FILE, data)
 
 
 def _plugin_root(install_path):
@@ -5021,6 +5541,8 @@ fr: {
   banner_starting: "Démarrage en cours...",
   btn_delete_mcp_title: "Supprimer ce MCP / cette extension (popup de confirmation)",
   mcp_checkbox_title: "Coché = chargé au prochain démarrage de Claude Desktop. Décoché ne stoppe pas immédiatement le process en cours, utilise Stopper pour ça.",
+  mcp_readonly_tooltip: "MCP en lecture seule : sa source de vérité n'est pas claude_desktop_config.json (Claude Code CLI ~/.claude.json, ou plugin). Modifie-le à la source, ou utilise le bouton « Ajouter à Claude Desktop » de l'onglet Plugins.",
+  state_load_failed: "Impossible de charger l'état des MCPs et Skills.",
   confirm_stop_mcp: "Stopper le MCP « {name} » à chaud ?\\n\\n• Le process en cours est tué immédiatement\\n• La config reste intacte (le checkbox ne change pas)\\n• Au prochain redémarrage de Claude Desktop, il sera relancé automatiquement\\n• Pour désactiver durablement, décoche la case en plus\\n\\nCONFIRMER ?",
   confirm_delete_extension: "Supprimer l'extension « {name} » ?\\n\\n• Le dossier d'install est zippé en backup puis supprimé\\n• Le fichier de settings est sauvegardé puis supprimé\\n• L'entrée disparaît de extensions-installations.json\\n\\nNote : si Claude Desktop la ré-installe automatiquement (cas des extensions Anthropic-managed comme PowerPoint, Word, Control Mac), désinstalle-la via Settings → Extensions de Claude Desktop.\\n\\nCONFIRMER ?",
   mcp_col_running: "En cours d'execution",
@@ -5332,6 +5854,8 @@ en: {
   banner_starting: "Starting...",
   btn_delete_mcp_title: "Delete this MCP / extension (confirmation popup)",
   mcp_checkbox_title: "Checked = loaded at next Claude Desktop start. Unchecking does NOT immediately stop the running process; use Stop for that.",
+  mcp_readonly_tooltip: "Read-only MCP: its source of truth is not claude_desktop_config.json (Claude Code CLI ~/.claude.json, or a plugin). Edit it at the source, or use the \"Add to Claude Desktop\" button in the Plugins tab.",
+  state_load_failed: "Could not load MCP and Skill state.",
   confirm_stop_mcp: 'Stop MCP "{name}" hot?\\n\\n• The running process is killed immediately\\n• The config stays intact (checkbox unchanged)\\n• At next Claude Desktop start, it will be respawned automatically\\n• To disable persistently, uncheck the box too\\n\\nCONFIRM?',
   confirm_delete_extension: 'Delete extension "{name}"?\\n\\n• The install dir is zip-backed up then deleted\\n• The settings file is backed up then deleted\\n• The entry is removed from extensions-installations.json\\n\\nNote: if Claude Desktop re-installs it automatically (case of Anthropic-managed extensions like PowerPoint, Word, Control Mac), uninstall it via Settings → Extensions in Claude Desktop.\\n\\nCONFIRM?',
   mcp_col_running: "Running",
@@ -5482,8 +6006,18 @@ function filterPlugins(){
 }
 let CURRENT_STATE = {mcps:[], skills:[]};
 async function loadState(){
-  const s = await (await fetch('/api/state')).json();
+  let s;
+  try{
+    s = await fetchJSON('/api/state');
+  }catch(e){
+    // v1.14.0 - erreur visible au lieu d'une liste figee en silence.
+    banner('red', tr('state_load_failed') + ' ' + String(e.message || e));
+    return;
+  }
   CURRENT_STATE = s;
+  // v1.14.0 - claude_desktop_config.json illisible (virgule en trop apres une
+  // edition manuelle) : on le dit, au lieu d'afficher une liste vide.
+  if(s.config_error) banner('red', s.config_error);
   // v1.7.1 - rendu en 2 colonnes : running a gauche, inactifs a droite.
   // Chaque ligne expose un bouton "Redemarrer" texte+icone (visible sans hover)
   // qui appelle restart_mcp/restart_extension cote backend (kill PID + toggle
@@ -5495,29 +6029,49 @@ async function loadState(){
   // Claude Desktop' (persistance config), distinct du Stop a chaud.
   function _renderMcpRow(m){
     const isExt = m.type === 'extension';
+    // v1.14.0 - m.name vient de claude_desktop_config.json / ~/.claude.json,
+    // eux-memes alimentes par import_mcp_json/git/zip. Il etait interpole
+    // BRUT ici, alors que escAttr etait deja utilise juste en dessous pour
+    // m.version. Un nom contenant '<' ouvrait une balise qui avalait les
+    // lignes suivantes (des MCPs disparaissaient de la liste) ; un nom
+    // contenant une apostrophe cassait le JS inline. Et c'etait une XSS dans
+    // une page qui peut appeler /api/delete-mcp et /api/restart-self.
+    const nameHtml = escAttr(m.name);
+    const nameJs = escJsAttr(m.name);
+    // v1.14.0 - MCPs en lecture seule (Claude Code CLI, plugins) : leur
+    // source de verite n'est pas claude_desktop_config.json.
+    const readOnly = m.editable === false;
     const extBadge = isExt ? `<span class="text-[10px] font-mono text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded" title="Desktop Extension">${tr('ext_badge')}</span>` : '';
+    const srcBadge = readOnly
+      ? `<span class="text-[10px] font-mono text-sky-800 bg-sky-50 border border-sky-200 px-1.5 py-0.5 rounded" title="${escAttr(tr('mcp_readonly_tooltip'))}">${escAttr(m.source || m.type)}</span>`
+      : '';
     const versionBadge = isExt && m.version ? `<span class="text-[10px] text-stone-400 font-mono">v${escAttr(m.version)}</span>` : '';
-    const toggleFn = isExt ? `toggleExtension('${m.name}', this.checked)` : `toggleMcp('${m.name}')`;
+    const toggleFn = isExt ? `toggleExtension('${nameJs}', this.checked)` : `toggleMcp('${nameJs}')`;
     // v1.7.9 - 'pas demarre · pourquoi ?' compacte en simple '?' amber
     // (le pill complet faisait wrap sur 3 lignes en layout 2-colonnes).
-    const whyBtn = (m.active && !m.running && !isExt)
-      ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${m.name}')" class="text-[11px] font-bold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-full w-5 h-5 inline-flex items-center justify-center shrink-0" title="${tr('not_started_label')} - ${tr('why_title')}">?</button>`
+    const whyBtn = (m.active && !m.running && !isExt && !readOnly)
+      ? `<button type="button" onclick="event.preventDefault();event.stopPropagation();showMcpError('${nameJs}')" class="text-[11px] font-bold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-full w-5 h-5 inline-flex items-center justify-center shrink-0" title="${escAttr(tr('not_started_label'))} - ${escAttr(tr('why_title'))}">?</button>`
       : '';
     // v1.7.9 - boutons icon-only (avec title tooltip) : libere ~200px par ligne
     // pour que les noms ne soient plus tronques a 1-2 lettres en layout
     // 2-colonnes. Sémantique des icônes universelle (▶ ⏹ ↻ 🗑) + tooltip clair.
     const iconBtnCls = (theme) => `inline-flex items-center justify-center w-7 h-7 text-sm rounded-md border shrink-0 ${theme}`;
     let runCtlBtn = '';
-    if (m.running){
-      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();stopMcp('${m.name}')" title="${tr('btn_stop_mcp_short')} - ${tr('btn_stop_mcp_title')}" class="${iconBtnCls('text-stone-700 bg-stone-50 border-stone-200 hover:bg-stone-100')}" aria-label="${tr('btn_stop_mcp_short')}">&#9209;</button>`;
+    if (readOnly){
+      // pas d'action destructrice : on ne pilote pas ces MCPs depuis ici
+    } else if (m.running){
+      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();stopMcp('${nameJs}')" title="${escAttr(tr('btn_stop_mcp_short'))} - ${escAttr(tr('btn_stop_mcp_title'))}" class="${iconBtnCls('text-stone-700 bg-stone-50 border-stone-200 hover:bg-stone-100')}" aria-label="${escAttr(tr('btn_stop_mcp_short'))}">&#9209;</button>`;
     } else if (m.active){
-      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();startMcp('${m.name}')" title="${tr('btn_start_mcp_short')} - ${tr('btn_start_mcp_title')}" class="${iconBtnCls('text-green-800 bg-green-50 border-green-200 hover:bg-green-100')}" aria-label="${tr('btn_start_mcp_short')}">&#9654;</button>`;
+      runCtlBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();startMcp('${nameJs}')" title="${escAttr(tr('btn_start_mcp_short'))} - ${escAttr(tr('btn_start_mcp_title'))}" class="${iconBtnCls('text-green-800 bg-green-50 border-green-200 hover:bg-green-100')}" aria-label="${escAttr(tr('btn_start_mcp_short'))}">&#9654;</button>`;
     }
-    const restartBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${m.name}')" title="${tr('btn_restart_mcp_short')} - ${tr('btn_restart_mcp')}" class="${iconBtnCls('text-amber-800 bg-amber-50 border-amber-200 hover:bg-amber-100')}" aria-label="${tr('btn_restart_mcp_short')}">&#x21bb;</button>`;
-    const deleteFn = isExt ? `deleteExtension('${m.name}')` : `deleteMcp('${m.name}')`;
-    const deleteBtn = `<button type="button" onclick="event.preventDefault();event.stopPropagation();${deleteFn}" title="${tr('btn_delete')} - ${tr('btn_delete_mcp_title')}" class="${iconBtnCls('text-red-700 bg-red-50 border-red-200 hover:bg-red-100')}" aria-label="${tr('btn_delete')}">&#128465;</button>`;
-    const checkboxTitle = tr('mcp_checkbox_title');
-    return `<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-2 flex-1 min-w-0"><input type="checkbox" ${m.active?'checked':''} onchange="${toggleFn}" title="${checkboxTitle}" class="w-5 h-5 rounded accent-green-700 shrink-0"><span class="font-medium truncate">${m.name}</span>${extBadge}${versionBadge}${whyBtn}</div><div class="flex items-center gap-1.5 shrink-0">${runCtlBtn}${restartBtn}${deleteBtn}</div></label>`;
+    const restartBtn = readOnly ? ''
+      : `<button type="button" onclick="event.preventDefault();event.stopPropagation();restartMcp('${nameJs}')" title="${escAttr(tr('btn_restart_mcp_short'))} - ${escAttr(tr('btn_restart_mcp'))}" class="${iconBtnCls('text-amber-800 bg-amber-50 border-amber-200 hover:bg-amber-100')}" aria-label="${escAttr(tr('btn_restart_mcp_short'))}">&#x21bb;</button>`;
+    const deleteFn = isExt ? `deleteExtension('${nameJs}')` : `deleteMcp('${nameJs}')`;
+    const deleteBtn = readOnly ? ''
+      : `<button type="button" onclick="event.preventDefault();event.stopPropagation();${deleteFn}" title="${escAttr(tr('btn_delete'))} - ${escAttr(tr('btn_delete_mcp_title'))}" class="${iconBtnCls('text-red-700 bg-red-50 border-red-200 hover:bg-red-100')}" aria-label="${escAttr(tr('btn_delete'))}">&#128465;</button>`;
+    const checkboxTitle = escAttr(readOnly ? tr('mcp_readonly_tooltip') : tr('mcp_checkbox_title'));
+    const checkbox = `<input type="checkbox" ${m.active?'checked':''} ${readOnly?'disabled':`onchange="${toggleFn}"`} title="${checkboxTitle}" class="w-5 h-5 rounded accent-green-700 shrink-0${readOnly?' opacity-50 cursor-not-allowed':''}">`;
+    return `<label class="flex items-center justify-between gap-3 p-3 rounded-lg hover:bg-stone-50 cursor-pointer border ${m.active?'border-stone-200':'border-stone-100 opacity-60'}"><div class="flex items-center gap-2 flex-1 min-w-0">${checkbox}<span class="font-medium truncate">${nameHtml}</span>${extBadge}${srcBadge}${versionBadge}${whyBtn}</div><div class="flex items-center gap-1.5 shrink-0">${runCtlBtn}${restartBtn}${deleteBtn}</div></label>`;
   }
   const running = s.mcps.filter(m=>m.running);
   const stopped = s.mcps.filter(m=>!m.running);
@@ -5630,6 +6184,46 @@ async function restartClaudeDesktop(){
 }
 
 function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');}
+// v1.14.0 - escAttr NE SUFFIT PAS pour une valeur interpolee dans du JS
+// inline (onclick="fn('...')"). Le parseur HTML decode les entites AVANT que
+// JS ne voie la source : escAttr("'") donne &#39; qui redevient ' et casse la
+// chaine JS. Il faut donc echapper d'abord pour JS (antislash), puis pour
+// l'attribut HTML.
+function escJs(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/\r/g,'\\r').replace(/\n/g,'\\n');}
+function escJsAttr(s){return escAttr(escJs(s));}
+
+// v1.14.0 - fetch avec timeout et erreur explicite.
+// Avant : `await (await fetch(url)).json()` nu. Un /api/state lent ou en
+// erreur rejetait la promesse, personne ne catchait, et la liste MCP gardait
+// indefiniment son dernier rendu SANS message -- exactement le symptome
+// "mes MCPs ont disparu".
+async function fetchJSON(url, ms){
+  const ctl = new AbortController();
+  const t = setTimeout(()=>ctl.abort(), ms || 20000);
+  try{
+    const r = await fetch(url, {signal: ctl.signal});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+// v1.14.0 - polling auto-rearme avec garde "requete en cours".
+// Avant : setInterval fixe, sans garde. Quand le serveur ralentissait, le
+// navigateur empilait les requetes, qui empilaient les threads serveur :
+// boucle de retroaction qui transformait un ralentissement en gel complet.
+function poll(fn, ms, label){
+  let busy = false;
+  const tick = async () => {
+    if(!busy){
+      busy = true;
+      try{ await fn(); }
+      catch(e){ console.error('poll ' + (label||'') , e); }
+      finally{ busy = false; }
+    }
+    setTimeout(tick, ms);
+  };
+  setTimeout(tick, ms);
+}
 let SKILL_USAGE = {};
 let SKILL_SOURCE_FILTER = (localStorage.getItem('cc-skill-src') || 'all');
 let SKILL_CAT_FILTER = (localStorage.getItem('cc-skill-cat') || '');
@@ -7192,11 +7786,64 @@ async function _revealPathInFinder(path){
   if(!path) return;
   try{ await api('/api/reveal-path', {path: path}); }catch(e){ console.error(e); }
 }
-applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();loadWatchdogTab();checkUpdate();setInterval(loadOverview,10000);setInterval(loadState,5000);setInterval(loadPlugins,15000);setInterval(loadCommands,30000);setInterval(loadWatchdog,10000);setInterval(loadWatchdogTab,10000);setInterval(checkUpdate,3600000);
+applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();loadWatchdogTab();checkUpdate();poll(loadOverview,10000,'overview');poll(loadState,5000,'state');poll(loadPlugins,15000,'plugins');poll(loadCommands,30000,'commands');poll(loadWatchdog,10000,'watchdog');poll(loadWatchdogTab,10000,'watchdogTab');poll(checkUpdate,3600000,'update');
 </script></body></html>"""
 
 
+# v1.14.0 - routes dont le corps fait un cycle lire-modifier-ecrire sur un
+# fichier de config. Elles sont serialisees par _CONFIG_LOCK : sans ca, deux
+# requetes concurrentes (le serveur est multi-thread) lisent la meme version
+# et la derniere ecriture ecrase l'autre. Les routes lentes qui ne touchent
+# pas la config (mcp-test, suggest-skill-description, pick-folder) sont
+# volontairement hors de cette liste pour ne pas bloquer les autres.
+_CONFIG_MUTATING_ROUTES = {
+    "/api/toggle-mcp", "/api/delete-mcp", "/api/delete-extension",
+    "/api/toggle-extension", "/api/resolve-mcp-conflict", "/api/mcp-set-env",
+    "/api/import-mcp-json", "/api/import-mcp-file", "/api/import-mcp-git",
+    "/api/preset-save", "/api/preset-apply", "/api/preset-delete",
+    "/api/toggle-plugin", "/api/delete-plugin", "/api/bridge-plugin-mcp",
+    "/api/add-plugin-git", "/api/plugin-cleanup", "/api/save-settings",
+    "/api/watchdog-config", "/api/save-claude-md", "/api/save-command",
+    "/api/toggle-skill", "/api/toggle-command", "/api/delete-skill",
+    "/api/repair-skill", "/api/delete-user-skill-duplicates",
+    "/api/package-plugin-skill",
+}
+
+# Routes qui recoivent un binaire brut (upload ZIP) : pas de Content-Type JSON.
+_RAW_BODY_ROUTES = {"/api/import-skill-zip", "/api/import-mcp-zip"}
+
+_ALLOWED_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"[::1]:{PORT}"}
+_ALLOWED_ORIGINS = {f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}",
+                    f"http://[::1]:{PORT}"}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    def _guard_request(self):
+        """v1.14.0 - Defense CSRF / DNS rebinding.
+
+        Le serveur n'ecoute que sur 127.0.0.1, mais ca ne protege de rien
+        contre un site tiers ouvert dans le meme navigateur : do_POST parsait
+        le corps SANS regarder le Content-Type, donc un simple
+
+            <form action="http://localhost:8765/api/delete-mcp"
+                  method="POST" enctype="text/plain">
+
+        passait (text/plain est une "simple request" : pas de preflight CORS)
+        et declenchait delete-mcp, apply-update ou restart-self. L'attaquant
+        ne lit pas la reponse, mais l'action a lieu.
+
+        Trois controles : Host attendu (bloque le DNS rebinding), Origin
+        attendu quand il est present, et Content-Type JSON sur les routes
+        JSON. Retourne (ok, message).
+        """
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host not in _ALLOWED_HOSTS:
+            return False, f"Host non autorise : {host or '(absent)'}"
+        origin = self.headers.get("Origin")
+        if origin is not None and origin.strip().lower() not in _ALLOWED_ORIGINS:
+            return False, f"Origin non autorise : {origin}"
+        return True, ""
+
     def _json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -7206,6 +7853,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        ok, why = self._guard_request()
+        if not ok:
+            self._json({"error": why}, status=403); return
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
             body = HTML.encode("utf-8")
@@ -7296,8 +7946,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
     def do_POST(self):
+        ok, why = self._guard_request()
+        if not ok:
+            self._json({"success": False, "message": why}, status=403); return
         path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            self._json({"success": False, "message": "Content-Length invalide"}, status=400); return
+        if length < 0:
+            self._json({"success": False, "message": "Content-Length invalide"}, status=400); return
+        if path not in _RAW_BODY_ROUTES:
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                self._json({"success": False,
+                            "message": "Content-Type application/json requis"}, status=415); return
         if path in ("/api/import-skill-zip", "/api/import-mcp-zip"):
             if length > MAX_ZIP_SIZE:
                 self._json({"success": False, "message": f"Trop volumineux (max {MAX_ZIP_SIZE // 1024 // 1024} Mo)"}); return
@@ -7360,7 +8023,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         }
         if path in routes:
             try:
-                ok, msg = routes[path]()
+                if path in _CONFIG_MUTATING_ROUTES:
+                    with _CONFIG_LOCK:
+                        ok, msg = routes[path]()
+                else:
+                    ok, msg = routes[path]()
             except Exception as e:
                 ok, msg = False, f"Erreur serveur : {e}"
             if isinstance(msg, dict):
