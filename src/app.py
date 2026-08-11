@@ -926,8 +926,24 @@ _BULK_REPAIR = {
     "running": False, "total": 0, "done": 0, "current": None,
     "results": [], "started_at": None, "finished_at": None,
     "cancelled": False, "lang": None,
+    # v1.14.2 - phase / arret. Sans ca, un lot dont le CLI ne repond jamais
+    # affichait "Reparation en cours 1/93" pendant plus de trois heures
+    # (93 skills x 120 s de timeout) avant de dire quoi que ce soit.
+    "phase": "idle",          # idle | preflight | running | finished
+    "aborted": False,
+    "abort_reason": None,
+    "probe_seconds": None,    # duree mesuree d'un appel CLI trivial
+    "started_monotonic": None,
 }
 _BULK_REPAIR_LOCK = threading.Lock()
+
+# v1.14.2 - au-dela de ce nombre d'echecs consecutifs, on arrete le lot. Si le
+# CLI ne repond pas 3 fois de suite, il ne repondra pas les 90 fois suivantes :
+# continuer ne produit rien et occupe la machine pendant des heures.
+BULK_REPAIR_MAX_CONSECUTIVE_FAILURES = 3
+# Timeout du probe de preflight. Plus court que l'appel reel : on ne cherche
+# pas une bonne reponse, seulement la preuve que le CLI en rend une.
+BULK_REPAIR_PROBE_TIMEOUT = 90
 
 
 def _repairable_user_skills(include_synced=False):
@@ -970,10 +986,55 @@ def _repairable_user_skills(include_synced=False):
     return out
 
 
+def _bulk_repair_outcome(snap):
+    """v1.14.2 - Etat terminal explicite, calcule cote serveur pour que l'UI
+    n'ait pas a le deviner.
+
+    Avant, l'UI affichait "Reparation terminee {done}/{total}" dans tous les
+    cas. Sur 93 skills dont 60 en echec, ca lisait "terminee 93/93" : le
+    compteur mesurait les skills TRAITES, pas les skills REPARES. Un lot
+    annule et un lot integralement en echec produisaient le meme texte.
+    """
+    if snap["phase"] == "preflight":
+        return "preflight"
+    if snap["running"]:
+        return "running"
+    if not snap["results"] and not snap["aborted"]:
+        return "idle"
+    if snap["aborted"]:
+        return "aborted"
+    if snap["cancelled"]:
+        return "cancelled"
+    if snap["ok_count"] == 0 and snap["failed_count"]:
+        return "all_failed"
+    if snap["failed_count"]:
+        return "partial"
+    return "success"
+
+
 def bulk_repair_status():
     with _BULK_REPAIR_LOCK:
         snap = dict(_BULK_REPAIR)
         snap["results"] = list(_BULK_REPAIR["results"])
+        started_mono = _BULK_REPAIR["started_monotonic"]
+    snap["ok_count"] = sum(1 for r in snap["results"] if r.get("ok"))
+    snap["failed_count"] = sum(1 for r in snap["results"] if not r.get("ok"))
+    snap["remaining"] = max(0, snap["total"] - snap["done"])
+    # v1.14.2 - ETA mesuree, pas estimee a la louche. Le tooltip annoncait
+    # "~7 s par skill" en dur ; sur une machine ou le CLI met 120 s, l'ecart
+    # entre l'annonce et le vecu est le probleme.
+    snap["elapsed_seconds"] = (
+        round(time.monotonic() - started_mono) if started_mono else None)
+    per_item = None
+    if snap["done"] and snap["elapsed_seconds"]:
+        per_item = snap["elapsed_seconds"] / snap["done"]
+    elif snap["probe_seconds"]:
+        per_item = snap["probe_seconds"]
+    snap["seconds_per_skill"] = round(per_item, 1) if per_item else None
+    snap["eta_seconds"] = (
+        round(per_item * snap["remaining"])
+        if (per_item and snap["running"] and snap["remaining"]) else None)
+    snap["outcome"] = _bulk_repair_outcome(snap)
     if not snap["running"] and not snap["results"]:
         snap["pending"] = len(_repairable_user_skills())
         snap["pending_synced"] = len(
@@ -990,7 +1051,77 @@ def cancel_bulk_repair():
     return True, "Annulation demandee - le skill en cours se termine"
 
 
+def dismiss_bulk_repair():
+    """v1.14.2 - Efface le compte rendu du dernier lot. Sans ca, le panneau
+    de resultats restait affiche jusqu'au prochain lot, sans moyen de le
+    fermer."""
+    with _BULK_REPAIR_LOCK:
+        if _BULK_REPAIR["running"]:
+            return False, "Une reparation est en cours"
+        _BULK_REPAIR.update({
+            "results": [], "done": 0, "total": 0, "phase": "idle",
+            "aborted": False, "abort_reason": None, "cancelled": False,
+            "started_at": None, "finished_at": None, "started_monotonic": None,
+        })
+    return True, "Compte rendu efface"
+
+
+def _bulk_repair_probe():
+    """v1.14.2 - Verifie que le CLI rend une reponse AVANT de lancer le lot.
+
+    Motivation concrete : sur une machine ou le CLI ne repond pas, un lot de
+    93 skills enchainait 93 timeouts de 120 s -- plus de trois heures a
+    afficher "Reparation en cours 1/93" pour finir sur zero description
+    reecrite. Un seul appel trivial en tete de lot transforme ca en message
+    immediat, et sa duree donne l'ETA reelle du lot.
+
+    Retourne (ok, seconds, error_message).
+    """
+    started = time.monotonic()
+    try:
+        out = _call_claude_cli(
+            "ping",
+            system_prompt="Reply with the single word: pong. Nothing else.",
+            timeout=BULK_REPAIR_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, time.monotonic() - started, (
+            f"Le CLI Claude n'a pas repondu a un appel trivial en "
+            f"{BULK_REPAIR_PROBE_TIMEOUT} s. Le lot n'a pas ete lance : il "
+            f"aurait echoue skill apres skill. Teste a la main dans un "
+            f"terminal : echo ping | claude -p --safe-mode")
+    except ClaudeCliNotLoggedIn as e:
+        return False, time.monotonic() - started, str(e)
+    except Exception as e:
+        return False, time.monotonic() - started, f"{type(e).__name__} : {e}"
+    elapsed = time.monotonic() - started
+    if not (out or "").strip():
+        return False, elapsed, (
+            "Le CLI Claude a repondu sans aucun texte. Le lot n'a pas ete "
+            "lance. Teste : echo ping | claude -p --safe-mode")
+    return True, elapsed, None
+
+
+def _bulk_repair_abort(reason):
+    with _BULK_REPAIR_LOCK:
+        _BULK_REPAIR.update({
+            "running": False, "current": None, "aborted": True,
+            "abort_reason": reason, "phase": "finished",
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+        })
+    _log(f"bulk_repair: arret - {reason}")
+    _notify("Reparation des skills arretee", reason)
+
+
 def _bulk_repair_worker(targets, lang):
+    ok, probe_seconds, probe_error = _bulk_repair_probe()
+    with _BULK_REPAIR_LOCK:
+        _BULK_REPAIR["probe_seconds"] = round(probe_seconds, 1)
+    if not ok:
+        _bulk_repair_abort(probe_error)
+        return
+    with _BULK_REPAIR_LOCK:
+        _BULK_REPAIR["phase"] = "running"
+    consecutive_failures = 0
     for item in targets:
         with _BULK_REPAIR_LOCK:
             if _BULK_REPAIR["cancelled"]:
@@ -1013,14 +1144,33 @@ def _bulk_repair_worker(targets, lang):
         with _BULK_REPAIR_LOCK:
             _BULK_REPAIR["results"].append(entry)
             _BULK_REPAIR["done"] += 1
+        consecutive_failures = 0 if entry.get("ok") else consecutive_failures + 1
+        if consecutive_failures >= BULK_REPAIR_MAX_CONSECUTIVE_FAILURES:
+            # v1.14.2 - la duree du probe distingue deux pannes tres
+            # differentes : un CLI mort (probe lent lui aussi) et un CLI sain
+            # qui cale sur le contenu envoye (probe rapide, appels reels en
+            # timeout). Sans ca, les deux donnent le meme "Timeout".
+            hint = ""
+            if probe_seconds and probe_seconds < 30:
+                hint = (f" Le CLI avait pourtant repondu en "
+                        f"{probe_seconds:.0f} s a un appel trivial : la panne "
+                        f"vient probablement du contenu envoye, pas du CLI.")
+            _bulk_repair_abort(
+                f"Arret apres {consecutive_failures} echecs consecutifs "
+                f"(dernier : {str(entry.get('error') or '')[:140]})."
+                f"{hint} Les skills restants n'ont pas ete touches.")
+            return
     with _BULK_REPAIR_LOCK:
         _BULK_REPAIR["running"] = False
         _BULK_REPAIR["current"] = None
+        _BULK_REPAIR["phase"] = "finished"
         _BULK_REPAIR["finished_at"] = datetime.now().isoformat(timespec="seconds")
-        done, total = _BULK_REPAIR["done"], _BULK_REPAIR["total"]
+        total = _BULK_REPAIR["total"]
+        repaired = sum(1 for r in _BULK_REPAIR["results"] if r.get("ok"))
         failed = sum(1 for r in _BULK_REPAIR["results"] if not r.get("ok"))
-    _notify("Reparation des skills terminee",
-            f"{done}/{total} traites, {failed} en echec")
+        cancelled = _BULK_REPAIR["cancelled"]
+    head = "Reparation des skills annulee" if cancelled else "Reparation des skills terminee"
+    _notify(head, f"{repaired} repares, {failed} en echec, sur {total}")
 
 
 def start_bulk_repair(lang=None, include_synced=False):
@@ -1040,11 +1190,13 @@ def start_bulk_repair(lang=None, include_synced=False):
             "running": True, "total": len(targets), "done": 0,
             "current": None, "results": [], "cancelled": False, "lang": lang,
             "started_at": datetime.now().isoformat(timespec="seconds"),
-            "finished_at": None,
+            "finished_at": None, "phase": "preflight", "aborted": False,
+            "abort_reason": None, "probe_seconds": None,
+            "started_monotonic": time.monotonic(),
         })
     threading.Thread(target=_bulk_repair_worker, args=(targets, lang),
                      name="claude-control-bulk-repair", daemon=True).start()
-    return True, {"message": f"Reparation de {len(targets)} skill(s) lancee",
+    return True, {"message": f"Verification du CLI, puis {len(targets)} skill(s)",
                   "total": len(targets), "started": True}
 
 
@@ -5880,11 +6032,24 @@ fr: {
   skills_health_ready: "prêts à se déclencher",
   skills_health_all_good: "Tous tes skills sont en bonne forme",
   bulk_repair_btn: "Réparer les {n} descriptions",
-  bulk_repair_title: "Génère une vraie description (ce que fait le skill + quand le déclencher) pour chaque skill signalé, via le CLI Claude Code. Environ 7 s par skill.",
-  confirm_bulk_repair: "Régénérer la description de tous les skills signalés ?\n\n• Chaque SKILL.md est sauvegardé en .zip avant écriture\n• Environ 7 secondes par skill, ça tourne en arrière-plan\n• Tu peux annuler en cours de route\n\nCONTINUER ?",
+  bulk_repair_title: "Génère une vraie description (ce que fait le skill + quand le déclencher) pour chaque skill signalé, via le CLI Claude Code. Un appel par skill, en arrière-plan, annulable.",
+  confirm_bulk_repair: "Régénérer la description de tous les skills signalés ?\n\n• Un appel test au CLI d'abord : s'il ne répond pas, aucun skill n'est modifié\n• Chaque SKILL.md est sauvegardé en .zip avant écriture\n• Un appel CLI par skill : le temps total dépend de ta machine, l'estimation s'affiche dès le départ\n• Arrêt automatique après 3 échecs consécutifs\n\nCONTINUER ?",
   bulk_repair_running: "Réparation en cours",
   bulk_repair_done: "Réparation terminée",
   bulk_repair_cancel: "Annuler",
+  bulk_close: "Fermer",
+  bulk_preflight: "Vérification du CLI Claude…",
+  bulk_preflight_sub: "Un appel test avant de lancer le lot. Si le CLI ne répond pas, aucun skill n'est modifié.",
+  bulk_ok: "{n} descriptions réécrites",
+  bulk_partial: "{n} réécrites, {f} en échec",
+  bulk_all_failed: "Aucune description réécrite — {f} échecs",
+  bulk_cancelled: "Annulé — {n} réécrites, {r} non traités",
+  bulk_aborted: "Réparation arrêtée — {n} réécrites",
+  bulk_eta: "≈ {t} restantes",
+  bulk_pace: "{s} s par skill",
+  bulk_elapsed: "Durée : {t}",
+  bulk_failed_list: "{f} en échec — voir le détail",
+  bulk_ok_list: "{n} réécrites — voir le détail",
   bulk_repair_synced_btn: "+ {n} skills synchronisés",
   bulk_repair_synced_title: "Ces skills viennent de la synchronisation de ton compte Claude (~/.claude/skills/synced/). Les réparer localement fonctionne, mais une resynchro peut écraser la modification.",
   confirm_bulk_repair_synced: "Réparer AUSSI les skills synchronisés depuis ton compte Claude ?\n\n⚠ Ils vivent dans ~/.claude/skills/synced/ : une resynchronisation du compte peut écraser la nouvelle description.\n\n• Un backup .zip est créé pour chacun\n• Environ 7 secondes par skill\n\nCONTINUER ?",
@@ -6202,11 +6367,24 @@ en: {
   skills_health_ready: "ready to trigger",
   skills_health_all_good: "All your skills are in good shape",
   bulk_repair_btn: "Repair {n} descriptions",
-  bulk_repair_title: "Generates a real description (what the skill does + when to trigger it) for every flagged skill, via the Claude Code CLI. About 7s per skill.",
-  confirm_bulk_repair: "Regenerate the description of every flagged skill?\n\n• Each SKILL.md is backed up as .zip before writing\n• About 7 seconds per skill, runs in the background\n• You can cancel while it runs\n\nCONTINUE?",
+  bulk_repair_title: "Generates a real description (what the skill does + when to trigger it) for every flagged skill, via the Claude Code CLI. One call per skill, in the background, cancellable.",
+  confirm_bulk_repair: "Regenerate the description of every flagged skill?\n\n• One test call to the CLI first: if it does not answer, no skill is touched\n• Each SKILL.md is backed up as .zip before writing\n• One CLI call per skill: total time depends on your machine, the estimate shows up front\n• Stops automatically after 3 consecutive failures\n\nCONTINUE?",
   bulk_repair_running: "Repairing",
   bulk_repair_done: "Repair finished",
   bulk_repair_cancel: "Cancel",
+  bulk_close: "Close",
+  bulk_preflight: "Checking the Claude CLI…",
+  bulk_preflight_sub: "One test call before starting the batch. If the CLI does not answer, no skill is touched.",
+  bulk_ok: "{n} descriptions rewritten",
+  bulk_partial: "{n} rewritten, {f} failed",
+  bulk_all_failed: "No description rewritten — {f} failures",
+  bulk_cancelled: "Cancelled — {n} rewritten, {r} untouched",
+  bulk_aborted: "Repair stopped — {n} rewritten",
+  bulk_eta: "≈ {t} left",
+  bulk_pace: "{s}s per skill",
+  bulk_elapsed: "Took {t}",
+  bulk_failed_list: "{f} failed — show details",
+  bulk_ok_list: "{n} rewritten — show details",
   bulk_repair_synced_btn: "+ {n} synced skills",
   bulk_repair_synced_title: "These skills come from your Claude account sync (~/.claude/skills/synced/). Repairing them locally works, but a re-sync may overwrite the change.",
   confirm_bulk_repair_synced: "ALSO repair skills synced from your Claude account?\n\n⚠ They live in ~/.claude/skills/synced/: an account re-sync may overwrite the new description.\n\n• A .zip backup is created for each\n• About 7 seconds per skill\n\nCONTINUE?",
@@ -6753,43 +6931,109 @@ async function startBulkRepair(includeSynced){
 async function cancelBulkRepair(){
   try{ const j = await api('/api/repair-all-cancel', {}); banner('blue', j.message); }
   catch(e){ banner('red', String(e.message || e)); }
+  refreshBulkRepair();
+}
+async function dismissBulkRepair(){
+  try{ await api('/api/repair-all-dismiss', {}); }catch(e){}
+  const p = document.getElementById('bulk-repair-panel');
+  if(p) p.remove();
+  loadState();
 }
 function pollBulkRepair(){
   if(BULK_REPAIR_TIMER) return;
   BULK_REPAIR_TIMER = setInterval(refreshBulkRepair, 2000);
   refreshBulkRepair();
 }
+// v1.14.2 - le compte rendu vivait dans le bandeau Sante, donc uniquement
+// sur la vue Skills et uniquement si ce bandeau etait rendu. Un lot de 93
+// skills dure des minutes : des que l'utilisateur changeait d'onglet ou
+// scrollait, refreshBulkRepair sortait sur `if(!el) return` et il n'avait
+// plus AUCUN retour. Le panneau est maintenant ancre au document.
+function _bulkRepairPanel(){
+  let el = document.getElementById('bulk-repair-panel');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'bulk-repair-panel';
+    el.className = 'fixed bottom-4 left-4 z-50 w-96 max-w-[calc(100vw-2rem)] '
+      + 'bg-white border border-stone-200 rounded-xl shadow-lg p-3 text-sm';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function _fmtDuration(sec){
+  if(sec == null) return '';
+  if(sec < 60) return `${Math.round(sec)} s`;
+  const m = Math.floor(sec/60), s = Math.round(sec%60);
+  return s ? `${m} min ${s} s` : `${m} min`;
+}
 async function refreshBulkRepair(){
-  const el = document.getElementById('bulk-repair-progress');
-  if(!el) return;
   let st;
   try{ st = await fetchJSON('/api/repair-all-status'); }
   catch(e){ return; }
-  if(!st.running && !(st.results||[]).length){
-    el.classList.add('hidden'); el.innerHTML = '';
+  const stale = document.getElementById('bulk-repair-progress');
+  if(stale) stale.classList.add('hidden');
+  if(st.outcome === 'idle'){
+    const p = document.getElementById('bulk-repair-panel');
+    if(p) p.remove();
     if(BULK_REPAIR_TIMER){ clearInterval(BULK_REPAIR_TIMER); BULK_REPAIR_TIMER = null; }
     return;
   }
   if(st.running && !BULK_REPAIR_TIMER) pollBulkRepair();
+  const results = st.results || [];
+  const failed = results.filter(r=>!r.ok);
+  const done = results.filter(r=>r.ok);
+  // v1.14.2 - le titre nomme l'issue reelle. Avant, "Reparation terminee
+  // 93/93" s'affichait a l'identique que les 93 soient reecrites ou que les
+  // 93 aient echoue : {done} comptait les skills TRAITES, pas les REPARES.
+  const S = {
+    preflight: ['blue',   tr('bulk_preflight')],
+    running:   ['blue',   `${tr('bulk_repair_running')} ${st.done}/${st.total}`],
+    success:   ['green',  tr('bulk_ok').replace('{n}', String(st.ok_count))],
+    partial:   ['amber',  tr('bulk_partial').replace('{n}', String(st.ok_count)).replace('{f}', String(st.failed_count))],
+    all_failed:['red',    tr('bulk_all_failed').replace('{f}', String(st.failed_count))],
+    cancelled: ['amber',  tr('bulk_cancelled').replace('{n}', String(st.ok_count)).replace('{r}', String(st.remaining))],
+    aborted:   ['red',    tr('bulk_aborted').replace('{n}', String(st.ok_count))],
+  }[st.outcome] || ['blue', st.outcome];
+  const tone = {blue:'text-blue-800', green:'text-green-800', amber:'text-amber-800', red:'text-red-800'}[S[0]];
+  const bar  = {blue:'bg-blue-500', green:'bg-green-600', amber:'bg-amber-500', red:'bg-red-500'}[S[0]];
   const pct = st.total ? Math.round(st.done / st.total * 100) : 0;
-  const failed = (st.results||[]).filter(r=>!r.ok);
-  const head = st.running
-    ? `${tr('bulk_repair_running')} ${st.done}/${st.total}${st.current ? ' — ' + escAttr(st.current) : ''}`
-    : `${tr('bulk_repair_done')} ${st.done}/${st.total}`;
-  const cancelBtn = st.running
-    ? `<button onclick="cancelBulkRepair()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${escAttr(tr('bulk_repair_cancel'))}</button>` : '';
+  let sub = '';
+  if(st.outcome === 'preflight'){
+    sub = tr('bulk_preflight_sub');
+  }else if(st.running){
+    const bits = [];
+    if(st.current) bits.push(escAttr(st.current));
+    if(st.eta_seconds != null) bits.push(tr('bulk_eta').replace('{t}', _fmtDuration(st.eta_seconds)));
+    else if(st.seconds_per_skill) bits.push(tr('bulk_pace').replace('{s}', String(st.seconds_per_skill)));
+    sub = bits.join(' · ');
+  }else if(st.abort_reason){
+    sub = escAttr(st.abort_reason);
+  }else if(st.elapsed_seconds != null){
+    sub = tr('bulk_elapsed').replace('{t}', _fmtDuration(st.elapsed_seconds));
+  }
+  const actions = st.running
+    ? `<button onclick="cancelBulkRepair()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${escAttr(tr('bulk_repair_cancel'))}</button>`
+    : `<button onclick="dismissBulkRepair()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${escAttr(tr('bulk_close'))}</button>`;
   const errList = failed.length
-    ? `<ul class="mt-2 text-xs text-red-700 list-disc pl-5">` +
-      failed.slice(0, 8).map(r=>`<li><span class="font-mono">${escAttr(r.name)}</span> — ${escAttr(String(r.error||'').slice(0,160))}</li>`).join('') +
-      (failed.length > 8 ? `<li>+${failed.length - 8}</li>` : '') + `</ul>`
-    : '';
-  el.classList.remove('hidden');
-  el.innerHTML = `
-    <div class="flex items-center justify-between gap-2 mb-1">
-      <span class="text-xs text-stone-600">${head}</span>${cancelBtn}
+    ? `<details class="mt-2" ${st.running ? '' : 'open'}><summary class="text-xs text-red-700 cursor-pointer">${escAttr(tr('bulk_failed_list').replace('{f}', String(failed.length)))}</summary>
+       <ul class="mt-1 text-xs text-red-700 list-disc pl-5 max-h-40 overflow-y-auto">`
+      + failed.map(r=>`<li><span class="font-mono">${escAttr(r.name)}</span> — ${escAttr(String(r.error||'').slice(0,200))}</li>`).join('')
+      + `</ul></details>` : '';
+  // v1.14.2 - les reussites etaient invisibles : on ne listait que les
+  // echecs, donc impossible de verifier ce qui avait ete reecrit sans
+  // rouvrir 93 cards une par une.
+  const okList = done.length
+    ? `<details class="mt-2"><summary class="text-xs text-green-800 cursor-pointer">${escAttr(tr('bulk_ok_list').replace('{n}', String(done.length)))}</summary>
+       <ul class="mt-1 text-xs text-stone-600 list-disc pl-5 max-h-40 overflow-y-auto">`
+      + done.map(r=>`<li><span class="font-mono">${escAttr(r.name)}</span> — ${escAttr(String(r.after||'').slice(0,120))}…</li>`).join('')
+      + `</ul></details>` : '';
+  _bulkRepairPanel().innerHTML = `
+    <div class="flex items-start justify-between gap-2 mb-1">
+      <span class="font-medium ${tone}">${escAttr(S[1])}</span>${actions}
     </div>
-    <div class="w-full h-1.5 rounded-full bg-stone-100 overflow-hidden"><div class="h-full bg-green-600" style="width:${pct}%"></div></div>
-    ${errList}`;
+    ${sub ? `<div class="text-xs text-stone-500 mb-2 break-words">${sub}</div>` : ''}
+    <div class="w-full h-1.5 rounded-full bg-stone-100 overflow-hidden"><div class="h-full ${bar}" style="width:${st.outcome==='preflight'?100:pct}%"></div></div>
+    ${errList}${okList}`;
   if(!st.running && BULK_REPAIR_TIMER){
     clearInterval(BULK_REPAIR_TIMER); BULK_REPAIR_TIMER = null;
     loadState();
@@ -8196,7 +8440,7 @@ async function _revealPathInFinder(path){
   if(!path) return;
   try{ await api('/api/reveal-path', {path: path}); }catch(e){ console.error(e); }
 }
-applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();loadWatchdogTab();checkUpdate();poll(loadOverview,10000,'overview');poll(loadState,5000,'state');poll(loadPlugins,15000,'plugins');poll(loadCommands,30000,'commands');poll(loadWatchdog,10000,'watchdog');poll(loadWatchdogTab,10000,'watchdogTab');poll(checkUpdate,3600000,'update');
+applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();loadWatchdogTab();checkUpdate();poll(loadOverview,10000,'overview');poll(loadState,5000,'state');poll(loadPlugins,15000,'plugins');poll(loadCommands,30000,'commands');poll(loadWatchdog,10000,'watchdog');poll(loadWatchdogTab,10000,'watchdogTab');poll(checkUpdate,3600000,'update');refreshBulkRepair();
 </script></body></html>"""
 
 
@@ -8417,6 +8661,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/repair-all-skills": lambda: start_bulk_repair(
                 data.get("lang"), bool(data.get("include_synced", False))),
             "/api/repair-all-cancel": lambda: cancel_bulk_repair(),
+            "/api/repair-all-dismiss": lambda: dismiss_bulk_repair(),
             "/api/suggest-skill-description": lambda: suggest_skill_description(data.get("name", ""), lang=data.get("lang")),
             "/api/delete-user-skill-duplicates": lambda: delete_user_skill_duplicates(),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),

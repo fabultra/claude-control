@@ -277,7 +277,8 @@ class BulkRepairTests(unittest.TestCase):
                 return False, "CLI indisponible"
             return True, {"suggestion": suggestion or self.GOOD, "source": "claude_cli"}
 
-        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"):
+        with patch.object(app, "_claude_cli_path", lambda: "/usr/local/bin/claude"), \
+             patch.object(app, "_call_claude_cli", return_value="pong"):
             with patch.object(app, "suggest_skill_description", fake_suggest):
                 ok, payload = app.start_bulk_repair(lang="fr")
                 deadline = time.time() + 5
@@ -467,6 +468,201 @@ class AccentFoldingTests(unittest.TestCase):
         self.assertEqual(app._fold_accents("À déclencher"), "a declencher")
         self.assertEqual(app._fold_accents("ÉÈÊË"), "eeee")
 
+
+
+class BulkRepairPreflightTests(unittest.TestCase):
+    """v1.14.2 - un lot de 93 skills lance sur une machine dont le CLI ne
+    repond pas enchainait 93 timeouts de 120 s : plus de trois heures a
+    afficher "Reparation en cours 1/93" pour finir sur zero description
+    reecrite, sans jamais nommer la cause.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        root = Path(self.tmpdir.name)
+        self.skills_dir = root / "skills"
+        self.disabled_dir = root / "skills-disabled"
+        self.backup_dir = root / "backup"
+        for d in (self.skills_dir, self.disabled_dir, self.backup_dir):
+            d.mkdir(parents=True)
+        self._orig = (app.SKILLS_DIR, app.SKILLS_DISABLED_DIR, app.BACKUP_DIR)
+        app.SKILLS_DIR, app.SKILLS_DISABLED_DIR = self.skills_dir, self.disabled_dir
+        app.BACKUP_DIR = self.backup_dir
+        self._orig_notify = app._notify
+        app._notify = lambda *a, **k: None
+        app.dismiss_bulk_repair()
+
+    def tearDown(self):
+        app.SKILLS_DIR, app.SKILLS_DISABLED_DIR, app.BACKUP_DIR = self._orig
+        app._notify = self._orig_notify
+        app._BULK_REPAIR["running"] = False
+        app.dismiss_bulk_repair()
+        self.tmpdir.cleanup()
+
+    def _skill(self, name, description="trop court"):
+        d = self.skills_dir / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(
+            f'---\nname: {name}\ndescription: "{description}"\n---\n\nCorps.\n')
+        return d
+
+    def _targets(self, n):
+        return [{"name": f"s{i}", "description": "trop court",
+                 "quality": "enrich", "reason": "", "active": True,
+                 "source": "user"} for i in range(n)]
+
+    def test_probe_timeout_aborts_before_touching_any_skill(self):
+        for i in range(5):
+            self._skill(f"s{i}")
+        with patch.object(app, "_call_claude_cli",
+                          side_effect=subprocess.TimeoutExpired("claude", 90)):
+            app._BULK_REPAIR.update({"running": True, "total": 5, "done": 0,
+                                     "phase": "preflight"})
+            app._bulk_repair_worker(self._targets(5), None)
+        st = app.bulk_repair_status()
+        self.assertEqual(st["outcome"], "aborted")
+        self.assertEqual(st["done"], 0, "aucun skill ne doit avoir ete traite")
+        self.assertIn("n'a pas repondu", st["abort_reason"])
+        # les SKILL.md sont intacts
+        body = (self.skills_dir / "s0" / "SKILL.md").read_text()
+        self.assertIn('description: "trop court"', body)
+
+    def test_probe_measures_pace_for_eta(self):
+        self._skill("s0")
+        with patch.object(app, "_call_claude_cli", return_value="pong"):
+            ok, secs, err = app._bulk_repair_probe()
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertIsInstance(secs, float)
+
+    def test_empty_probe_answer_is_a_failure(self):
+        with patch.object(app, "_call_claude_cli", return_value="   "):
+            ok, _secs, err = app._bulk_repair_probe()
+        self.assertFalse(ok)
+        self.assertIn("sans aucun texte", err)
+
+    def test_stops_after_three_consecutive_failures(self):
+        for i in range(20):
+            self._skill(f"s{i}")
+        calls = {"n": 0}
+
+        def _suggest(name, lang=None):
+            calls["n"] += 1
+            return False, "Timeout : le CLI Claude n'a pas repondu en 120 s."
+
+        with patch.object(app, "_call_claude_cli", return_value="pong"), \
+             patch.object(app, "suggest_skill_description", side_effect=_suggest):
+            app._BULK_REPAIR.update({"running": True, "total": 20, "done": 0,
+                                     "phase": "preflight",
+                                     "started_monotonic": time.monotonic()})
+            app._bulk_repair_worker(self._targets(20), None)
+        st = app.bulk_repair_status()
+        self.assertEqual(st["outcome"], "aborted")
+        self.assertEqual(calls["n"], 3, "on ne doit pas tenter les 20 skills")
+        self.assertIn("echecs consecutifs", st["abort_reason"])
+
+    def test_consecutive_counter_resets_on_success(self):
+        seq = [False, False, True, False, False, True]
+        it = iter(seq)
+
+        def _suggest(name, lang=None):
+            ok = next(it)
+            return (True, {"suggestion": BulkRepairTests.GOOD}) if ok else (False, "boom")
+
+        for i in range(6):
+            self._skill(f"s{i}")
+        with patch.object(app, "_call_claude_cli", return_value="pong"), \
+             patch.object(app, "suggest_skill_description", side_effect=_suggest):
+            app._BULK_REPAIR.update({"running": True, "total": 6, "done": 0,
+                                     "phase": "preflight",
+                                     "started_monotonic": time.monotonic()})
+            app._bulk_repair_worker(self._targets(6), None)
+        st = app.bulk_repair_status()
+        self.assertEqual(st["done"], 6, "aucune serie n'atteint 3 echecs")
+        self.assertEqual(st["outcome"], "partial")
+
+
+class BulkRepairOutcomeTests(unittest.TestCase):
+    """v1.14.2 - l'UI affichait "Reparation terminee {done}/{total}" quel que
+    soit le resultat : {done} compte les skills TRAITES, pas les REPARES. Un
+    lot 100% en echec et un lot 100% reussi produisaient le meme texte.
+    """
+
+    def tearDown(self):
+        app._BULK_REPAIR["running"] = False
+        app.dismiss_bulk_repair()
+
+    def _state(self, results, **kw):
+        app._BULK_REPAIR.update({
+            "running": False, "total": kw.get("total", len(results)),
+            "done": len(results), "results": results, "phase": "finished",
+            "cancelled": kw.get("cancelled", False),
+            "aborted": kw.get("aborted", False),
+            "abort_reason": kw.get("abort_reason"),
+            "started_monotonic": kw.get("started_monotonic"),
+            "probe_seconds": kw.get("probe_seconds"),
+        })
+        return app.bulk_repair_status()
+
+    def test_all_failed_is_not_reported_as_finished(self):
+        st = self._state([{"name": f"s{i}", "ok": False, "error": "timeout"}
+                          for i in range(93)])
+        self.assertEqual(st["outcome"], "all_failed")
+        self.assertEqual(st["ok_count"], 0)
+        self.assertEqual(st["failed_count"], 93)
+
+    def test_partial_reports_both_counts(self):
+        res = [{"name": "a", "ok": True, "after": "x"},
+               {"name": "b", "ok": False, "error": "timeout"}]
+        st = self._state(res)
+        self.assertEqual(st["outcome"], "partial")
+        self.assertEqual((st["ok_count"], st["failed_count"]), (1, 1))
+
+    def test_success_outcome(self):
+        st = self._state([{"name": "a", "ok": True, "after": "x"}])
+        self.assertEqual(st["outcome"], "success")
+
+    def test_cancelled_is_distinct_from_finished(self):
+        st = self._state([{"name": "a", "ok": True, "after": "x"}],
+                         total=93, cancelled=True)
+        self.assertEqual(st["outcome"], "cancelled")
+        self.assertEqual(st["remaining"], 92)
+
+    def test_aborted_wins_over_cancelled(self):
+        st = self._state([{"name": "a", "ok": False, "error": "x"}],
+                         total=93, cancelled=True, aborted=True,
+                         abort_reason="3 echecs consecutifs")
+        self.assertEqual(st["outcome"], "aborted")
+
+    def test_idle_when_nothing_ran(self):
+        app.dismiss_bulk_repair()
+        st = app.bulk_repair_status()
+        self.assertEqual(st["outcome"], "idle")
+
+    def test_eta_uses_measured_pace(self):
+        app._BULK_REPAIR.update({
+            "running": True, "total": 10, "done": 2, "phase": "running",
+            "results": [{"name": "a", "ok": True}, {"name": "b", "ok": True}],
+            "started_monotonic": time.monotonic() - 20, "cancelled": False,
+            "aborted": False, "abort_reason": None, "probe_seconds": 5.0,
+        })
+        st = app.bulk_repair_status()
+        self.assertEqual(st["outcome"], "running")
+        self.assertAlmostEqual(st["seconds_per_skill"], 10.0, delta=1.5)
+        # 8 restants x ~10 s
+        self.assertAlmostEqual(st["eta_seconds"], 80, delta=15)
+
+    def test_dismiss_refuses_while_running(self):
+        app._BULK_REPAIR.update({"running": True})
+        ok, msg = app.dismiss_bulk_repair()
+        self.assertFalse(ok)
+        app._BULK_REPAIR["running"] = False
+
+    def test_dismiss_clears_report(self):
+        self._state([{"name": "a", "ok": True, "after": "x"}])
+        ok, _ = app.dismiss_bulk_repair()
+        self.assertTrue(ok)
+        self.assertEqual(app.bulk_repair_status()["outcome"], "idle")
 
 if __name__ == "__main__":
     unittest.main()
