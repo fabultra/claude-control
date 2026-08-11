@@ -28,9 +28,15 @@ class PartialOutputIsKeptTests(unittest.TestCase):
     def setUp(self):
         self._orig = app._claude_cli_path
         app._claude_cli_path = lambda: "/usr/local/bin/claude"
+        # v1.14.8 - l'echec de l'appel optimise est memorise pour la duree du
+        # process : sans remise a zero, un test precedent ferait sauter
+        # l'essai court et ces assertions mesureraient un autre chemin.
+        self._fallback = app._CLI_FALLBACK["used"]
+        app._CLI_FALLBACK["used"] = False
 
     def tearDown(self):
         app._claude_cli_path = self._orig
+        app._CLI_FALLBACK["used"] = self._fallback
 
     def _timeout_with(self, stdout=None, stderr=None):
         def boom(cmd, **kw):
@@ -113,9 +119,15 @@ class DiagnoseDoesARealCallTests(unittest.TestCase):
     def setUp(self):
         self._orig = app._claude_cli_path
         app._claude_cli_path = lambda: "/usr/local/bin/claude"
+        # v1.14.8 - l'echec de l'appel optimise est memorise pour la duree du
+        # process : sans remise a zero, un test precedent ferait sauter
+        # l'essai court et ces assertions mesureraient un autre chemin.
+        self._fallback = app._CLI_FALLBACK["used"]
+        app._CLI_FALLBACK["used"] = False
 
     def tearDown(self):
         app._claude_cli_path = self._orig
+        app._CLI_FALLBACK["used"] = self._fallback
 
     def _diag(self, ping):
         def fake_version(cmd, **kw):
