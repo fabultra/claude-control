@@ -725,6 +725,23 @@ _CLI_ENV_RECOVERED = {"vars": []}
 # ca le repli serait invisible et l'app tournerait degradee en silence.
 _CLI_FALLBACK = {"used": False}
 
+# v1.14.9 - repertoire de travail STABLE pour les appels au CLI.
+#
+# Chaque appel tournait dans un dossier temporaire neuf. Le CLI traite le
+# repertoire courant comme le projet courant : un chemin jamais vu, a chaque
+# fois, sous /var/folders. Un repertoire fixe, cree une fois, lui donne un
+# projet connu et constant -- et n'a aucun des effets d'un dossier inconnu.
+CLI_WORKDIR = HOME / ".claude/claude-control-cli-workdir"
+
+
+def _cli_workdir():
+    """Retourne le cwd des appels CLI, cree si besoin."""
+    try:
+        CLI_WORKDIR.mkdir(parents=True, exist_ok=True)
+        return str(CLI_WORKDIR)
+    except OSError:
+        return str(HOME)
+
 
 def _login_shell_env(timeout=8):
     """v1.14.4 - Environnement du shell de connexion de l'utilisateur.
@@ -815,6 +832,22 @@ def _cli_env():
                 env[k] = v
                 recovered.append(k)
     _CLI_ENV_RECOVERED["vars"] = recovered
+
+    # v1.14.9 - retirer les marqueurs de session Claude Code parente.
+    #
+    # Le diagnostic a etabli que depuis l'app, api.anthropic.com repond
+    # (HTTP 401), le binaire est sain, et pourtant meme l'appel NU cale --
+    # alors que ce meme appel repond dans le terminal de l'utilisateur. Il ne
+    # reste que ce que l'app transmet.
+    #
+    # Si Claude Control a ete demarre depuis une session Claude Code, son
+    # environnement porte CLAUDECODE=1 et les CLAUDE_CODE_* de cette session.
+    # Le CLI enfant les herite et ne se comporte plus comme un appel
+    # autonome. Un terminal ordinaire ne les a pas : d'ou "marche chez moi,
+    # cale depuis l'app".
+    for key in [k for k in env
+                if k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_")]:
+        del env[key]
     return env
 
 
@@ -932,10 +965,10 @@ def _cli_probe(optional, timeout=CLI_DIAG_PROBE_TIMEOUT):
         payload = f"{guidance}\n\n---\n\n{payload}"
     started = time.monotonic()
     try:
-        with tempfile.TemporaryDirectory(prefix="claude-control-probe-") as wd:
-            r = subprocess.run(cmd, input=payload,
-                               capture_output=True, text=True,
-                               timeout=timeout, env=_cli_env(), cwd=wd)
+        r = subprocess.run(cmd, input=payload,
+                           capture_output=True, text=True,
+                           timeout=timeout, env=_cli_env(),
+                           cwd=_cli_workdir())
     except subprocess.TimeoutExpired as e:
         return {"ok": False, "seconds": round(time.monotonic() - started, 1),
                 "error": f"timeout {timeout}s",
@@ -1176,10 +1209,9 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
         # repertoire comme le projet courant.
         started = time.monotonic()
         try:
-            with tempfile.TemporaryDirectory(prefix="claude-control-cli-") as workdir:
-                res = subprocess.run(cmd, input=payload, capture_output=True,
-                                     text=True, timeout=budget, env=env,
-                                     cwd=workdir)
+            res = subprocess.run(cmd, input=payload, capture_output=True,
+                                 text=True, timeout=budget, env=env,
+                                 cwd=_cli_workdir())
         except subprocess.TimeoutExpired as e:
             # v1.14.3 - la sortie partielle est la seule trace de CE QUE le
             # CLI faisait quand il a cale, et on la jetait : l'utilisateur

@@ -100,7 +100,10 @@ class CommandBuildingTests(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertIn("Reply with the single word: pong",
                       calls[0]["kw"]["input"])
-        self.assertIn("claude-control-probe", str(calls[0]["kw"]["cwd"]))
+        # v1.14.9 - plus de dossier temporaire neuf a chaque appel : la sonde
+        # et la production partagent le meme repertoire stable, sinon la
+        # sonde ne rejouerait pas l'appel de production.
+        self.assertEqual(calls[0]["kw"]["cwd"], app._cli_workdir())
         for arg in calls[0]["cmd"]:
             self.assertNotIn("Reply with the single word", arg)
 
