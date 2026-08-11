@@ -67,12 +67,18 @@ class CallClaudeCliTests(unittest.TestCase):
         for arg in self.calls[0]["cmd"]:
             self.assertFalse(arg.startswith("--- "), f"prompt fuite dans argv : {arg!r}")
 
-    def test_safe_mode_is_used(self):
-        """--safe-mode coupe MCP/hooks/plugins/CLAUDE.md tout en gardant
-        l'auth OAuth (contrairement a --bare)."""
+    def test_mcp_stack_is_not_started(self):
+        """v1.14.1 obtenait ca avec --safe-mode ; v1.14.6 l'a retire parce
+        que cette option bloquait le CLI 2.1.173 indefiniment. L'objectif
+        tient : ne pas demarrer les serveurs MCP de l'utilisateur avant de
+        generer une phrase. --strict-mcp-config avec une config vide le fait
+        sans toucher au reste du demarrage."""
         app._call_claude_cli("x")
         cmd = self.calls[0]["cmd"]
-        self.assertIn("--safe-mode", cmd)
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertEqual(cmd[cmd.index("--mcp-config") + 1],
+                         '{"mcpServers":{}}')
+        self.assertNotIn("--safe-mode", cmd)
         self.assertNotIn("--bare", cmd)
 
     def test_session_persistence_disabled(self):

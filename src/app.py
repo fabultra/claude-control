@@ -720,6 +720,11 @@ _SHELL_ENV_CACHE = {"done": False, "env": {}}
 # cause, et l'utilisateur doit le savoir.
 _CLI_ENV_RECOVERED = {"vars": []}
 
+# v1.14.6 - vrai des qu'un appel a du se replier sur la version nue. Sert a
+# signaler que les options optionnelles sont hors service sur ce CLI : sans
+# ca le repli serait invisible et l'app tournerait degradee en silence.
+_CLI_FALLBACK = {"used": False}
+
 
 def _login_shell_env(timeout=8):
     """v1.14.4 - Environnement du shell de connexion de l'utilisateur.
@@ -829,14 +834,36 @@ _CLI_DIAG_PROBE_TIMEOUT_MIN = 20
 # (mode print, sortie texte). Les autres sont des optimisations : chacune
 # peut etre retiree pour un test, ce qui rend le coupable identifiable.
 _CLI_CORE_FLAGS = ("-p", "--output-format", "text")
-_CLI_OPTIONAL_FLAGS = ("--safe-mode", "--no-session-persistence",
-                       "--disable-slash-commands")
+
+# v1.14.6 - `--safe-mode` retire : c'est LUI qui bloquait.
+#
+# Bissection sur la machine concernee (CLI 2.1.173) : l'appel nu repond,
+# `--safe-mode` ne rend jamais la main et n'ecrit rien. Il avait ete ajoute
+# en v1.14.1 pour une seule raison utile -- ne pas demarrer les vingt
+# serveurs MCP de l'utilisateur (Serena et sa fenetre de navigateur
+# comprises) avant de generer une phrase.
+#
+# `--strict-mcp-config` avec une config vide fait exactement ce travail, et
+# rien d'autre : aucun serveur MCP n'est charge, le reste du demarrage n'est
+# pas touche. Verifie en reel, meme reponse et meme temps que `--safe-mode`
+# la ou ce dernier fonctionne encore.
+#
+# Groupes et non chaines plates : une option qui porte une valeur doit etre
+# retiree ou ajoutee avec elle, sinon la bissection produirait un
+# `--mcp-config` orphelin.
+_CLI_OPTIONAL_FLAGS = (
+    ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'),
+    ("--no-session-persistence",),
+    ("--disable-slash-commands",),
+)
 
 
 def _cli_cmd(cli_path, optional=None, system_prompt=None):
-    """v1.14.4 - Construit la commande. `optional=()` donne l'appel nu."""
+    """v1.14.4 / v1.14.6 - Construit la commande. `optional=()` donne
+    l'appel nu ; sinon une sequence de groupes d'options."""
     flags = list(_CLI_CORE_FLAGS)
-    flags += list(_CLI_OPTIONAL_FLAGS if optional is None else optional)
+    for group in (_CLI_OPTIONAL_FLAGS if optional is None else optional):
+        flags += list(group)
     cmd = [cli_path] + flags
     if system_prompt:
         cmd += ["--system-prompt", system_prompt]
@@ -924,9 +951,9 @@ def _blame_cli_flag(reference_seconds=None):
     budget = _CLI_DIAG_PROBE_TIMEOUT_MIN if reference_seconds is None else \
         max(_CLI_DIAG_PROBE_TIMEOUT_MIN,
             min(CLI_DIAG_PROBE_TIMEOUT, round(reference_seconds * 4)))
-    for flag in _CLI_OPTIONAL_FLAGS:
-        if not _cli_probe((flag,), timeout=budget)["ok"]:
-            return flag
+    for group in _CLI_OPTIONAL_FLAGS:
+        if not _cli_probe((group,), timeout=budget)["ok"]:
+            return " ".join(group)
     return None
 
 
@@ -988,7 +1015,10 @@ def _diagnose_claude_cli():
         reply = _call_claude_cli(
             "Reply with the single word: pong",
             timeout=CLI_DIAG_PING_TIMEOUT,
-            system_prompt="Reply with exactly one word. No preamble.")
+            system_prompt="Reply with exactly one word. No preamble.",
+            # v1.14.6 - le diagnostic ne se rattrape pas : une sonde qui se
+            # replie mesurerait autre chose que l'appel de production.
+            allow_fallback=False)
         out["ping_seconds"] = round(time.monotonic() - started, 1)
         out["ping_ok"] = True
         out["ping_reply"] = reply[:120]
@@ -1069,9 +1099,10 @@ class ClaudeCliTimeout(Exception):
         super().__init__(msg)
 
 
-def _call_claude_cli(prompt, timeout=120, system_prompt=None):
-    """v1.9.3 / v1.9.4 / v1.9.5 / v1.14.1 - Invoque le CLI Claude Code en
-    mode print.
+def _call_claude_cli(prompt, timeout=120, system_prompt=None,
+                     allow_fallback=True):
+    """v1.9.3 / v1.9.4 / v1.9.5 / v1.14.1 / v1.14.6 - Invoque le CLI Claude
+    Code en mode print.
 
     v1.14.1 - trois changements, chacun corrige une facon dont l'appel
     pouvait "ne pas repondre" :
@@ -1083,14 +1114,15 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None):
        directement, l'appel echoue avant meme de demarrer. Passer par stdin
        supprime aussi toute limite ARG_MAX.
 
-    2. `--safe-mode` : demarre sans MCP, hooks, plugins, CLAUDE.md ni
-       commandes custom. Le CLI lancait sinon TOUTE la config MCP de
-       l'utilisateur avant de repondre -- sur une machine qui a une
-       vingtaine de MCPs dont certains en echec, le demarrage seul pouvait
-       depasser le timeout. On genere une phrase de description : aucun de
-       ces composants n'est utile. Important : contrairement a `--bare`,
-       `--safe-mode` garde l'authentification OAuth, donc pas besoin de clef
-       API.
+    2. Pas de serveurs MCP. Le CLI lancait sinon TOUTE la config MCP de
+       l'utilisateur avant de repondre -- sur une machine qui en a une
+       vingtaine, le demarrage seul pouvait depasser le timeout. On genere
+       une phrase de description : aucun de ces composants n'est utile.
+
+       v1.14.1 obtenait ca avec `--safe-mode`. v1.14.6 le retire : sur CLI
+       2.1.173, cette option ne rend jamais la main et n'ecrit rien -- c'est
+       elle qui cassait la reparation. `--strict-mcp-config` avec une config
+       vide fait le meme travail utile sans toucher au reste du demarrage.
 
     3. `--no-session-persistence` : sans ca, chaque suggestion ecrivait une
        session JSONL dans ~/.claude/projects -- le repertoire meme que
@@ -1103,35 +1135,70 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None):
     cli_path = _claude_cli_path()
     if not cli_path:
         raise FileNotFoundError("claude CLI not in PATH")
-    # v1.14.4 - flags isoles dans _cli_cmd : le diagnostic doit pouvoir
-    # rejouer exactement cet appel en les retirant, sinon un flag devenu
-    # toxique apres une mise a jour du CLI reste indetectable.
-    cmd = _cli_cmd(cli_path, system_prompt=system_prompt)
-    _log(f"_call_claude_cli: cli={cli_path} prompt_len={len(prompt)} timeout={timeout}")
     env = _cli_env()
-    # v1.14.1 - cwd neutre. Sinon le CLI herite du cwd du serveur ('/' quand
-    # Claude Control est lance depuis Finder) et traite ce repertoire comme
-    # le projet courant.
-    started = time.monotonic()
+
+    def _attempt(optional, budget):
+        # v1.14.4 - flags isoles dans _cli_cmd : le diagnostic doit pouvoir
+        # rejouer exactement cet appel en les retirant, sinon une option
+        # devenue toxique reste indetectable.
+        cmd = _cli_cmd(cli_path, optional=optional, system_prompt=system_prompt)
+        _log(f"_call_claude_cli: cli={cli_path} prompt_len={len(prompt)} "
+             f"timeout={budget} options={'completes' if optional is None else 'nues'}")
+        # v1.14.1 - cwd neutre. Sinon le CLI herite du cwd du serveur ('/'
+        # quand Claude Control est lance depuis Finder) et traite ce
+        # repertoire comme le projet courant.
+        started = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory(prefix="claude-control-cli-") as workdir:
+                res = subprocess.run(cmd, input=prompt, capture_output=True,
+                                     text=True, timeout=budget, env=env,
+                                     cwd=workdir)
+        except subprocess.TimeoutExpired as e:
+            # v1.14.3 - la sortie partielle est la seule trace de CE QUE le
+            # CLI faisait quand il a cale, et on la jetait : l'utilisateur
+            # voyait "n'a pas repondu en 120 s" sans jamais savoir pourquoi.
+            # subprocess remplit e.stdout/e.stderr avec ce qui avait ete
+            # ecrit avant le timeout (en bytes, meme avec text=True).
+            partial = _decode_partial(e.stdout) + _decode_partial(e.stderr)
+            _log(f"_call_claude_cli: TIMEOUT after {budget}s partial={partial[:400]!r}")
+            raise ClaudeCliTimeout(budget, partial)
+        _log(f"_call_claude_cli: exit={res.returncode} in "
+             f"{time.monotonic() - started:.1f}s "
+             f"out_len={len((res.stdout or '').strip())}")
+        return res
+
+    started_total = time.monotonic()
     try:
-        with tempfile.TemporaryDirectory(prefix="claude-control-cli-") as workdir:
-            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                               timeout=timeout, env=env, cwd=workdir)
-    except subprocess.TimeoutExpired as e:
-        # v1.14.3 - la sortie partielle est la seule trace de CE QUE le CLI
-        # faisait quand il a cale, et on la jetait : l'utilisateur voyait
-        # "n'a pas repondu en 120 s" sans jamais savoir pourquoi. subprocess
-        # remplit e.stdout/e.stderr avec ce qui avait ete ecrit avant le
-        # timeout (en bytes, meme avec text=True). Un CLI bloque sur une
-        # invite ("Do you trust the files in this folder?"), une erreur de
-        # proxy ou un message d'auth l'a deja affiche a ce stade.
-        partial = _decode_partial(e.stdout) + _decode_partial(e.stderr)
-        _log(f"_call_claude_cli: TIMEOUT after {timeout}s partial={partial[:400]!r}")
-        raise ClaudeCliTimeout(timeout, partial)
-    elapsed = time.monotonic() - started
+        r = _attempt(None, timeout)
+    except ClaudeCliTimeout as first:
+        # v1.14.6 - repli automatique sur l'appel nu.
+        #
+        # `--safe-mode` a fait perdre cinq semaines : l'option bloquait le
+        # CLI indefiniment, l'app rendait "n'a pas repondu en 120 s", et la
+        # fonctionnalite etait morte sans recours. Une option qui devient
+        # toxique -- mise a jour du CLI, version qui diverge -- ne doit pas
+        # pouvoir remettre l'app dans ce cul-de-sac : on retire les options
+        # optionnelles et on retente une fois. Elles sont des optimisations,
+        # pas des conditions de fonctionnement.
+        #
+        # Le repli est refuse au diagnostic (allow_fallback=False) : une
+        # sonde qui se rattrape toute seule mesurerait autre chose que
+        # l'appel de production et ne prouverait plus rien.
+        if not allow_fallback:
+            raise
+        _log("_call_claude_cli: repli sur l'appel nu apres timeout")
+        _CLI_FALLBACK["used"] = True
+        try:
+            r = _attempt((), max(30, timeout // 2))
+        except ClaudeCliTimeout:
+            # Les deux essais ont cale : on remonte le PREMIER. Annoncer le
+            # budget du repli ferait etat de 60 s la ou l'utilisateur a
+            # attendu 180 s, et designerait l'appel nu alors que c'est
+            # l'appel complet qui a echoue d'abord.
+            raise first
+    elapsed = time.monotonic() - started_total
     stdout = (r.stdout or "").strip()
     stderr = (r.stderr or "").strip()
-    _log(f"_call_claude_cli: exit={r.returncode} in {elapsed:.1f}s out_len={len(stdout)}")
     if r.returncode != 0:
         _log(f"_call_claude_cli: stdout={stdout[:300]!r} stderr={stderr[:300]!r}")
         combined = (stdout + " " + stderr).lower()
