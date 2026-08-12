@@ -6052,6 +6052,21 @@ body{background:linear-gradient(180deg,#fafaf9 0%,#f5f5f4 100%);}
 </div></header>
 <div id="banner" class="hidden mb-4 p-3 rounded-lg text-sm border"></div>
 <div id="toasts" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm pointer-events-none"></div>
+<!-- v1.14.10 - journal des erreurs. Une erreur qui disparait avant d'avoir
+     ete lue n'a pas ete affichee. Les messages rouges s'accumulent ici et
+     restent consultables et copiables. -->
+<button type="button" id="errlog-btn" onclick="toggleErrLog()" class="hidden fixed bottom-4 left-4 z-50 text-xs font-medium bg-red-600 hover:bg-red-700 text-white rounded-lg shadow-lg px-3 py-2"></button>
+<div id="errlog-panel" class="hidden fixed bottom-16 left-4 z-50 w-[min(32rem,calc(100vw-2rem))] bg-white border border-red-200 rounded-lg shadow-xl">
+  <div class="flex items-center justify-between px-3 py-2 border-b border-stone-200">
+    <strong class="text-sm text-red-800" data-i18n="errlog_title">Erreurs recentes</strong>
+    <div class="flex gap-2">
+      <button type="button" onclick="copyErrLog()" class="text-xs border border-stone-300 rounded px-2 py-0.5 hover:bg-stone-50" data-i18n="btn_copy">Copier</button>
+      <button type="button" onclick="clearErrLog()" class="text-xs border border-stone-300 rounded px-2 py-0.5 hover:bg-stone-50" data-i18n="errlog_clear">Vider</button>
+      <button type="button" onclick="toggleErrLog()" class="text-xs text-stone-500 hover:text-stone-800 px-1">&#10005;</button>
+    </div>
+  </div>
+  <pre id="errlog-body" class="text-[11px] p-3 max-h-64 overflow-auto whitespace-pre-wrap font-mono"></pre>
+</div>
 <div id="watchdog-widget" class="mb-4"></div>
 <nav id="main-tabs" class="flex gap-1 mb-6 bg-stone-100 p-1 rounded-lg overflow-x-auto">
 <button class="main-tab-btn flex-1 min-w-[80px] px-3 py-2 text-sm rounded-md font-medium" data-main-tab="overview" onclick="setMainTab('overview')" data-i18n="tab_overview">Vue d'ensemble</button>
@@ -6668,6 +6683,9 @@ fr: {
   repair_skill_not_logged_in_title: "Connexion Claude Code requise",
   repair_skill_not_logged_in_body: "Lance cette commande dans un terminal pour t'authentifier (une seule fois) :",
   btn_copy: "Copier",
+  errlog_btn: "{n} erreur(s) - voir",
+  errlog_title: "Erreurs recentes",
+  errlog_clear: "Vider",
   btn_open_terminal: "Ouvrir Terminal",
   copied: "Commande copiee",
   repair_skill_login_pending_hint: "Une fois 'Login successful' affiche dans Terminal, clique ci-dessous pour generer la description :",
@@ -7017,6 +7035,9 @@ en: {
   repair_skill_not_logged_in_title: "Claude Code login required",
   repair_skill_not_logged_in_body: "Run this command in a terminal to authenticate (one time only):",
   btn_copy: "Copy",
+  errlog_btn: "{n} error(s) - view",
+  errlog_title: "Recent errors",
+  errlog_clear: "Clear",
   btn_open_terminal: "Open Terminal",
   copied: "Command copied",
   repair_skill_login_pending_hint: "Once 'Login successful' shows in Terminal, click below to generate the description:",
@@ -7334,7 +7355,12 @@ function poll(fn, ms, label){
     if(!busy){
       busy = true;
       try{ await fn(); }
-      catch(e){ console.error('poll ' + (label||'') , e); }
+      catch(e){
+        // v1.14.10 - une erreur de sondage n'allait que dans la
+        // console : invisible pour qui n'ouvre pas les devtools.
+        console.error('poll ' + (label||'') , e);
+        try{ errLogPush((label||'poll') + ' : ' + (e && e.message || e)); }catch(_){}
+      }
       finally{ busy = false; }
     }
     setTimeout(tick, ms);
@@ -9084,7 +9110,60 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Escape'){closeSavePreset();closeMcpError();closeAddPlugin();closeCmdEdit();}
   if(e.key==='Enter' && !document.getElementById('preset-modal').classList.contains('hidden') && document.activeElement.id==='preset-name-in'){e.preventDefault();confirmSavePreset();}
 });
-function banner(c,m){const b=document.getElementById('banner');const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];b.textContent=m;b.classList.remove('hidden');setTimeout(()=>b.classList.add('hidden'),4500);toast(c,m);}
+// v1.14.10 - une erreur ne s'efface plus toute seule.
+//
+// banner() masquait apres 4,5 s et toast() apres 7 s, quelle que soit la
+// gravite -- et il n'y a qu'un seul #banner, donc deux messages successifs
+// s'ecrasaient. Au rechargement, plusieurs erreurs pouvaient defiler sans
+// qu'aucune soit lisible. Un message qu'on ne peut pas lire n'a pas ete
+// affiche.
+//
+// Les messages rouges restent jusqu'a fermeture explicite et sont archives
+// dans le journal, consultable et copiable a tout moment.
+const ERR_LOG = [];
+function errLogPush(m){
+  const msg = String(m);
+  const last = ERR_LOG[ERR_LOG.length - 1];
+  // Un sondage qui echoue toutes les 5 s remplirait le journal d'une seule
+  // et meme erreur et noierait les autres : on compte les repetitions.
+  if(last && last.m === msg){ last.n = (last.n || 1) + 1; errLogRender(); return; }
+  ERR_LOG.push({t:new Date().toLocaleTimeString(), m:msg, n:1});
+  if(ERR_LOG.length > 50) ERR_LOG.shift();
+  errLogRender();
+}
+function errLogText(){
+  return ERR_LOG.map(e=>'['+e.t+'] '+e.m+(e.n>1?'  (x'+e.n+')':'')).join('\n');
+}
+function errLogRender(){
+  const btn = document.getElementById('errlog-btn');
+  const body = document.getElementById('errlog-body');
+  if(!btn || !body) return;
+  btn.classList.toggle('hidden', ERR_LOG.length === 0);
+  btn.textContent = tr('errlog_btn').replace('{n}', String(ERR_LOG.length));
+  body.textContent = errLogText();
+}
+function toggleErrLog(){
+  const p = document.getElementById('errlog-panel');
+  if(p) p.classList.toggle('hidden');
+}
+function copyErrLog(){
+  navigator.clipboard.writeText(errLogText()).then(()=>toast('green', tr('copied')));
+}
+function clearErrLog(){
+  ERR_LOG.length = 0;
+  errLogRender();
+  const p = document.getElementById('errlog-panel');
+  if(p) p.classList.add('hidden');
+}
+function banner(c,m){
+  const b=document.getElementById('banner');
+  const cls={green:'bg-green-50 text-green-800 border-green-200',red:'bg-red-50 text-red-800 border-red-200',blue:'bg-blue-50 text-blue-800 border-blue-200'};
+  b.className='mb-4 p-3 rounded-lg text-sm border '+cls[c];
+  b.textContent=m;
+  b.classList.remove('hidden');
+  if(c!=='red') setTimeout(()=>b.classList.add('hidden'),4500);
+  toast(c,m);
+}
 // v1.12.1 - toast bottom-right toujours visible peu importe le scroll. La
 // banniere classique reste pour le top de page mais ne sert plus a rien
 // quand l'utilisateur est scrolle dans la liste des plugins.
@@ -9109,15 +9188,27 @@ function toast(c,m,opts){
   });
   // v1.13.2 - persiste plus longtemps quand il y a une action, l'user
   // a besoin de temps pour cliquer.
-  const ttl = actions.length ? 12000 : 7000;
+  // v1.14.10 - une erreur ne part JAMAIS toute seule : elle attend d'etre
+  // fermee, et elle est archivee dans le journal pour rester relisable.
+  const ttl = c === 'red' ? 0 : (actions.length ? 12000 : 7000);
+  if(c === 'red') errLogPush(m);
   wrap.appendChild(el);
   requestAnimationFrame(()=>{el.style.opacity='1';el.style.transform='translateY(0)';});
-  setTimeout(()=>{el.style.opacity='0';el.style.transform='translateY(8px)';setTimeout(()=>el.remove(),200);}, ttl);
+  if(ttl) setTimeout(()=>{el.style.opacity='0';el.style.transform='translateY(8px)';setTimeout(()=>el.remove(),200);}, ttl);
 }
 async function _revealPathInFinder(path){
   if(!path) return;
   try{ await api('/api/reveal-path', {path: path}); }catch(e){ console.error(e); }
 }
+// v1.14.10 - erreurs non rattrapees : elles n'atterrissaient que dans la
+// console. Elles rejoignent le journal, seul endroit ou l'utilisateur peut
+// les relire apres coup.
+window.addEventListener('error', function(e){
+  try{ errLogPush('JS : ' + (e.message || e.error || 'erreur inconnue')); }catch(_){}
+});
+window.addEventListener('unhandledrejection', function(e){
+  try{ errLogPush('Promise : ' + ((e.reason && e.reason.message) || e.reason)); }catch(_){}
+});
 applyLang(CURRENT_LANG);setMainTab(CURRENT_MAIN_TAB);loadOverview();loadState();loadPresets();loadPlugins();loadCommands();loadClaudeMd();loadSettings();loadWatchdog();loadWatchdogTab();checkUpdate();poll(loadOverview,10000,'overview');poll(loadState,5000,'state');poll(loadPlugins,15000,'plugins');poll(loadCommands,30000,'commands');poll(loadWatchdog,10000,'watchdog');poll(loadWatchdogTab,10000,'watchdogTab');poll(checkUpdate,3600000,'update');refreshBulkRepair();
 </script></body></html>"""
 
