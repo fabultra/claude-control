@@ -784,6 +784,51 @@ def _cli_workdir():
         return str(HOME)
 
 
+# v1.14.14 - le CLI traite son cwd comme un projet, et un projet JAMAIS
+# approuve peut declencher la question de confiance ("Do you trust the files
+# in this folder?") -- observee mot pour mot dans une sortie partielle a
+# l'epoque de v1.14.3. Posee via /dev/tty par un process sans terminal, la
+# question ne s'affiche nulle part et n'obtient jamais de reponse : gel
+# silencieux, zero octet ecrit -- le symptome exact. L'epoque ou "ca
+# marchait" (<= v1.13.4) n'imposait aucun cwd : le CLI heritait d'un dossier
+# deja connu. Depuis v1.14.1/v1.14.9, il tourne dans un dossier cree par
+# l'app, que personne n'a jamais approuve.
+#
+# On ecrit donc dans ~/.claude.json, AVANT le premier appel, l'entree que le
+# CLI enregistre lui-meme quand on repond oui a la question. Best-effort :
+# fichier absent (CLI jamais lance) ou structure inattendue -> on ne touche
+# a rien. Une seule ecriture par vie du process, et aucune si l'entree est
+# deja la -- pour ne pas jouer des coudes avec les ecritures du CLI.
+_CLI_WORKDIR_TRUSTED = {"done": False}
+
+
+def _pretrust_cli_workdir():
+    if _CLI_WORKDIR_TRUSTED["done"]:
+        return
+    _CLI_WORKDIR_TRUSTED["done"] = True
+    try:
+        if not CLI_CONFIG_PATH.exists():
+            return
+        data = json.loads(CLI_CONFIG_PATH.read_text(errors="replace") or "{}")
+        if not isinstance(data, dict):
+            return
+        projects = data.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            return
+        wd = _cli_workdir()
+        entry = projects.get(wd)
+        if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted"):
+            return
+        entry = entry if isinstance(entry, dict) else {}
+        entry["hasTrustDialogAccepted"] = True
+        entry["hasCompletedProjectOnboarding"] = True
+        projects[wd] = entry
+        _atomic_write_json(CLI_CONFIG_PATH, data)
+        _log(f"_pretrust_cli_workdir: {wd} approuve dans {CLI_CONFIG_PATH.name}")
+    except Exception as e:
+        _log(f"_pretrust_cli_workdir: ignore ({type(e).__name__}: {e})")
+
+
 def _login_shell_env(timeout=8):
     """v1.14.4 - Environnement du shell de connexion de l'utilisateur.
 
@@ -1161,12 +1206,13 @@ def _cli_probe(optional, timeout=CLI_DIAG_PROBE_TIMEOUT):
     payload = "Reply with the single word: pong"
     if bare:
         payload = f"{guidance}\n\n---\n\n{payload}"
+    _pretrust_cli_workdir()
     started = time.monotonic()
     try:
         r = subprocess.run(cmd, input=payload,
                            capture_output=True, text=True,
                            timeout=timeout, env=_cli_env(),
-                           cwd=_cli_workdir())
+                           cwd=_cli_workdir(), start_new_session=True)
     except subprocess.TimeoutExpired as e:
         return {"ok": False, "seconds": round(time.monotonic() - started, 1),
                 "error": f"timeout {timeout}s",
@@ -1205,6 +1251,20 @@ def _blame_cli_flag(reference_seconds=None):
 
 
 def _diagnose_claude_cli():
+    """v1.14.14 - Enveloppe publique : ajoute la version de l'app et TRACE le
+    diagnostic complet dans le log fichier. Jusqu'ici le verdict ne vivait
+    que dans l'UI : impossible de le retrouver apres coup, et l'utilisateur
+    devait le retranscrire a la main pour le partager."""
+    out = _diagnose_claude_cli_stages()
+    out["app_version"] = get_local_version()
+    try:
+        _log("cli-diagnose: " + json.dumps(out, ensure_ascii=False)[:2000])
+    except Exception:
+        pass
+    return out
+
+
+def _diagnose_claude_cli_stages():
     """v1.9.4 / v1.14.3 - Diagnostic du CLI Claude Code.
 
     v1.14.3 - le diagnostic ne lancait que `claude --version`, qui teste le
@@ -1255,7 +1315,7 @@ def _diagnose_claude_cli():
     out["stage"] = "version"
     try:
         r = subprocess.run([cli, "--version"], capture_output=True, text=True,
-                           timeout=10, env=_cli_env())
+                           timeout=10, env=_cli_env(), start_new_session=True)
         out["version"] = (r.stdout or "").strip() or (r.stderr or "").strip()
         if r.returncode != 0:
             out["error"] = (f"--version sort en {r.returncode} : "
@@ -1360,9 +1420,11 @@ def _cli_debug_tail(timeout=25):
     guidance = "Reply with exactly one word. No preamble."
     payload = f"{guidance}\n\n---\n\nReply with the single word: pong"
     cmd = [cli, "--debug"] + list(_CLI_CORE_FLAGS)
+    _pretrust_cli_workdir()
     try:
         r = subprocess.run(cmd, input=payload, capture_output=True, text=True,
-                           timeout=timeout, env=_cli_env(), cwd=_cli_workdir())
+                           timeout=timeout, env=_cli_env(), cwd=_cli_workdir(),
+                           start_new_session=True)
         tail = ((r.stderr or "") + "\n" + (r.stdout or "")).strip()
     except subprocess.TimeoutExpired as e:
         tail = (_decode_partial(e.stderr) + "\n" + _decode_partial(e.stdout)).strip()
@@ -1445,6 +1507,7 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
     if not cli_path:
         raise FileNotFoundError("claude CLI not in PATH")
     env = _cli_env()
+    _pretrust_cli_workdir()
 
     def _attempt(optional, budget):
         # v1.14.4 - flags isoles dans _cli_cmd : le diagnostic doit pouvoir
@@ -1467,11 +1530,17 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
         # v1.14.1 - cwd neutre. Sinon le CLI herite du cwd du serveur ('/'
         # quand Claude Control est lance depuis Finder) et traite ce
         # repertoire comme le projet courant.
+        #
+        # v1.14.14 - start_new_session : le subprocess n'a AUCUN terminal de
+        # controle, meme quand l'app est lancee depuis un terminal de dev.
+        # Toute question interactive que le CLI tenterait via /dev/tty
+        # echoue alors immediatement au lieu d'attendre une reponse que
+        # personne ne verra : un gel invisible devient une erreur visible.
         started = time.monotonic()
         try:
             res = subprocess.run(cmd, input=payload, capture_output=True,
                                  text=True, timeout=budget, env=env,
-                                 cwd=_cli_workdir())
+                                 cwd=_cli_workdir(), start_new_session=True)
         except subprocess.TimeoutExpired as e:
             # v1.14.3 - la sortie partielle est la seule trace de CE QUE le
             # CLI faisait quand il a cale, et on la jetait : l'utilisateur
@@ -7233,6 +7302,7 @@ fr: {
   bulk_failed_list: "{f} en échec — voir le détail",
   bulk_ok_list: "{n} réécrites — voir le détail",
   bulk_repair_synced_btn: "+ {n} skills synchronisés",
+  cli_diag_copy: "Copier le rapport",
   bulk_terminal_btn: "Réparer via le Terminal",
   bulk_terminal_title: "Ouvre Terminal.app et y exécute les appels claude — dans TON environnement, celui où le CLI fonctionne. L'app applique les résultats automatiquement.",
   bulk_terminal_sub: "via la fenêtre Terminal — laisse-la ouverte",
@@ -7589,6 +7659,7 @@ en: {
   bulk_failed_list: "{f} failed — show details",
   bulk_ok_list: "{n} rewritten — show details",
   bulk_repair_synced_btn: "+ {n} synced skills",
+  cli_diag_copy: "Copy report",
   bulk_terminal_btn: "Repair via Terminal",
   bulk_terminal_title: "Opens Terminal.app and runs the claude calls there — in YOUR environment, where the CLI works. The app applies the results automatically.",
   bulk_terminal_sub: "via the Terminal window — keep it open",
@@ -8914,6 +8985,13 @@ function cliDiagVerdict(d){
     text: tr('cli_diag_ping_stuck').replace('{p}', d.partial.substring(0,300))};
   return {tone:'red', text: tr('cli_diag_ping_silent').replace('{s}', String(d.ping_seconds))};
 }
+let LAST_CLI_DIAG_REPORT = '';
+function copyCliDiagReport(){
+  if(!LAST_CLI_DIAG_REPORT) return;
+  navigator.clipboard.writeText(LAST_CLI_DIAG_REPORT)
+    .then(()=>banner('green', tr('copied')))
+    .catch(()=>banner('red', 'Copie impossible'));
+}
 async function diagClaudeCli(target){
   // v1.14.3 - le resultat s'affiche dans l'UI (pas dans un alert() qu'on
   // ne peut ni copier ni relire) et commence par le verdict.
@@ -8960,11 +9038,17 @@ async function diagClaudeCli(target){
     if (d.env_recovered && d.env_recovered.length) rows.push('env shell: ' + d.env_recovered.join(', '));
     if (d.debug_tail) rows.push('--- journal --debug du CLI (la derniere ligne = ou il bloque) ---\n' + d.debug_tail);
     const facts = rows.join('\n');
+    // v1.14.14 - le rapport complet est copiable en un clic : c'est la seule
+    // facon fiable de le faire voyager jusqu'a quelqu'un qui peut agir.
+    LAST_CLI_DIAG_REPORT = 'Claude Control ' + (d.app_version || '?')
+      + ' — diagnostic CLI\n' + v.text + '\n' + facts;
     if (!box){ alert(v.text + '\n\n' + facts); return d; }
     box.innerHTML = '<strong class="' + (v.tone==='green'?'text-green-700':'text-red-700') + '">'
       + escAttr(v.text) + '</strong>'
       + '<pre class="mt-1 text-[10px] bg-stone-100 rounded p-1.5 overflow-x-auto">'
-      + escAttr(facts) + '</pre>';
+      + escAttr(facts) + '</pre>'
+      + '<button onclick="copyCliDiagReport()" class="mt-1 text-[10px] underline text-stone-600 hover:text-stone-900">'
+      + escAttr(tr('cli_diag_copy')) + '</button>';
     return d;
   } catch(e){
     if (box) box.innerHTML = '<span class="text-red-700">Diag failed: ' + escAttr(e.message) + '</span>';
