@@ -1033,6 +1033,112 @@ def _check_api_reachable(env=None, timeout=12):
         return False, f"{type(e).__name__}: {e}"
 
 
+# v1.14.13 - nom du coffre Keychain du CLI Claude Code sur macOS. Si le CLI
+# d'une version future range son jeton ailleurs, la sonde repond "missing" --
+# un constat neutre, jamais un verdict d'authentification cassee.
+CLI_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _check_cli_credentials(timeout=6):
+    """v1.14.13 - Le jeton du CLI est-il accessible DEPUIS L'APP ?
+
+    Toutes les preuves accumulees depuis v1.14.3 dessinent le meme trou :
+    binaire sain, reseau sain (HTTP 401), et un CLI qui cale AVANT d'ecrire
+    le moindre octet -- alors qu'il repond dans le terminal. Ce qui se passe
+    avant le premier octet, c'est le chargement du jeton. Sur macOS il vit
+    dans le Keychain, et une ACL Keychain est liee au BINAIRE qui accede :
+    un node different de celui du terminal (le defaut v1.14.11/12) suffit a
+    declencher une demande d'autorisation -- parfois invisible depuis un
+    process lance par launchd. Aucune version n'avait teste ce maillon.
+
+    Retourne (status, detail) :
+      - "ok"      : jeton lisible (le SECRET N'EST JAMAIS conserve ni logge)
+      - "blocked" : le Keychain ne repond pas -> autorisation en attente,
+                    c'est le gel observe
+      - "missing" : pas d'item sous ce nom (autre emplacement possible)
+      - "file"    : jeton en fichier (.credentials.json), Keychain hors jeu
+      - "skipped" / "error"
+    """
+    cfg_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
+    try:
+        if (cfg_dir / ".credentials.json").is_file():
+            return "file", ".credentials.json present - le Keychain n'est pas en jeu"
+    except OSError:
+        pass
+    if sys.platform != "darwin":
+        return "skipped", "pas de Keychain hors macOS"
+    started = time.monotonic()
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", CLI_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "blocked", (
+            f"le Keychain n'a pas rendu le jeton en {timeout} s : macOS "
+            "attend une autorisation que personne ne voit. C'est tres "
+            "probablement LE blocage. Correctif : ouvre Trousseaux d'acces, "
+            "ou lance une reparation via le Terminal (bouton dans l'app).")
+    except FileNotFoundError:
+        return "error", "outil `security` introuvable"
+    except Exception as e:
+        return "error", f"{type(e).__name__}: {e}"
+    # r.stdout contient le jeton : on ne le lit pas, on ne le garde pas.
+    if r.returncode == 0:
+        return "ok", f"jeton accessible en {time.monotonic() - started:.1f} s"
+    if r.returncode == 44:
+        return "missing", (f"aucun item '{CLI_KEYCHAIN_SERVICE}' dans le "
+                           "Keychain (cette version du CLI le range peut-etre "
+                           "ailleurs) - constat neutre")
+    return "error", f"security exit {r.returncode}: {(r.stderr or '').strip()[:120]}"
+
+
+def _check_cli_node():
+    """v1.14.13 - Quel node executerait le CLI, et repond-il ?
+
+    Le CLI npm est un script `#!/usr/bin/env node` : le node resolu par le
+    PATH du subprocess est celui qui compte. Un node x86_64 sur un Mac arm64
+    passe par Rosetta ; si Rosetta n'est pas installee, macOS attend une
+    boite de dialogue et le lancement ne rend jamais la main -- un
+    `node --version` qui ne repond pas en 6 s EST le verdict.
+    """
+    env = _cli_env()
+    node = shutil.which("node", path=env.get("PATH"))
+    out = {"node_path": node, "node_version": None, "node_warning": None}
+    if not node:
+        out["node_warning"] = ("aucun `node` dans le PATH du subprocess - "
+                               "un CLI npm ne peut pas demarrer")
+        return out
+    try:
+        r = subprocess.run([node, "--version"], capture_output=True,
+                           text=True, timeout=6, env=env)
+        out["node_version"] = (r.stdout or r.stderr or "").strip()[:40] or None
+    except subprocess.TimeoutExpired:
+        out["node_version"] = None
+        out["node_warning"] = ("`node --version` ne repond pas en 6 s : "
+                               "binaire gele (Rosetta manquante ?) - c'est "
+                               "tres probablement LE blocage")
+        return out
+    except Exception as e:
+        out["node_version"] = f"{type(e).__name__}"
+        return out
+    if sys.platform == "darwin":
+        try:
+            arch = subprocess.run(["uname", "-m"], capture_output=True,
+                                  text=True, timeout=5)
+            kind = subprocess.run(["file", "-b", node], capture_output=True,
+                                  text=True, timeout=5)
+            if ("arm64" in (arch.stdout or "")
+                    and "x86_64" in (kind.stdout or "")
+                    and "arm64" not in (kind.stdout or "")):
+                out["node_warning"] = ("node x86_64 sur Mac arm64 : execution "
+                                       "via Rosetta - lent, et gel garanti si "
+                                       "Rosetta n'est pas installee")
+        except Exception:
+            pass
+    return out
+
+
 def _cli_probe(optional, timeout=CLI_DIAG_PROBE_TIMEOUT):
     """v1.14.4 - Un aller-retour reel avec un jeu de flags donne.
 
@@ -1119,6 +1225,15 @@ def _diagnose_claude_cli():
     echoue, le CLI va bien et c'est le contenu envoye qui cale. S'il echoue,
     la panne est dans le CLI ou son authentification, et la sortie partielle
     dit sur quoi il bloque.
+
+    v1.14.13 - deux sondes AVANT le ping, rapides et decisives, sur les deux
+    maillons que huit versions de correctifs n'avaient jamais testes : le
+    node qui execute le script CLI (Rosetta ?), et l'acces au jeton Keychain
+    depuis l'app (ACL liee au binaire). Si l'une des deux rend un verdict de
+    gel, on repond en quelques secondes au lieu de faire patienter 60 s de
+    ping voue a caler sur la meme cause. Et quand tout le reste a echoue
+    sans verdict, une derniere sonde `--debug` capture le journal de
+    demarrage du CLI : la ou il s'arrete d'ecrire EST l'etape qui bloque.
     """
     cli = _claude_cli_path()
     out = {"available": False, "path": cli or None, "version": None,
@@ -1128,7 +1243,11 @@ def _diagnose_claude_cli():
            "network_ok": None, "network_detail": None,
            "minimal_ok": None, "minimal_seconds": None,
            "blamed_flag": None, "env_recovered": [],
-           "not_logged_in": False}
+           "not_logged_in": False,
+           # v1.14.13
+           "creds_status": None, "creds_detail": None,
+           "node_path": None, "node_version": None, "node_warning": None,
+           "debug_tail": None}
     if not cli:
         out["error"] = "claude introuvable dans le PATH"
         return out
@@ -1149,6 +1268,20 @@ def _diagnose_claude_cli():
         out["error"] = f"{type(e).__name__}: {e}"
         return out
     out["available"] = True
+
+    # v1.14.13 - le node d'abord (gratuit), le jeton ensuite (<= 6 s).
+    out["stage"] = "node"
+    node_info = _check_cli_node()
+    out.update(node_info)
+    if node_info.get("node_warning") and "ne repond pas" in node_info["node_warning"]:
+        out["error"] = node_info["node_warning"]
+        return out
+
+    out["stage"] = "creds"
+    out["creds_status"], out["creds_detail"] = _check_cli_credentials()
+    if out["creds_status"] == "blocked":
+        out["error"] = out["creds_detail"]
+        return out
 
     out["stage"] = "ping"
     started = time.monotonic()
@@ -1202,7 +1335,42 @@ def _diagnose_claude_cli():
     if minimal["ok"]:
         out["stage"] = "blame"
         out["blamed_flag"] = _blame_cli_flag()
+    else:
+        # v1.14.13 - binaire sain, node sain, jeton lisible, reseau joignable,
+        # appel nu qui cale quand meme : plus aucun etage fidele n'a de
+        # verdict. Dernier recours : demander au CLI lui-meme ou il s'arrete.
+        out["stage"] = "debug"
+        out["debug_tail"] = _cli_debug_tail()
     return out
+
+
+def _cli_debug_tail(timeout=25):
+    """v1.14.13 - Le journal de demarrage du CLI, par le CLI.
+
+    `--debug` fait ecrire au CLI chaque etape de son demarrage sur stderr.
+    Quand il cale sans rien dire, la DERNIERE ligne ecrite avant le timeout
+    nomme l'etape ou il s'est arrete -- exactement l'information que huit
+    versions de correctifs ont du deviner. Sonde ADDITIONNELLE, clairement
+    etiquetee : elle ne remplace jamais les sondes fideles a la production
+    (elle ajoute un flag), elle temoigne seulement.
+    """
+    cli = _claude_cli_path()
+    if not cli:
+        return None
+    guidance = "Reply with exactly one word. No preamble."
+    payload = f"{guidance}\n\n---\n\nReply with the single word: pong"
+    cmd = [cli, "--debug"] + list(_CLI_CORE_FLAGS)
+    try:
+        r = subprocess.run(cmd, input=payload, capture_output=True, text=True,
+                           timeout=timeout, env=_cli_env(), cwd=_cli_workdir())
+        tail = ((r.stderr or "") + "\n" + (r.stdout or "")).strip()
+    except subprocess.TimeoutExpired as e:
+        tail = (_decode_partial(e.stderr) + "\n" + _decode_partial(e.stdout)).strip()
+        tail = (tail + "\n[coupe au timeout de la sonde --debug : la "
+                "derniere ligne ci-dessus est l'etape qui bloque]").strip()
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return tail[-800:] if tail else None
 
 
 class ClaudeCliNotLoggedIn(Exception):
@@ -1455,21 +1623,13 @@ _SUGGEST_SYSTEM_PROMPT = (
 )
 
 
-def suggest_skill_description(name, body_max_chars=4000, lang=None):
-    """v1.9.3 / v1.9.6 - Genere une description suggeree pour un skill via
-    le CLI Claude Code.
-
-    v1.9.6 : ajout du parametre `lang` ('fr'|'en'|None). Le system prompt
-    inclut une directive 'Respond in {lang}' pour que la suggestion match
-    la langue voulue par l'utilisateur (par defaut, langue de l'UI Claude
-    Control). Sans lang, le LLM suit ses propres instincts (souvent EN
-    parce que le system prompt est en anglais).
-    """
+def _suggestion_prompts(name, body_max_chars=4000, lang=None):
+    """v1.14.13 - Construit (system_prompt, prompt) pour la suggestion d'un
+    skill. Extrait de suggest_skill_description pour que la reparation via
+    le Terminal envoie EXACTEMENT les memes prompts que le chemin
+    subprocess. Retourne (ok, dict|message)."""
     if not name:
         return False, "Nom de skill requis"
-    if not _claude_cli_path():
-        return False, ("Claude Code CLI ('claude') introuvable dans le PATH. "
-                       "Installer avec : npm install -g @anthropic-ai/claude-code")
     target = _find_skill_dir(name)
     if not target:
         return False, f"Skill '{name}' introuvable"
@@ -1492,13 +1652,37 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
     # v1.14.1 - la consigne part dans --system-prompt, le message utilisateur
     # ne porte plus que la matiere. Avant, tout etait concatene dans le
     # prompt utilisateur, ce qui diluait la consigne et rendait la sortie
-    # beaucoup plus bavarde (d'ou l'heuristique de nettoyage plus bas).
-    system_prompt = _SUGGEST_SYSTEM_PROMPT + lang_directive
-    prompt = (
-        f"Skill folder name: {name}\n\n"
-        f"SKILL.md content:\n```\n{content}\n```\n\n"
-        f"Write the description field value now, and nothing else."
-    )
+    # beaucoup plus bavarde (d'ou l'heuristique de nettoyage).
+    return True, {
+        "system_prompt": _SUGGEST_SYSTEM_PROMPT + lang_directive,
+        "prompt": (
+            f"Skill folder name: {name}\n\n"
+            f"SKILL.md content:\n```\n{content}\n```\n\n"
+            f"Write the description field value now, and nothing else."
+        ),
+        "content": content,
+    }
+
+
+def suggest_skill_description(name, body_max_chars=4000, lang=None):
+    """v1.9.3 / v1.9.6 - Genere une description suggeree pour un skill via
+    le CLI Claude Code.
+
+    v1.9.6 : ajout du parametre `lang` ('fr'|'en'|None). Le system prompt
+    inclut une directive 'Respond in {lang}' pour que la suggestion match
+    la langue voulue par l'utilisateur (par defaut, langue de l'UI Claude
+    Control). Sans lang, le LLM suit ses propres instincts (souvent EN
+    parce que le system prompt est en anglais).
+    """
+    if not _claude_cli_path():
+        return False, ("Claude Code CLI ('claude') introuvable dans le PATH. "
+                       "Installer avec : npm install -g @anthropic-ai/claude-code")
+    ok, built = _suggestion_prompts(name, body_max_chars=body_max_chars,
+                                    lang=lang)
+    if not ok:
+        return False, built
+    system_prompt, prompt, content = (built["system_prompt"],
+                                      built["prompt"], built["content"])
     _log(f"suggest_skill_description: name={name} chars_sent={len(content)} lang={lang}")
     try:
         raw_response = _call_claude_cli(prompt, system_prompt=system_prompt)
@@ -1528,14 +1712,29 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
         _log(f"suggest_skill_description: exception {type(e).__name__} : {e}")
         return False, f"Erreur appel CLI ({type(e).__name__}) : {e}"
     _log(f"suggest_skill_description: raw response len={len(raw_response or '')} preview={(raw_response or '')[:200]!r}")
-    # v1.9.2 - sanitize plus agressif. Haiku peut retourner :
-    # - du markdown (## prefix, **bold**, > quote, * list)
-    # - des prefixes 'Description:', 'Here is the description:'
-    # - des quotes triple ou single
-    # - du preamble multi-ligne ('Sure! Here is...\n\nUse this skill for X')
-    # On nettoie chaque ligne puis on prend la plus longue / la plus
-    # substantive (heuristique : la 'vraie' description est generalement
-    # la ligne la plus longue dans la reponse).
+    suggestion = _clean_suggestion(raw_response)
+    if not suggestion:
+        _log(f"suggest_skill_description: empty after sanitization (raw was {raw_response[:200]!r})")
+        return False, f"API a retourne une suggestion vide ou non parsable. Raw : {(raw_response or '')[:150]!r}"
+    return True, {
+        "suggestion": suggestion,
+        "source": "claude_cli",
+        "chars_sent": len(content),
+        "raw_chars": len(raw_response or ""),
+        "lang": lang,
+    }
+
+
+def _clean_suggestion(raw_response):
+    """v1.9.2 / v1.14.1 / v1.14.13 - Nettoie une reponse de modele en une
+    description exploitable. Extrait de suggest_skill_description pour que la
+    reparation via le Terminal (v1.14.13) applique EXACTEMENT le meme
+    nettoyage que le chemin subprocess. Retourne "" si rien d'exploitable.
+
+    Le modele peut retourner : du markdown (## prefix, **bold**, > quote),
+    des prefixes 'Description:' / 'Here is the description:', des quotes
+    triple ou single, du preamble multi-ligne.
+    """
     def _strip_line(s):
         s = s.strip()
         while s and s[0] in '#>*-':
@@ -1586,16 +1785,7 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
         cut = suggestion[:700]
         dot = max(cut.rfind(". "), cut.rfind(" ! "), cut.rfind(" ? "))
         suggestion = (cut[:dot + 1] if dot > 200 else cut).strip()
-    if not suggestion:
-        _log(f"suggest_skill_description: empty after sanitization (raw was {raw_response[:200]!r})")
-        return False, f"API a retourne une suggestion vide ou non parsable. Raw : {(raw_response or '')[:150]!r}"
-    return True, {
-        "suggestion": suggestion,
-        "source": "claude_cli",
-        "chars_sent": len(content),
-        "raw_chars": len(raw_response or ""),
-        "lang": lang,
-    }
+    return suggestion
 
 
 # === REPARATION EN LOT ===
@@ -1616,6 +1806,10 @@ _BULK_REPAIR = {
     "abort_reason": None,
     "probe_seconds": None,    # duree mesuree d'un appel CLI trivial
     "started_monotonic": None,
+    # v1.14.13 - "cli" (subprocess) ou "terminal" (run dans Terminal.app).
+    # L'UI de progression est la meme ; le mode change le sous-texte et le
+    # message d'annulation.
+    "mode": "cli",
 }
 _BULK_REPAIR_LOCK = threading.Lock()
 
@@ -1730,6 +1924,13 @@ def cancel_bulk_repair():
         if not _BULK_REPAIR["running"]:
             return False, "Aucune réparation en cours"
         _BULK_REPAIR["cancelled"] = True
+        mode = _BULK_REPAIR.get("mode", "cli")
+    if mode == "terminal":
+        # v1.14.13 - l'app cesse d'appliquer les resultats ; le script, lui,
+        # tourne dans la fenetre Terminal de l'utilisateur, qu'on ne ferme
+        # pas a sa place.
+        return True, ("Annulation demandée — ferme aussi la fenêtre Terminal "
+                      "pour arrêter les appels en cours")
     return True, "Annulation demandée — le skill en cours se termine"
 
 
@@ -1744,6 +1945,7 @@ def dismiss_bulk_repair():
             "results": [], "done": 0, "total": 0, "phase": "idle",
             "aborted": False, "abort_reason": None, "cancelled": False,
             "started_at": None, "finished_at": None, "started_monotonic": None,
+            "mode": "cli",
         })
     return True, "Compte rendu effacé"
 
@@ -1882,11 +2084,257 @@ def start_bulk_repair(lang=None, include_synced=False):
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "finished_at": None, "phase": "preflight", "aborted": False,
             "abort_reason": None, "probe_seconds": None,
-            "started_monotonic": time.monotonic(),
+            "started_monotonic": time.monotonic(), "mode": "cli",
         })
     threading.Thread(target=_bulk_repair_worker, args=(targets, lang),
                      name="claude-control-bulk-repair", daemon=True).start()
     return True, {"message": f"Vérification du CLI, puis {len(targets)} skill(s)",
+                  "total": len(targets), "started": True}
+
+
+# === REPARATION VIA LE TERMINAL ===
+#
+# v1.14.13 - huit versions ont tente de faire ressembler le subprocess de
+# l'app au terminal de l'utilisateur (PATH, proxy, session imbriquee, cwd,
+# node, binaire, flags). Chaque correctif a elimine UNE difference ; la
+# classe des differences possibles, elle, est sans fond -- et "ca marche
+# dans mon terminal, ca cale depuis l'app" a survecu a tous. Ce mode
+# retourne le probleme : au lieu de reconstruire l'environnement du
+# terminal, il execute les appels DANS le terminal. Terminal.app lance un
+# script genere par l'app ; `claude` y tourne avec le vrai shell, le vrai
+# PATH, le vrai node et le vrai contexte Keychain de l'utilisateur --
+# l'environnement prouve par definition. L'app surveille les fichiers de
+# sortie et applique les descriptions elle-meme : les prompts, le nettoyage
+# et l'ecriture des frontmatters restent le code teste cote app. Ce chemin
+# fonctionne PAR CONSTRUCTION, quelle que soit la difference residuelle.
+TERMINAL_REPAIR_DIR = HOME / ".claude/claude-control-terminal-repair"
+# Au-dela de ce silence (aucun nouveau resultat), on considere que la
+# fenetre Terminal a ete fermee -- ou que le CLI y est bloque aussi, ce qui
+# serait en soi un verdict interessant.
+TERMINAL_REPAIR_STALL_SECONDS = 240
+
+
+def _shell_display_label(s):
+    """Nom de skill embarque dans le script bash pour affichage : on retire
+    tout caractere qui pourrait s'echapper d'une chaine double-quotee."""
+    return re.sub(r'[^A-Za-z0-9 ._-]', '_', str(s))[:80]
+
+
+def _build_terminal_repair_run(targets, lang):
+    """Ecrit prompts + plan.json + run.sh dans un dossier de run horodate.
+
+    Le script est volontairement TRIVIAL : une boucle de
+    `claude -p --output-format text < prompt > out`, la forme nue prouvee.
+    Chaque sortie passe par un .tmp puis `mv` (atomique sur le meme volume)
+    pour que le watcher ne lise jamais un fichier a moitie ecrit. err-N.txt
+    existe des le lancement (redirection) : il ne prouve un echec qu'une
+    fois le run termine sans out-N.txt.
+    """
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = TERMINAL_REPAIR_DIR / ts
+    run_dir.mkdir(parents=True, exist_ok=False)
+    entries = []
+    for i, item in enumerate(targets):
+        ok, built = _suggestion_prompts(item["name"], lang=lang)
+        if not ok:
+            entries.append({"index": i, "name": item["name"],
+                            "skipped": str(built)})
+            continue
+        # Meme convention que l'appel nu de _call_claude_cli : la consigne
+        # voyage dans le prompt, seul canal prouve.
+        payload = f"{built['system_prompt']}\n\n---\n\n{built['prompt']}"
+        (run_dir / f"prompt-{i:03d}.txt").write_text(payload)
+        entries.append({"index": i, "name": item["name"]})
+    _atomic_write_json(run_dir / "plan.json",
+                       {"created": ts, "lang": lang, "targets": entries})
+    runnable = [e for e in entries if "skipped" not in e]
+    lines = [
+        "#!/bin/bash",
+        "# Genere par Claude Control - reparation des skills via le Terminal.",
+        "# Chaque appel `claude` tourne dans TON environnement de terminal,",
+        "# celui ou le CLI fonctionne. Claude Control lit les out-*.txt et",
+        "# ecrit les descriptions lui-meme. Fermer cette fenetre annule.",
+        'DIR="$(cd "$(dirname "$0")" && pwd)"',
+        f"TOTAL={len(runnable)}",
+        'echo "Claude Control - reparation de $TOTAL skill(s) via ton terminal."',
+        "echo",
+    ]
+    for k, e in enumerate(runnable, start=1):
+        i = e["index"]
+        label = _shell_display_label(e["name"])
+        lines += [
+            f'echo "[{k}/$TOTAL] {label}"',
+            (f'claude -p --output-format text'
+             f' < "$DIR/prompt-{i:03d}.txt"'
+             f' > "$DIR/.out-{i:03d}.tmp"'
+             f' 2> "$DIR/err-{i:03d}.txt"'
+             f' && mv "$DIR/.out-{i:03d}.tmp" "$DIR/out-{i:03d}.txt"'
+             f' || echo "  ECHEC (voir err-{i:03d}.txt)"'),
+        ]
+    lines += [
+        'touch "$DIR/DONE"',
+        "echo",
+        'echo "Termine - retourne dans Claude Control, les resultats y sont appliques."',
+        "",
+    ]
+    script = run_dir / "run.sh"
+    script.write_text("\n".join(lines))
+    script.chmod(0o755)
+    return run_dir, script
+
+
+def _terminal_repair_watcher(run_dir, targets, lang):
+    """Suit les out-*.txt du run Terminal et applique les descriptions.
+
+    Reutilise l'etat _BULK_REPAIR : l'UI de progression existante suit ce
+    mode sans changement. La cloture (resultats, notification) est la meme
+    que _bulk_repair_worker.
+    """
+    by_name = {t["name"]: t for t in targets}
+    try:
+        plan = json.loads((run_dir / "plan.json").read_text())
+    except Exception as e:
+        _bulk_repair_abort(f"Plan de réparation illisible : {e}")
+        return
+    runnable, skipped = {}, []
+    for e in plan.get("targets", []):
+        if "skipped" in e:
+            skipped.append(e)
+        else:
+            runnable[int(e["index"])] = e["name"]
+    with _BULK_REPAIR_LOCK:
+        for e in skipped:
+            _BULK_REPAIR["results"].append(
+                {"name": e["name"], "ok": False, "error": e["skipped"]})
+            _BULK_REPAIR["done"] += 1
+
+    def _apply(i, name):
+        out_file = run_dir / f"out-{i:03d}.txt"
+        raw = ""
+        if out_file.exists():
+            try:
+                raw = out_file.read_text(errors="replace")
+            except Exception:
+                raw = ""
+        entry = {"name": name,
+                 "before": (by_name.get(name) or {}).get("description", "")}
+        suggestion = _clean_suggestion(raw)
+        if not suggestion:
+            err_file = run_dir / f"err-{i:03d}.txt"
+            tail = []
+            if err_file.exists():
+                try:
+                    tail = _read_log_tail(err_file, max_lines=4,
+                                          max_bytes=4000)
+                except Exception:
+                    tail = []
+            detail = " / ".join(t.strip() for t in tail if t.strip())[:200]
+            entry.update({"ok": False,
+                          "error": ("Aucune sortie exploitable du Terminal."
+                                    + (f" stderr : {detail}" if detail else ""))})
+        else:
+            ok2, msg2 = repair_skill(name, description=suggestion)
+            entry.update({"ok": bool(ok2), "after": suggestion,
+                          "error": None if ok2 else str(msg2)})
+        with _BULK_REPAIR_LOCK:
+            _BULK_REPAIR["results"].append(entry)
+            _BULK_REPAIR["done"] += 1
+
+    processed = set()
+    last_progress = time.monotonic()
+    cancelled = False
+    while True:
+        with _BULK_REPAIR_LOCK:
+            cancelled = _BULK_REPAIR["cancelled"]
+        if cancelled:
+            break
+        progressed = False
+        for i in sorted(set(runnable) - processed):
+            if (run_dir / f"out-{i:03d}.txt").exists():
+                processed.add(i)
+                progressed = True
+                _apply(i, runnable[i])
+        if progressed:
+            last_progress = time.monotonic()
+        if (run_dir / "DONE").exists():
+            # Le run est fini : ce qui n'a pas de out-N.txt a echoue dans le
+            # Terminal -- err-N.txt porte le pourquoi.
+            for i in sorted(set(runnable) - processed):
+                processed.add(i)
+                _apply(i, runnable[i])
+            break
+        if time.monotonic() - last_progress > TERMINAL_REPAIR_STALL_SECONDS:
+            _bulk_repair_abort(
+                f"Aucun résultat du Terminal depuis "
+                f"{TERMINAL_REPAIR_STALL_SECONDS // 60} min — fenêtre fermée, "
+                f"ou le CLI y est bloqué aussi (ce qui serait un vrai verdict : "
+                f"lance le diagnostic). Les skills déjà traités sont appliqués.")
+            return
+        time.sleep(1.5)
+    with _BULK_REPAIR_LOCK:
+        _BULK_REPAIR["running"] = False
+        _BULK_REPAIR["current"] = None
+        _BULK_REPAIR["phase"] = "finished"
+        _BULK_REPAIR["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        total = _BULK_REPAIR["total"]
+        repaired = sum(1 for r in _BULK_REPAIR["results"] if r.get("ok"))
+        failed = sum(1 for r in _BULK_REPAIR["results"] if not r.get("ok"))
+        was_cancelled = _BULK_REPAIR["cancelled"]
+    head = ("Reparation des skills annulee" if was_cancelled
+            else "Reparation des skills terminee")
+    _notify(head, f"{repaired} repares, {failed} en echec, sur {total} (via Terminal)")
+
+
+def start_terminal_repair(lang=None, include_synced=False, names=None):
+    """v1.14.13 - Lance la reparation dans Terminal.app (cf. bloc ci-dessus).
+
+    `names` optionnel : restreint aux skills nommes (bouton de la modal de
+    reparation d'un skill unique).
+    """
+    with _BULK_REPAIR_LOCK:
+        if _BULK_REPAIR["running"]:
+            return False, "Une réparation est déjà en cours"
+    targets = _repairable_user_skills(include_synced=include_synced)
+    if names:
+        wanted = {str(n) for n in names}
+        targets = [t for t in targets if t["name"] in wanted]
+    if not targets:
+        return True, {"message": "Aucun skill à réparer", "total": 0,
+                      "started": False}
+    try:
+        run_dir, script = _build_terminal_repair_run(targets, lang)
+    except Exception as e:
+        return False, f"Préparation du run impossible : {e}"
+    # Le chemin est genere par l'app sous HOME : pas de guillemet dedans en
+    # pratique ; les doubles quotes du shell sont echappees pour AppleScript
+    # par _osa_quote.
+    shell_cmd = f'bash "{script}"'
+    osa = ('tell application "Terminal"\n'
+           '  activate\n'
+           f'  do script "{_osa_quote(shell_cmd, 500)}"\n'
+           'end tell')
+    try:
+        r = subprocess.run(["osascript", "-e", osa], capture_output=True,
+                           text=True, timeout=10)
+        if r.returncode != 0:
+            return False, ("Ouverture du Terminal impossible : "
+                           f"{(r.stderr or '').strip()[:200]}")
+    except Exception as e:
+        return False, f"Ouverture du Terminal impossible : {e}"
+    with _BULK_REPAIR_LOCK:
+        _BULK_REPAIR.update({
+            "running": True, "total": len(targets), "done": 0,
+            "current": None, "results": [], "cancelled": False, "lang": lang,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None, "phase": "running", "aborted": False,
+            "abort_reason": None, "probe_seconds": None,
+            "started_monotonic": time.monotonic(), "mode": "terminal",
+        })
+    threading.Thread(target=_terminal_repair_watcher,
+                     args=(run_dir, targets, lang),
+                     name="claude-control-terminal-repair",
+                     daemon=True).start()
+    return True, {"message": f"Terminal ouvert — {len(targets)} skill(s) en cours",
                   "total": len(targets), "started": True}
 
 
@@ -6785,6 +7233,10 @@ fr: {
   bulk_failed_list: "{f} en échec — voir le détail",
   bulk_ok_list: "{n} réécrites — voir le détail",
   bulk_repair_synced_btn: "+ {n} skills synchronisés",
+  bulk_terminal_btn: "Réparer via le Terminal",
+  bulk_terminal_title: "Ouvre Terminal.app et y exécute les appels claude — dans TON environnement, celui où le CLI fonctionne. L'app applique les résultats automatiquement.",
+  bulk_terminal_sub: "via la fenêtre Terminal — laisse-la ouverte",
+  confirm_terminal_repair: "Réparer via le Terminal ?\n\n• Une fenêtre Terminal s'ouvre et exécute un appel claude par skill, dans TON environnement (celui où le CLI fonctionne)\n• Chaque SKILL.md est sauvegardé en .zip avant écriture\n• Les descriptions sont appliquées automatiquement par l'app\n• Fermer la fenêtre Terminal annule ce qui reste\n\nCONTINUER ?",
   bulk_repair_synced_title: "Ces skills viennent de la synchronisation de ton compte Claude (~/.claude/skills/synced/). Les réparer localement fonctionne, mais une resynchro peut écraser la modification.",
   confirm_bulk_repair_synced: "Réparer AUSSI les skills synchronisés depuis ton compte Claude ?\n\n⚠ Ils vivent dans ~/.claude/skills/synced/ : une resynchronisation du compte peut écraser la nouvelle description.\n\n• Un backup .zip est créé pour chacun\n• Environ 7 secondes par skill\n\nCONTINUER ?",
   chip_broken_action: "à corriger (sans description)",
@@ -7137,6 +7589,10 @@ en: {
   bulk_failed_list: "{f} failed — show details",
   bulk_ok_list: "{n} rewritten — show details",
   bulk_repair_synced_btn: "+ {n} synced skills",
+  bulk_terminal_btn: "Repair via Terminal",
+  bulk_terminal_title: "Opens Terminal.app and runs the claude calls there — in YOUR environment, where the CLI works. The app applies the results automatically.",
+  bulk_terminal_sub: "via the Terminal window — keep it open",
+  confirm_terminal_repair: "Repair via the Terminal?\n\n• A Terminal window opens and runs one claude call per skill, in YOUR environment (where the CLI works)\n• Each SKILL.md is backed up as .zip before writing\n• Descriptions are applied automatically by the app\n• Closing the Terminal window cancels what remains\n\nCONTINUE?",
   bulk_repair_synced_title: "These skills come from your Claude account sync (~/.claude/skills/synced/). Repairing them locally works, but a re-sync may overwrite the change.",
   confirm_bulk_repair_synced: "ALSO repair skills synced from your Claude account?\n\n⚠ They live in ~/.claude/skills/synced/: an account re-sync may overwrite the new description.\n\n• A .zip backup is created for each\n• About 7 seconds per skill\n\nCONTINUE?",
   chip_broken_action: "to fix (no description)",
@@ -7692,6 +8148,20 @@ function _renderHealthBanner(skills){
 // clics et 24 modales ; chaque appel CLI prend ~7 s, donc le lot tourne en
 // tache de fond cote serveur et l'UI suit la progression.
 let BULK_REPAIR_TIMER = null;
+// v1.14.13 - meme reparation, executee dans Terminal.app. C'est le chemin
+// qui fonctionne par construction quand le subprocess de l'app cale : le CLI
+// tourne dans le VRAI environnement de l'utilisateur (shell, PATH, node,
+// Keychain), l'app lit les resultats et ecrit les frontmatters elle-meme.
+async function startTerminalRepair(names){
+  if(!confirm(tr('confirm_terminal_repair'))) return;
+  try{
+    const body = {lang: CURRENT_LANG};
+    if(names && names.length) body.names = names;
+    const j = await api('/api/repair-all-terminal', body);
+    banner(j.success?'blue':'red', j.message);
+    if(j.success) pollBulkRepair();
+  }catch(e){ banner('red', String(e.message || e)); }
+}
 async function startBulkRepair(includeSynced){
   const key = includeSynced ? 'confirm_bulk_repair_synced' : 'confirm_bulk_repair';
   if(!confirm(tr(key))) return;
@@ -7782,6 +8252,7 @@ async function refreshBulkRepair(){
     sub = tr('bulk_preflight_sub');
   }else if(st.running){
     const bits = [];
+    if(st.mode === 'terminal') bits.push(escAttr(tr('bulk_terminal_sub')));
     if(st.current) bits.push(escAttr(st.current));
     if(st.eta_seconds != null) bits.push(tr('bulk_eta').replace('{t}', _fmtDuration(st.eta_seconds)));
     else if(st.seconds_per_skill) bits.push(tr('bulk_pace').replace('{s}', String(st.seconds_per_skill)));
@@ -7791,9 +8262,17 @@ async function refreshBulkRepair(){
   }else if(st.elapsed_seconds != null){
     sub = tr('bulk_elapsed').replace('{t}', _fmtDuration(st.elapsed_seconds));
   }
+  // v1.14.13 - quand un lot CLI vient d'echouer, la voie de secours est a
+  // un clic : refaire le meme lot via le Terminal (mode 'cli' seulement --
+  // se proposer soi-meme comme secours de soi-meme n'aurait pas de sens).
+  const offerTerminal = !st.running && st.mode !== 'terminal'
+    && (st.outcome === 'aborted' || st.outcome === 'all_failed' || st.outcome === 'partial');
+  const terminalBtn = offerTerminal
+    ? `<button onclick="startTerminalRepair()" title="${escAttr(tr('bulk_terminal_title'))}" class="text-xs px-2.5 py-1 rounded-full bg-green-700 hover:bg-green-800 text-white font-medium">${escAttr(tr('bulk_terminal_btn'))}</button>`
+    : '';
   const actions = st.running
     ? `<button onclick="cancelBulkRepair()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${escAttr(tr('bulk_repair_cancel'))}</button>`
-    : `<button onclick="dismissBulkRepair()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${escAttr(tr('bulk_close'))}</button>`;
+    : `<span class="inline-flex gap-1.5">${terminalBtn}<button onclick="dismissBulkRepair()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${escAttr(tr('bulk_close'))}</button></span>`;
   const errList = failed.length
     ? `<details class="mt-2" ${st.running ? '' : 'open'}><summary class="text-xs text-red-700 cursor-pointer">${escAttr(tr('bulk_failed_list').replace('{f}', String(failed.length)))}</summary>
        <ul class="mt-1 text-xs text-red-700 list-disc pl-5 max-h-40 overflow-y-auto">`
@@ -8470,10 +8949,16 @@ async function diagClaudeCli(target){
       'ping: ' + (d.ping_ok ? (d.ping_reply||'ok') : (tr('cli_diag_failed') + (d.ping_seconds!=null ? ' (' + d.ping_seconds + 's)' : ''))),
     ];
     // v1.14.4 - les sondes ne s'affichent que si elles ont tourne.
+    // v1.14.13 - node et jeton d'abord : les deux maillons jamais testes
+    // avant, et les deux seuls qui expliquent un gel sans un octet ecrit.
+    if (d.node_path) rows.push('node: ' + d.node_path + (d.node_version ? ' (' + d.node_version + ')' : ''));
+    if (d.node_warning) rows.push('node !! ' + d.node_warning);
+    if (d.creds_status) rows.push('jeton CLI: ' + d.creds_status + (d.creds_detail ? ' — ' + d.creds_detail : ''));
     if (d.network_detail) rows.push('api.anthropic.com: ' + (d.network_ok ? 'ok' : 'KO') + ' (' + d.network_detail + ')');
     if (d.minimal_ok != null) rows.push('appel nu / bare call: ' + (d.minimal_ok ? 'ok (' + d.minimal_seconds + 's)' : tr('cli_diag_failed')));
     if (d.blamed_flag) rows.push('option en cause: ' + d.blamed_flag);
     if (d.env_recovered && d.env_recovered.length) rows.push('env shell: ' + d.env_recovered.join(', '));
+    if (d.debug_tail) rows.push('--- journal --debug du CLI (la derniere ligne = ou il bloque) ---\n' + d.debug_tail);
     const facts = rows.join('\n');
     if (!box){ alert(v.text + '\n\n' + facts); return d; }
     box.innerHTML = '<strong class="' + (v.tone==='green'?'text-green-700':'text-red-700') + '">'
@@ -8541,8 +9026,15 @@ async function suggestSkillDescription(){
         // demander a l'utilisateur d'aller taper une commande dans un
         // terminal. Le diag rejoue le meme appel avec les memes flags : son
         // verdict dit si le CLI est en panne ou si c'est ce skill-ci qui cale.
+        // v1.14.13 - et la voie de secours est offerte tout de suite : le
+        // meme appel, execute dans le Terminal de l'utilisateur, ou le CLI
+        // fonctionne par definition.
         setMeta(
           '<strong>&#9888; ' + escAttr(msg) + '</strong>'
+          + '<div class="mt-2"><button onclick="var n=CURRENT_REPAIR_SKILL;closeRepairSkill();startTerminalRepair([n])" '
+          + 'title="' + escAttr(tr('bulk_terminal_title')) + '" '
+          + 'class="text-xs px-2.5 py-1 rounded-full bg-green-700 hover:bg-green-800 text-white font-medium">'
+          + escAttr(tr('bulk_terminal_btn')) + '</button></div>'
           + '<div id="repair-skill-diag" class="mt-2"></div>',
           'red'
         );
@@ -9580,6 +10072,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/repair-skill": lambda: repair_skill(data.get("name", ""), data.get("description"), data.get("name_override")),
             "/api/repair-all-skills": lambda: start_bulk_repair(
                 data.get("lang"), bool(data.get("include_synced", False))),
+            # v1.14.13 - meme reparation, executee dans Terminal.app : le
+            # chemin qui fonctionne par construction quand le subprocess cale.
+            "/api/repair-all-terminal": lambda: start_terminal_repair(
+                data.get("lang"), bool(data.get("include_synced", False)),
+                data.get("names")),
             "/api/repair-all-cancel": lambda: cancel_bulk_repair(),
             "/api/repair-all-dismiss": lambda: dismiss_bulk_repair(),
             "/api/suggest-skill-description": lambda: suggest_skill_description(data.get("name", ""), lang=data.get("lang")),
