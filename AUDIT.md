@@ -1,5 +1,9 @@
 # Audit de code — Claude Control v1.13.4
 
+> **Audit plus récent : [AUDIT-v1.14.12.md](AUDIT-v1.14.12.md)** — mené sur
+> v1.14.11 (symptôme « la réparation des skills timeout encore »), constats
+> critiques corrigés en v1.14.12.
+
 > **Statut : les 12 constats sont corrigés en v1.14.0.**
 > Ce document reste le diagnostic d'origine — il explique *pourquoi* le code
 > a changé. Chaque correctif porte un commentaire `v1.14.0` à l'endroit

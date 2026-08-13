@@ -1,0 +1,26 @@
+# v1.14.12 - la suite (375+ tests, ~5 s) existait depuis v1.14.0 mais
+# n'etait executee par AUCUN workflow : release.yml publie sur simple push
+# de version.txt, et rien ne tournait sur les PRs. Chaque regression
+# partait donc en release si personne ne pensait a lancer unittest.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile check
+        run: python3 -m py_compile src/app.py
+
+      - name: Run test suite
+        run: python3 -m unittest discover -s tests -v

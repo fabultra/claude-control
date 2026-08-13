@@ -48,12 +48,18 @@ class CallClaudeCliTests(unittest.TestCase):
         # sur l'appel au binaire claude, pas sur la recuperation d'env.
         self._orig_shell_cache = dict(app._SHELL_ENV_CACHE)
         app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
+        # v1.14.12 - l'echelle de repli est un etat de process : un test qui
+        # la fait descendre (unknown option, timeout) ne doit pas decaler les
+        # assertions des tests suivants.
+        self._orig_fallback = dict(app._CLI_FALLBACK)
+        app._CLI_FALLBACK.update({"used": False, "rung": 0})
 
     def tearDown(self):
         app.subprocess.run = self._orig_run
         app._claude_cli_path = self._orig_path
         app._SHELL_ENV_CACHE.clear()
         app._SHELL_ENV_CACHE.update(self._orig_shell_cache)
+        app._CLI_FALLBACK.update(self._orig_fallback)
 
     def test_prompt_goes_through_stdin_not_argv(self):
         app._call_claude_cli("---\nname: demo\n---\nbody")
@@ -107,14 +113,16 @@ class CallClaudeCliTests(unittest.TestCase):
 
     def test_the_proven_call_gets_a_generous_timeout(self):
         """v1.14.7 - le budget genereux va desormais a l'appel NU, seul
-        prouve sur les CLI concernes. L'appel optimise n'a qu'un essai
-        court : le depasser signifie qu'il ne repondra pas."""
+        prouve sur les CLI concernes. Les appels optimises n'ont qu'un essai
+        court chacun : le depasser signifie qu'ils ne repondront pas.
+        v1.14.12 : l'echelle compte un barreau intermediaire (MCP coupes),
+        lui aussi limite a l'essai court."""
         calls = self.calls
         orig = app.subprocess.run
 
         def stall_then_answer(cmd, **kw):
             calls.append({"cmd": cmd, "kw": kw})
-            if len(calls) == 1:
+            if len(calls) < 3:
                 raise subprocess.TimeoutExpired("claude", kw["timeout"])
             return _FakeCompleted(stdout="une description")
 
@@ -124,7 +132,8 @@ class CallClaudeCliTests(unittest.TestCase):
         finally:
             app.subprocess.run = orig
         self.assertEqual(calls[0]["kw"]["timeout"], app.CLI_FAST_PATH_TIMEOUT)
-        self.assertGreaterEqual(calls[1]["kw"]["timeout"], 120)
+        self.assertEqual(calls[1]["kw"]["timeout"], app.CLI_FAST_PATH_TIMEOUT)
+        self.assertGreaterEqual(calls[2]["kw"]["timeout"], 120)
 
     def test_unknown_option_error_is_named(self):
         app.subprocess.run = lambda cmd, **kw: _FakeCompleted(
