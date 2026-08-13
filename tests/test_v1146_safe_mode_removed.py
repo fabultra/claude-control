@@ -18,6 +18,13 @@ attendait 120 s puis affichait "le CLI n'a pas repondu". Les options
 optionnelles sont des optimisations, pas des conditions de fonctionnement --
 quand l'appel complet cale, l'app retente desormais sans elles.
 
+v1.14.12 - le repli descend une ECHELLE (cf. _CLI_RUNGS) au lieu de tout
+jeter d'un coup : d'abord seules les options non essentielles sont
+retirees (--strict-mcp-config est conserve, sinon l'appel de secours
+recharge la config MCP complete de l'utilisateur), l'appel nu reste le
+filet final. Les tests de ce fichier sont mis a jour en consequence ;
+leur intention d'origine est inchangee.
+
 Le repli est refuse au diagnostic : une sonde qui se rattrape toute seule
 mesurerait autre chose que l'appel de production, et ne prouverait plus rien.
 """
@@ -63,14 +70,14 @@ class FallbackTests(unittest.TestCase):
         app._claude_cli_path = lambda: "/bin/claude"
         self._shell = dict(app._SHELL_ENV_CACHE)
         app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
-        app._CLI_FALLBACK["used"] = False
+        app._CLI_FALLBACK.update({"used": False, "rung": 0})
 
     def tearDown(self):
         app.subprocess.run = self._orig_run
         app._claude_cli_path = self._orig_path
         app._SHELL_ENV_CACHE.clear()
         app._SHELL_ENV_CACHE.update(self._shell)
-        app._CLI_FALLBACK["used"] = False
+        app._CLI_FALLBACK.update({"used": False, "rung": 0})
 
     def _run_with(self, behaviour):
         def fake(cmd, **kw):
@@ -79,66 +86,84 @@ class FallbackTests(unittest.TestCase):
 
         app.subprocess.run = fake
 
-    def _stall_then_answer(self):
+    def _stall_until(self, answer_at):
+        """Cale les (answer_at - 1) premiers essais, repond au suivant."""
         def behaviour(n, cmd, kw):
-            if n == 1:
+            if n < answer_at:
                 raise subprocess.TimeoutExpired("claude", kw["timeout"])
             return _Done(stdout="pong")
 
         self._run_with(behaviour)
 
     def test_timeout_falls_back_and_succeeds(self):
-        self._stall_then_answer()
+        self._stall_until(2)
         self.assertEqual(app._call_claude_cli("x"), "pong")
         self.assertEqual(len(self.calls), 2)
 
-    def test_fallback_drops_the_optional_options(self):
-        self._stall_then_answer()
+    def test_first_fallback_keeps_the_mcp_neutralisation(self):
+        """v1.14.12 - le premier barreau de repli conserve
+        --strict-mcp-config : sans lui, l'appel de secours recharge la
+        config MCP complete de l'utilisateur -- la lenteur exacte que
+        l'option existe pour eviter."""
+        self._stall_until(2)
+        app._call_claude_cli("x")
+        self.assertIn("--strict-mcp-config", self.calls[1]["cmd"])
+        self.assertNotIn("--no-session-persistence", self.calls[1]["cmd"])
+        self.assertNotIn("--disable-slash-commands", self.calls[1]["cmd"])
+
+    def test_final_fallback_drops_the_optional_options(self):
+        self._stall_until(3)
         app._call_claude_cli("x")
         for group in app._CLI_OPTIONAL_FLAGS:
             for member in group:
-                self.assertNotIn(member, self.calls[1]["cmd"])
+                self.assertNotIn(member, self.calls[2]["cmd"])
 
     def test_fallback_keeps_the_core_options(self):
         """Sans -p ni --output-format, la reponse n'est plus exploitable."""
-        self._stall_then_answer()
+        self._stall_until(3)
         app._call_claude_cli("x")
-        self.assertIn("-p", self.calls[1]["cmd"])
-        self.assertEqual(
-            self.calls[1]["cmd"][self.calls[1]["cmd"].index("--output-format") + 1],
-            "text")
+        for call in self.calls[1:]:
+            self.assertIn("-p", call["cmd"])
+            self.assertEqual(
+                call["cmd"][call["cmd"].index("--output-format") + 1],
+                "text")
 
     def test_fallback_still_sends_the_prompt_through_stdin(self):
-        self._stall_then_answer()
+        self._stall_until(3)
         app._call_claude_cli("---\nfrontmatter")
         self.assertEqual(self.calls[1]["kw"]["input"], "---\nfrontmatter")
+        self.assertEqual(self.calls[2]["kw"]["input"], "---\nfrontmatter")
 
     def test_the_proven_call_gets_the_budget(self):
-        """v1.14.7 - budgets inverses. L'appel optimise n'est qu'une
-        optimisation et n'a droit qu'a un essai court ; l'appel nu est la
-        seule forme prouvee et recoit tout le budget. Avant, l'app misait
-        120 s sur la variante incertaine et n'en laissait que 60 a celle qui
-        marche."""
-        self._stall_then_answer()
+        """v1.14.7 - budgets inverses. Les appels optimises ne sont que des
+        optimisations et n'ont droit qu'a un essai court chacun ; l'appel
+        nu est la seule forme prouvee et recoit tout le budget. Avant,
+        l'app misait 120 s sur la variante incertaine et n'en laissait que
+        60 a celle qui marche."""
+        self._stall_until(3)
         app._call_claude_cli("x", timeout=120)
         self.assertEqual(self.calls[0]["kw"]["timeout"],
                          app.CLI_FAST_PATH_TIMEOUT)
-        self.assertEqual(self.calls[1]["kw"]["timeout"], 120)
+        self.assertEqual(self.calls[1]["kw"]["timeout"],
+                         app.CLI_FAST_PATH_TIMEOUT)
+        self.assertEqual(self.calls[2]["kw"]["timeout"], 120)
 
     def test_bare_attempt_carries_the_instruction_in_the_prompt(self):
         """--system-prompt a ete ajoute par le meme commit que --safe-mode et
-        n'a jamais ete valide sur le CLI concerne : le repli ne doit pas en
+        n'a jamais ete valide sur le CLI concerne : l'appel nu ne doit pas en
         heriter. La consigne repasse par stdin, seul canal prouve."""
-        self._stall_then_answer()
+        self._stall_until(3)
         app._call_claude_cli("CORPS", system_prompt="SOIS BREF")
-        self.assertNotIn("--system-prompt", self.calls[1]["cmd"])
-        self.assertIn("SOIS BREF", self.calls[1]["kw"]["input"])
-        self.assertIn("CORPS", self.calls[1]["kw"]["input"])
+        self.assertIn("--system-prompt", self.calls[1]["cmd"])
+        self.assertNotIn("--system-prompt", self.calls[2]["cmd"])
+        self.assertIn("SOIS BREF", self.calls[2]["kw"]["input"])
+        self.assertIn("CORPS", self.calls[2]["kw"]["input"])
 
     def test_fallback_is_recorded(self):
-        self._stall_then_answer()
+        self._stall_until(2)
         app._call_claude_cli("x")
         self.assertTrue(app._CLI_FALLBACK["used"])
+        self.assertEqual(app._CLI_FALLBACK["rung"], 1)
 
     def test_no_fallback_when_the_first_attempt_works(self):
         self._run_with(lambda n, cmd, kw: _Done(stdout="ok"))
@@ -146,7 +171,7 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertFalse(app._CLI_FALLBACK["used"])
 
-    def test_both_stalling_reports_the_total_wait(self):
+    def test_all_stalling_reports_the_total_wait(self):
         """Annoncer le budget d'un seul essai sous-declarerait ce que
         l'utilisateur a reellement patiente."""
         def behaviour(n, cmd, kw):
@@ -156,7 +181,7 @@ class FallbackTests(unittest.TestCase):
         with self.assertRaises(app.ClaudeCliTimeout) as ctx:
             app._call_claude_cli("x", timeout=120)
         self.assertEqual(ctx.exception.timeout,
-                         app.CLI_FAST_PATH_TIMEOUT + 120)
+                         2 * app.CLI_FAST_PATH_TIMEOUT + 120)
 
     def test_partial_output_of_the_first_attempt_survives(self):
         def behaviour(n, cmd, kw):
@@ -223,7 +248,12 @@ if __name__ == "__main__":
 class FastPathIsNotRetriedForeverTests(unittest.TestCase):
     """v1.14.8 - Sur une machine ou une option bloque, chaque generation
     perdait 30 s a rejouer un appel dont l'echec est deja connu : 40 s au
-    lieu de 10 par skill, et une reparation en lot qui dure des heures."""
+    lieu de 10 par skill, et une reparation en lot qui dure des heures.
+
+    v1.14.12 - meme garantie sur l'echelle a trois barreaux : le barreau qui
+    a cale n'est jamais rejoue, les appels suivants partent du barreau qui a
+    repondu. Ici le pire cas : c'est --strict-mcp-config lui-meme qui bloque,
+    donc les barreaux 0 ET 1 calent et seul l'appel nu repond."""
 
     def setUp(self):
         self.calls = []
@@ -232,7 +262,7 @@ class FastPathIsNotRetriedForeverTests(unittest.TestCase):
         app._claude_cli_path = lambda: "/bin/claude"
         self._shell = dict(app._SHELL_ENV_CACHE)
         app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
-        app._CLI_FALLBACK["used"] = False
+        app._CLI_FALLBACK.update({"used": False, "rung": 0})
 
         def fake(cmd, **kw):
             self.calls.append({"cmd": cmd, "kw": kw})
@@ -248,11 +278,11 @@ class FastPathIsNotRetriedForeverTests(unittest.TestCase):
         app._claude_cli_path = self._orig_path
         app._SHELL_ENV_CACHE.clear()
         app._SHELL_ENV_CACHE.update(self._shell)
-        app._CLI_FALLBACK["used"] = False
+        app._CLI_FALLBACK.update({"used": False, "rung": 0})
 
-    def test_first_call_pays_the_fast_path_once(self):
+    def test_first_call_pays_the_stalling_rungs_once(self):
         self.assertEqual(app._call_claude_cli("x"), "pong")
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 3)
 
     def test_next_calls_go_straight_to_the_proven_one(self):
         app._call_claude_cli("x")
@@ -265,11 +295,30 @@ class FastPathIsNotRetriedForeverTests(unittest.TestCase):
         for _ in range(5):
             app._call_claude_cli("x")
         stalled = [c for c in self.calls if "--strict-mcp-config" in c["cmd"]]
-        self.assertEqual(len(stalled), 1)
+        self.assertEqual(len(stalled), 2)
+
+    def test_a_toxic_secondary_option_keeps_mcp_off(self):
+        """v1.14.12 - si l'option toxique n'est PAS --strict-mcp-config, le
+        repli s'arrete au barreau intermediaire : les MCP restent coupes et
+        la reparation reste rapide."""
+        def fake(cmd, **kw):
+            self.calls.append({"cmd": cmd, "kw": kw})
+            if "--disable-slash-commands" in cmd:
+                raise subprocess.TimeoutExpired("claude", kw["timeout"])
+            return _Done(stdout="pong")
+
+        app.subprocess.run = fake
+        self.assertEqual(app._call_claude_cli("x"), "pong")
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("--strict-mcp-config", self.calls[1]["cmd"])
+        self.calls.clear()
+        app._call_claude_cli("y")
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("--strict-mcp-config", self.calls[0]["cmd"])
 
     def test_the_proven_call_is_not_replayed_twice_when_it_stalls(self):
         """Sinon l'utilisateur attendrait deux fois le budget complet."""
-        app._CLI_FALLBACK["used"] = True
+        app._CLI_FALLBACK.update({"used": True, "rung": 2})
 
         def always_stall(cmd, **kw):
             self.calls.append({"cmd": cmd, "kw": kw})
@@ -357,14 +406,14 @@ class StableWorkdirTests(unittest.TestCase):
         app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
         app.subprocess.run = fake
         app._claude_cli_path = lambda: "/bin/claude"
-        fallback = app._CLI_FALLBACK["used"]
-        app._CLI_FALLBACK["used"] = False
+        fallback = dict(app._CLI_FALLBACK)
+        app._CLI_FALLBACK.update({"used": False, "rung": 0})
         try:
             app._call_claude_cli("x")
             app._cli_probe(())
         finally:
             app.subprocess.run, app._claude_cli_path = orig_run, orig_path
-            app._CLI_FALLBACK["used"] = fallback
+            app._CLI_FALLBACK.update(fallback)
             app._SHELL_ENV_CACHE.clear()
             app._SHELL_ENV_CACHE.update(shell)
         self.assertEqual(len(set(calls)), 1, calls)

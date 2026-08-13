@@ -34,6 +34,14 @@ echo "[claude-control-repair] start"
 if [ -d "$TARGET_DIR/.git" ]; then
     echo "[repair] updating $TARGET_DIR"
     git -C "$TARGET_DIR" fetch origin
+    # v1.14.12 - le reset --hard detruisait le travail non commite du repo de
+    # dev (le README recommande ce script comme chemin de recuperation
+    # canonique). Un stash prealable le met a l'abri, recuperable via
+    # `git stash list` / `git stash pop`.
+    if [ -n "$(git -C "$TARGET_DIR" status --porcelain 2>/dev/null)" ]; then
+        echo "[repair] stashing uncommitted work (git stash list to recover)"
+        git -C "$TARGET_DIR" stash push -u -m "claude-control-repair $(date +%Y%m%d-%H%M%S)" || true
+    fi
     git -C "$TARGET_DIR" reset --hard origin/main
 else
     echo "[repair] cloning into $TARGET_DIR"
@@ -49,7 +57,11 @@ cp "$TARGET_DIR/src/app.py" "$APP_DIR/app.py"
 chmod +x "$APP_DIR/app.py"
 
 # Stop any old python instance so the new .app can bind 8765
-pkill -f "python.*claude-control/app.py" 2>/dev/null || true
+# v1.14.12 - motif ancre sur le chemin exact du script installe : le motif
+# large "python.*claude-control/app.py" matchait la ligne de commande de
+# n'importe quel process la contenant (editeur ouvert sur le fichier, tail,
+# session dans le repo de dev).
+pkill -f "$HOME/Applications/claude-control/app.py" 2>/dev/null || true
 sleep 0.5
 
 # Out with the old (Desktop / iCloud / ~/Applications) bundles

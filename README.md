@@ -48,7 +48,13 @@ Claude Control fixes all that with a clean web UI that runs locally on your Mac.
 - Read-only listing of plugins from `~/.claude/plugins/installed_plugins.json`
 - Per plugin: version, marketplace, count of skills/MCPs/commands/hooks, click to expand the full content listing
 - Toggle individually (writes `enabledPlugins` in `~/.claude/settings.json`, with backup)
-- **Orphan version detection**: a copper "orphan: vX.Y.Z" badge appears on plugins whose cache contains stale version directories. One click + confirm → the dir is zipped to `~/.claude/backups/claude-control/orphan-plugins/` then deleted
+- **Orphan version detection**: a "Nettoyer cache vX.Y.Z" button appears on plugins whose cache contains stale version directories. One click + confirm → the dir is zipped to `~/.claude/backups/claude-control/orphan-plugins/` then deleted
+
+**Also in the app**
+- **Commands tab**: list, toggle, edit and preview slash commands (`~/.claude/commands/`, plugin commands read-only)
+- **CLAUDE.md and settings.json editors** with automatic backup before save
+- **MCP conflict detection**: flags an MCP installed both as classic entry and Desktop Extension, one-click resolution
+- **Watchdog (opt-in)**: auto-restart Claude Desktop on crash, freeze detection, Desktop Commander auto-remediation
 
 **Imports**
 - MCPs from JSON, file path, Git repo, or local ZIP
@@ -139,10 +145,14 @@ The whole app is in [`src/app.py`](src/app.py) — a single Python file using on
 # Run locally during development
 python3 src/app.py
 
+# Run the test suite (also runs in CI on every PR)
+python3 -m unittest discover -s tests
+
 # Generate the icon (requires uv)
 bash scripts/build-icon.sh
 
 # Reinstall / repair the .app bundle
+# (stashes uncommitted work before resetting to origin/main)
 bash scripts/repair.sh
 ```
 

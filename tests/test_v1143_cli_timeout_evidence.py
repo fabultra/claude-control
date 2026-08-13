@@ -31,12 +31,12 @@ class PartialOutputIsKeptTests(unittest.TestCase):
         # v1.14.8 - l'echec de l'appel optimise est memorise pour la duree du
         # process : sans remise a zero, un test precedent ferait sauter
         # l'essai court et ces assertions mesureraient un autre chemin.
-        self._fallback = app._CLI_FALLBACK["used"]
-        app._CLI_FALLBACK["used"] = False
+        self._fallback = dict(app._CLI_FALLBACK)
+        app._CLI_FALLBACK.update({"used": False, "rung": 0})
 
     def tearDown(self):
         app._claude_cli_path = self._orig
-        app._CLI_FALLBACK["used"] = self._fallback
+        app._CLI_FALLBACK.update(self._fallback)
 
     def _timeout_with(self, stdout=None, stderr=None):
         def boom(cmd, **kw):
@@ -73,11 +73,12 @@ class PartialOutputIsKeptTests(unittest.TestCase):
         self.assertIn("rien écrit", str(e))
 
     def test_timeout_value_is_in_the_message(self):
-        """v1.14.7 - quand les deux essais calent, le message annonce
-        l'attente TOTALE (essai court + appel nu), pas le budget d'un seul."""
+        """v1.14.7 - quand tous les essais calent, le message annonce
+        l'attente TOTALE (les barreaux de l'echelle), pas le budget d'un
+        seul. v1.14.12 : l'echelle compte trois barreaux."""
         e = self._timeout_with()
-        self.assertEqual(e.timeout, app.CLI_FAST_PATH_TIMEOUT + 120)
-        self.assertIn(str(app.CLI_FAST_PATH_TIMEOUT + 120), str(e))
+        self.assertEqual(e.timeout, 2 * app.CLI_FAST_PATH_TIMEOUT + 120)
+        self.assertIn(str(2 * app.CLI_FAST_PATH_TIMEOUT + 120), str(e))
 
 
 class SuggestSurfacesTimeoutTests(unittest.TestCase):
@@ -122,12 +123,12 @@ class DiagnoseDoesARealCallTests(unittest.TestCase):
         # v1.14.8 - l'echec de l'appel optimise est memorise pour la duree du
         # process : sans remise a zero, un test precedent ferait sauter
         # l'essai court et ces assertions mesureraient un autre chemin.
-        self._fallback = app._CLI_FALLBACK["used"]
-        app._CLI_FALLBACK["used"] = False
+        self._fallback = dict(app._CLI_FALLBACK)
+        app._CLI_FALLBACK.update({"used": False, "rung": 0})
 
     def tearDown(self):
         app._claude_cli_path = self._orig
-        app._CLI_FALLBACK["used"] = self._fallback
+        app._CLI_FALLBACK.update(self._fallback)
 
     def _diag(self, ping):
         def fake_version(cmd, **kw):

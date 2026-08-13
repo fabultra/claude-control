@@ -644,10 +644,24 @@ def _claude_cli_path():
     se desactive a tort parce que `claude` est introuvable, alors que le
     CLI marche tres bien depuis Terminal. Fallback : on inspecte aussi
     les emplacements communs avant d'abandonner.
+
+    v1.14.12 - entre le PATH du process et les emplacements devines : le
+    PATH du shell de connexion. "Ca marche dans mon terminal" designe UN
+    binaire precis -- celui que le PATH du terminal resout. Le chercher
+    d'abord la ou l'utilisateur le trouve supprime toute la classe de
+    pannes "l'app a choisi un autre claude que le mien" : la liste devinee
+    ci-dessous ordonnait brew avant nvm, et pouvait donc executer une
+    installation plus vieille que celle que l'utilisateur utilise et met a
+    jour. Les candidats devines ne restent que pour un shell muet.
     """
     found = shutil.which("claude")
     if found:
         return found
+    shell_path = _login_shell_env().get("PATH")
+    if shell_path:
+        found = shutil.which("claude", path=shell_path)
+        if found:
+            return found
     candidates = [
         Path("/opt/homebrew/bin/claude"),       # macOS Apple Silicon + brew
         Path("/usr/local/bin/claude"),          # macOS Intel + brew, npm global
@@ -660,10 +674,17 @@ def _claude_cli_path():
         HOME / ".asdf/shims/claude",
     ]
     # nvm : ~/.nvm/versions/node/*/bin/claude (toutes versions installees)
+    #
+    # v1.14.12 - tri par NUMERO de version, comme _cli_env() depuis v1.14.11.
+    # Le tri alphabetique restait ici : "v9.11.2" passe avant "v22.1.0", et
+    # l'app choisissait le claude installe sous le node le plus ANCIEN --
+    # exactement le defaut corrige en v1.14.11, sur l'autre moitie du chemin.
+    # Sur un vieux build x86_64, macOS attend Rosetta : gel sans un octet.
     nvm_dir = HOME / ".nvm/versions/node"
     if nvm_dir.is_dir():
         try:
-            for v in sorted(nvm_dir.iterdir(), reverse=True):
+            for v in sorted(nvm_dir.iterdir(), key=_node_version_key,
+                            reverse=True):
                 candidates.append(v / "bin/claude")
         except Exception:
             pass
@@ -725,6 +746,10 @@ def _node_version_key(path):
 
 
 _SHELL_ENV_CACHE = {"done": False, "env": {}}
+# v1.14.12 - single-flight : la capture spawne un shell (jusqu'a 16 s si le
+# rc bloque). Deux requetes simultanees au premier chargement de page la
+# declenchaient chacune ; le verrou fait payer le shell une seule fois.
+_SHELL_ENV_LOCK = threading.Lock()
 
 # Variables recuperees lors du dernier _cli_env(). Le diagnostic les affiche :
 # si l'appel ne marche QUE parce qu'on a rapatrie HTTPS_PROXY, c'est ca la
@@ -734,7 +759,12 @@ _CLI_ENV_RECOVERED = {"vars": []}
 # v1.14.6 - vrai des qu'un appel a du se replier sur la version nue. Sert a
 # signaler que les options optionnelles sont hors service sur ce CLI : sans
 # ca le repli serait invisible et l'app tournerait degradee en silence.
-_CLI_FALLBACK = {"used": False}
+#
+# v1.14.12 - `rung` memorise le barreau de l'echelle de repli (cf.
+# _CLI_RUNGS) auquel les prochains appels commencent : une forme qui vient
+# de caler n'est pas rejouee au prochain skill. L'etat vaut pour la duree du
+# process, comme avant.
+_CLI_FALLBACK = {"used": False, "rung": 0}
 
 # v1.14.9 - repertoire de travail STABLE pour les appels au CLI.
 #
@@ -765,28 +795,29 @@ def _login_shell_env(timeout=8):
     timeout est court, on ne remplace pas un hang par un autre. En cas
     d'echec on retombe sur `-lc`, puis sur rien du tout.
     """
-    if _SHELL_ENV_CACHE["done"]:
-        return _SHELL_ENV_CACHE["env"]
-    env = {}
-    shell = os.environ.get("SHELL") or "/bin/zsh"
-    for flags in ("-lic", "-lc"):
-        try:
-            r = subprocess.run([shell, flags, "env"], capture_output=True,
-                               text=True, timeout=timeout,
-                               stdin=subprocess.DEVNULL)
-        except Exception:
-            continue
-        if r.returncode != 0 or not r.stdout:
-            continue
-        for line in r.stdout.splitlines():
-            k, sep, v = line.partition("=")
-            if sep and k and k.isidentifier():
-                env[k] = v
-        if env:
-            break
-    _SHELL_ENV_CACHE["env"] = env
-    _SHELL_ENV_CACHE["done"] = True
-    return env
+    with _SHELL_ENV_LOCK:
+        if _SHELL_ENV_CACHE["done"]:
+            return _SHELL_ENV_CACHE["env"]
+        env = {}
+        shell = os.environ.get("SHELL") or "/bin/zsh"
+        for flags in ("-lic", "-lc"):
+            try:
+                r = subprocess.run([shell, flags, "env"], capture_output=True,
+                                   text=True, timeout=timeout,
+                                   stdin=subprocess.DEVNULL)
+            except Exception:
+                continue
+            if r.returncode != 0 or not r.stdout:
+                continue
+            for line in r.stdout.splitlines():
+                k, sep, v = line.partition("=")
+                if sep and k and k.isidentifier():
+                    env[k] = v
+            if env:
+                break
+        _SHELL_ENV_CACHE["env"] = env
+        _SHELL_ENV_CACHE["done"] = True
+        return env
 
 
 def _cli_env():
@@ -842,10 +873,25 @@ def _cli_env():
     # terminal. Or ces chemins n'existent que pour le cas launchd, ou le PATH
     # est quasi vide -- comme repli, jamais comme priorite. Ce qui marche
     # dans le terminal de l'utilisateur doit marcher dans l'app.
+    #
+    # v1.14.12 - entre les deux : le PATH du shell de connexion, dans SON
+    # ordre. Depuis le Finder le PATH du process est quasi vide, donc les
+    # chemins devines decidaient seuls -- brew avant nvm, un ordre arbitraire
+    # qui n'est pas celui du terminal de l'utilisateur. Le CLI npm est un
+    # script `#!/usr/bin/env node` : c'est ce PATH qui choisit le node qui
+    # l'execute. En inserant les entrees du shell avant les suppositions, le
+    # subprocess resout `claude` ET `node` exactement comme le terminal ; les
+    # chemins devines ne tranchent plus que si le shell n'a rien donne.
     cur = env.get("PATH", "")
-    parts = [p for p in extra if p not in cur.split(":")]
-    if parts:
-        env["PATH"] = (cur + ":" if cur else "") + ":".join(parts)
+    shell_dirs = [d for d in (_login_shell_env().get("PATH") or "").split(":")
+                  if d]
+    merged, seen = [], set()
+    for p in cur.split(":") + shell_dirs + extra:
+        if p and p not in seen:
+            merged.append(p)
+            seen.add(p)
+    if merged:
+        env["PATH"] = ":".join(merged)
 
     # v1.14.4 - meme cause que le PATH, autre consequence : sans les
     # variables reseau/auth du shell, le CLI demarre puis bloque a
@@ -919,10 +965,27 @@ _CLI_CORE_FLAGS = ("-p", "--output-format", "text")
 # Groupes et non chaines plates : une option qui porte une valeur doit etre
 # retiree ou ajoutee avec elle, sinon la bissection produirait un
 # `--mcp-config` orphelin.
+_CLI_MCP_OFF = ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}')
 _CLI_OPTIONAL_FLAGS = (
-    ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'),
+    _CLI_MCP_OFF,
     ("--no-session-persistence",),
     ("--disable-slash-commands",),
+)
+
+# v1.14.12 - l'echelle de repli, du plus optimise au plus sur.
+#
+# Le repli v1.14.6 jetait TOUTES les options d'un coup : l'appel nu recharge
+# alors la config MCP complete de l'utilisateur -- sur une machine a vingt
+# serveurs, c'est reintroduire dans le chemin de secours exactement la
+# lenteur que --strict-mcp-config existe pour eviter, et une reparation en
+# lot la paie a chaque skill (jusqu'a re-timeout des que la config grossit).
+# Le barreau intermediaire ne conserve que la neutralisation des MCP : si
+# c'est une AUTRE option qui est devenue toxique, la reparation reste
+# rapide. L'appel nu reste le filet final.
+_CLI_RUNGS = (
+    None,             # 0 - toutes les options optionnelles
+    (_CLI_MCP_OFF,),  # 1 - seulement les MCP coupes
+    (),               # 2 - appel nu
 )
 
 
@@ -1256,58 +1319,71 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
         return res
 
     started_total = time.monotonic()
-    # v1.14.7 - budgets inverses. L'appel optimise n'est qu'une
-    # optimisation : il n'a droit qu'a un essai court. L'appel nu est la
-    # seule forme prouvee sur les machines concernees, et recoit tout le
-    # budget. Avant, l'inverse -- l'app misait 120 s sur la variante
-    # incertaine et n'en laissait que 60 a celle qui marche.
-    first_budget = timeout if not allow_fallback \
-        else min(CLI_FAST_PATH_TIMEOUT, timeout)
-
-    # v1.14.8 - une fois que l'appel optimise a cale, on cesse de l'essayer.
+    # v1.14.6 / v1.14.7 / v1.14.12 - repli automatique le long de _CLI_RUNGS.
     #
-    # Sur une machine ou une option bloque, chaque generation perdait 30 s a
-    # rejouer un appel dont on sait deja qu'il ne repondra pas -- soit 40 s
-    # au lieu de 10 pour chaque skill, et une reparation en lot qui dure des
-    # heures. L'etat vaut pour la duree du process : un redemarrage de l'app
-    # retente l'appel optimise, donc une mise a jour du CLI qui reparerait la
-    # situation est reprise sans rien avoir a configurer.
-    skip_fast_path = allow_fallback and _CLI_FALLBACK["used"]
-    if skip_fast_path:
-        _log("_call_claude_cli: appel optimise deja connu en echec, "
-             "appel nu directement")
-    try:
-        r = _attempt((), timeout) if skip_fast_path \
-            else _attempt(None, first_budget)
-    except ClaudeCliTimeout as first:
-        # v1.14.6 - repli automatique sur l'appel nu.
-        #
-        # `--safe-mode` a fait perdre cinq semaines : l'option bloquait le
-        # CLI indefiniment, l'app rendait "n'a pas repondu en 120 s", et la
-        # fonctionnalite etait morte sans recours. Une option qui devient
-        # toxique -- mise a jour du CLI, version qui diverge -- ne doit pas
-        # pouvoir remettre l'app dans ce cul-de-sac : on retire les options
-        # optionnelles et on retente une fois. Elles sont des optimisations,
-        # pas des conditions de fonctionnement.
-        #
-        # Le repli est refuse au diagnostic (allow_fallback=False) : une
-        # sonde qui se rattrape toute seule mesurerait autre chose que
-        # l'appel de production et ne prouverait plus rien.
-        if not allow_fallback or skip_fast_path:
-            # skip_fast_path : l'essai qui vient de caler ETAIT deja l'appel
-            # nu. Le rejouer a l'identique doublerait l'attente sans rien
-            # changer.
-            raise
-        _log("_call_claude_cli: repli sur l'appel nu apres timeout")
-        _CLI_FALLBACK["used"] = True
-        try:
-            r = _attempt((), timeout)
-        except ClaudeCliTimeout as second:
-            # Les deux essais ont cale : on annonce l'attente TOTALE.
-            # Remonter le budget d'un seul essai sous-declarerait ce que
-            # l'utilisateur a effectivement patiente.
-            raise ClaudeCliTimeout(first_budget + timeout,
-                                   first.partial or second.partial)
+    # `--safe-mode` a fait perdre cinq semaines : l'option bloquait le
+    # CLI indefiniment, l'app rendait "n'a pas repondu en 120 s", et la
+    # fonctionnalite etait morte sans recours. Une option qui devient
+    # toxique -- mise a jour du CLI, version qui diverge -- ne doit pas
+    # pouvoir remettre l'app dans ce cul-de-sac : les options sont des
+    # optimisations, jamais des conditions de fonctionnement.
+    #
+    # v1.14.7 - budgets inverses : chaque barreau intermediaire n'a droit
+    # qu'a un essai court, le dernier (l'appel nu, la seule forme garantie)
+    # recoit tout le budget.
+    #
+    # v1.14.8 - un barreau qui a cale n'est pas rejoue : les appels suivants
+    # partent du barreau memorise (_CLI_FALLBACK["rung"]). L'etat vaut pour
+    # la duree du process : un redemarrage de l'app reprend tout en haut,
+    # donc une mise a jour du CLI qui reparerait la situation est reprise
+    # sans rien avoir a configurer.
+    #
+    # v1.14.12 - la descente couvre aussi l'echec DUR d'une option. Un CLI
+    # mis a jour qui ne connait plus un flag sort en `unknown option` : ce
+    # n'est pas un timeout, mais c'est la meme panne -- une option devenue
+    # toxique -- et elle doit emprunter la meme echelle au lieu de tuer la
+    # reparation avec un message qui accuse le prompt.
+    #
+    # Le repli est refuse au diagnostic (allow_fallback=False) : une sonde
+    # qui se rattrape toute seule mesurerait autre chose que l'appel de
+    # production et ne prouverait plus rien.
+    if not allow_fallback:
+        r = _attempt(None, timeout)
+    else:
+        start_rung = _CLI_FALLBACK["rung"]
+        if start_rung:
+            _log(f"_call_claude_cli: barreau {start_rung} deja connu comme "
+                 f"point de depart (echec anterieur memorise)")
+        last_rung = len(_CLI_RUNGS) - 1
+        waited = 0.0
+        partial = ""
+        for rung in range(start_rung, len(_CLI_RUNGS)):
+            budget = timeout if rung == last_rung \
+                else min(CLI_FAST_PATH_TIMEOUT, timeout)
+            try:
+                r = _attempt(_CLI_RUNGS[rung], budget)
+            except ClaudeCliTimeout as e:
+                waited += budget
+                partial = partial or e.partial
+                _CLI_FALLBACK["used"] = True
+                _CLI_FALLBACK["rung"] = min(rung + 1, last_rung)
+                if rung == last_rung:
+                    # Tous les barreaux ont cale : on annonce l'attente
+                    # TOTALE. Remonter le budget d'un seul essai
+                    # sous-declarerait ce que l'utilisateur a patiente.
+                    raise ClaudeCliTimeout(round(waited), partial)
+                _log(f"_call_claude_cli: timeout au barreau {rung}, "
+                     f"descente au barreau {rung + 1}")
+                continue
+            combined_err = ((r.stdout or "") + " " + (r.stderr or "")).lower()
+            if (r.returncode != 0 and rung != last_rung
+                    and "unknown option" in combined_err):
+                _CLI_FALLBACK["used"] = True
+                _CLI_FALLBACK["rung"] = rung + 1
+                _log(f"_call_claude_cli: option inconnue du CLI au barreau "
+                     f"{rung}, descente au barreau {rung + 1}")
+                continue
+            break
     elapsed = time.monotonic() - started_total
     stdout = (r.stdout or "").strip()
     stderr = (r.stderr or "").strip()
@@ -1322,10 +1398,17 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
             )
         # v1.14.1 - deux erreurs de demarrage tres bavardes cote CLI mais
         # opaques cote UI : on les nomme.
+        #
+        # v1.14.12 - le prompt passe par stdin depuis v1.14.1 : il ne peut
+        # plus etre pris pour une option. Arriver ici avec `unknown option`
+        # apres l'echelle de repli signifie que le CLI refuse une option de
+        # BASE (-p / --output-format) : un CLI trop ancien pour l'app.
         if "unknown option" in combined:
             raise RuntimeError(
-                "Le CLI a pris une partie du prompt pour une option "
-                f"(exit {r.returncode}). Detail : {(stderr or stdout)[:200]}"
+                f"Le CLI refuse une option de l'appel (exit {r.returncode}), "
+                f"probablement parce qu'il est trop ancien. Mets-le a jour : "
+                f"npm install -g @anthropic-ai/claude-code. "
+                f"Detail : {(stderr or stdout)[:200]}"
             )
         if "credit balance" in combined or "rate limit" in combined or "quota" in combined:
             raise RuntimeError(
@@ -1685,11 +1768,13 @@ def _bulk_repair_probe():
     except ClaudeCliTimeout as e:
         # v1.14.3 - la sortie partielle dit sur quoi le CLI bloque ; sans
         # elle le message se reduisait a "teste a la main dans un terminal".
+        # v1.14.12 - la duree annoncee est l'attente TOTALE portee par
+        # l'exception (tous les barreaux de repli), pas le budget d'un seul.
         detail = (f" Il avait commencé à écrire : « {e.partial[:200]} »"
                   if e.partial else " Il n'a rien écrit du tout avant de caler.")
         return False, time.monotonic() - started, (
             f"Le CLI Claude n'a pas répondu à un appel trivial en "
-            f"{BULK_REPAIR_PROBE_TIMEOUT} s. Le lot n'a pas été lancé : il "
+            f"{e.timeout} s. Le lot n'a pas été lancé : il "
             f"aurait échoué skill après skill.{detail}")
     except ClaudeCliNotLoggedIn as e:
         return False, time.monotonic() - started, str(e)
@@ -1697,9 +1782,12 @@ def _bulk_repair_probe():
         return False, time.monotonic() - started, f"{type(e).__name__} : {e}"
     elapsed = time.monotonic() - started
     if not (out or "").strip():
+        # v1.14.12 - la commande suggeree citait encore `--safe-mode`,
+        # l'option retiree en v1.14.6 parce qu'elle GELAIT le CLI : suivre le
+        # conseil bloquait le terminal de l'utilisateur.
         return False, elapsed, (
             "Le CLI Claude a répondu sans aucun texte. Le lot n'a pas été "
-            "lancé. Teste : echo ping | claude -p --safe-mode")
+            "lancé. Teste : echo ping | claude -p --output-format text")
     return True, elapsed, None
 
 
@@ -2278,6 +2366,12 @@ def toggle_mcp(name):
 
 
 def toggle_skill(name):
+    # v1.14.12 - meme garde que delete_skill/repair_skill/_read_skill_content.
+    # toggle_skill etait la seule fonction de la famille sans validation :
+    # `SKILLS_DIR / "../../X"` suivi de `.rename()` deplacait n'importe quel
+    # dossier de la machine vers skills-disabled/ (le nom vient d'un POST).
+    if not _safe_component(name):
+        return False, "Nom de skill invalide"
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
     src_a = SKILLS_DIR / name
@@ -2742,14 +2836,6 @@ def add_plugin_from_git(url):
     settings.setdefault("enabledPlugins", {})[full_name] = True
     _save_settings(settings)
     return True, f"Plugin '{full_name}' v{version} ajouté et activé"
-
-
-def _read_command_preview(path, max_chars=400):
-    try:
-        text = path.read_text(errors="replace")
-    except Exception:
-        return ""
-    return text if len(text) <= max_chars else text[:max_chars] + "\n..."
 
 
 def list_commands():
@@ -4424,7 +4510,13 @@ def _watchdog_loop():
                     if not pids:
                         if cfg["auto_restart_on_crash"]:
                             _watchdog_event("start", "Claude Desktop not running, launching")
-                            subprocess.run(["open", "-a", "Claude"], check=False)
+                            # v1.14.12 - timeout : ces trois appels etaient les
+                            # seuls subprocess sans borne du fichier, dans LA
+                            # boucle qui tourne sans surveillance. Un `open`
+                            # bloque par LaunchServices figeait le thread
+                            # watchdog pour toujours, en silence.
+                            subprocess.run(["open", "-a", "Claude"], check=False,
+                                           timeout=15)
                     elif cfg["freeze_detection"]:
                         if not _claude_responsive(timeout=cfg["freeze_timeout"]):
                             _watchdog_event("restart", f"Claude Desktop unresponsive >{cfg['freeze_timeout']}s, restarting")
@@ -4433,9 +4525,11 @@ def _watchdog_loop():
                             # execute AUTOMATIQUEMENT toutes les 30 s des qu'un
                             # osascript lent faisait croire a un freeze -- ce qui
                             # tuait aussi les sessions Claude Code CLI.
-                            subprocess.run(["pkill", "-9", "-f", CLAUDE_DESKTOP_BIN], check=False)
+                            subprocess.run(["pkill", "-9", "-f", CLAUDE_DESKTOP_BIN], check=False,
+                                           timeout=10)
                             time.sleep(2)
-                            subprocess.run(["open", "-a", "Claude"], check=False)
+                            subprocess.run(["open", "-a", "Claude"], check=False,
+                                           timeout=15)
                 elif target == "custom":
                     pattern = cfg.get("target_pattern", "")
                     if not pattern or len(pattern) < 2:
@@ -5315,6 +5409,13 @@ def import_mcp_git(url):
         return False, "URL Git invalide (doit commencer par https:// ou git@)"
     IMPORTED_REPOS_DIR.mkdir(parents=True, exist_ok=True)
     name = re.sub(r'\.git$', '', url.rstrip('/').split('/')[-1])
+    # v1.14.12 - le nom derive de l'URL doit rester un composant de chemin
+    # sur. `https://x/..` donnait name='..', donc target=~/.claude, et le
+    # rmtree ci-dessous EFFACAIT tout ~/.claude (skills, settings, plugins,
+    # historique) avant meme le clone. Une URL vide de segment ('https://x/')
+    # donnait name='' -> target=imported-mcps/ lui-meme, rase pareil.
+    if not _safe_component(name):
+        return False, f"Nom de repo indeductible de l'URL ({name!r})"
     target = IMPORTED_REPOS_DIR / name
     if target.exists():
         shutil.rmtree(target)
@@ -5352,6 +5453,11 @@ def import_skill_git(url):
     if not (url.startswith("https://") or url.startswith("http://") or url.startswith("git@")):
         return False, "URL Git invalide"
     name = re.sub(r'\.git$', '', url.rstrip('/').split('/')[-1])
+    # v1.14.12 - meme garde que import_mcp_git : un nom '..' ou '' derive de
+    # l'URL sortait de skills/ (ici sans rmtree, mais le clone atterrissait
+    # hors du dossier prevu).
+    if not _safe_component(name):
+        return False, f"Nom de repo indeductible de l'URL ({name!r})"
     target = SKILLS_DIR / name
     if target.exists():
         return False, f"Skill '{name}' existe deja"
@@ -5385,7 +5491,8 @@ def import_skill_markdown(name, content):
     if target.exists():
         return False, f"Skill '{name}' existe deja"
     target.mkdir(parents=True)
-    (target / "SKILL.md").write_text(content)
+    # v1.14.12 - seule ecriture de SKILL.md qui restait non atomique.
+    _atomic_write_text(target / "SKILL.md", content)
     return True, f"Skill '{name}' cree"
 
 
@@ -5537,30 +5644,40 @@ def _load_settings():
     if not SETTINGS_FILE.exists():
         return {}
     try:
-        with open(SETTINGS_FILE) as f:
+        with open(SETTINGS_FILE, encoding="utf-8-sig") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 def _save_settings(data):
+    # v1.14.12 - refus d'ecraser un settings.json existant mais illisible.
+    #
+    # _load_settings() rend {} sur un JSON casse (virgule en trop d'une
+    # edition manuelle). Les ecrivains -- toggle_plugin en tete -- repartaient
+    # de ce {} et reecrivaient un fichier ne contenant QUE enabledPlugins :
+    # hooks, permissions, env, statusLine, model, tout etait perdu en cochant
+    # une case. Le meme durcissement existe deja pour l'autre config
+    # (load_config_safe, v1.14.0) ; il manquait ici.
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8-sig") as f:
+                json.load(f)
+        except Exception as e:
+            raise RuntimeError(
+                "~/.claude/settings.json existe mais n'est pas un JSON "
+                f"lisible ({type(e).__name__}). Écrire par-dessus détruirait "
+                "hooks, permissions et env : corrige le fichier puis réessaie.")
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     if SETTINGS_FILE.exists():
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = BACKUP_DIR / f"settings.json.backup.{ts}"
-        with open(SETTINGS_FILE) as src, open(backup, "w") as dst:
-            dst.write(src.read())
+        # v1.14.12 - copy2 au lieu d'un read/write manuel : la copie manuelle
+        # pouvait laisser un backup tronque si le process mourait en route --
+        # le filet de securite lui-meme n'etait pas fiable.
+        shutil.copy2(SETTINGS_FILE, backup)
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(SETTINGS_FILE, data)
-
-
-def _plugin_root(install_path):
-    """L'install_path pointe vers <cache>/<owner>/<repo>/<version>/plugins/<plugin>.
-    On veut souvent inspecter <plugin> directement, ou son sous-dossier .claude-plugin."""
-    p = Path(install_path)
-    if (p / ".claude-plugin").is_dir():
-        return p
-    return p
 
 
 def _read_plugin_mcp_servers(install_path):
@@ -7290,7 +7407,7 @@ async function loadMcpConflicts(){
       return `<div class="p-3 bg-white rounded border border-red-200">
         <div class="flex items-baseline justify-between flex-wrap gap-2 mb-2">
           <div class="font-semibold text-sm">${escAttr(c.extension_name)} <span class="text-stone-400 font-normal">↔</span> <span class="font-mono">${escAttr(c.classic_name)}</span> ${matchBadge}</div>
-          <button onclick="resolveMcpConflict('${escAttr(c.classic_name)}', '${escAttr(c.extension_name)}')" class="text-xs font-medium text-white bg-red-700 hover:bg-red-800 rounded-md px-3 py-1.5">${tr('mcp_conflict_resolve_btn')}</button>
+          <button onclick="resolveMcpConflict('${escJsAttr(c.classic_name)}', '${escJsAttr(c.extension_name)}')" class="text-xs font-medium text-white bg-red-700 hover:bg-red-800 rounded-md px-3 py-1.5">${tr('mcp_conflict_resolve_btn')}</button>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
           <div class="p-2 bg-green-50 rounded border border-green-100">
@@ -7883,7 +8000,7 @@ function _renderFiltersSidebar(skills){
         const showG = gN !== n;
         const tooltip = showG ? `${n} parmi tes filtres / ${gN} au total` : `${n} skill${n===1?'':'s'}`;
         const cd = showG ? `${n}<span class="${isActive?'opacity-60':'text-stone-300'}"> / ${gN}</span>` : `${n}`;
-        return `<button onclick="setSkillCatFilter('${escAttr(display)}')" title="${escAttr(tooltip)}" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="truncate">${escAttr(display)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'} ml-2 shrink-0">${cd}</span></button>`;
+        return `<button onclick="setSkillCatFilter('${escJsAttr(display)}')" title="${escAttr(tooltip)}" class="w-full flex items-center justify-between text-left px-2 py-1 rounded ${isActive?'bg-stone-900 text-white':'hover:bg-stone-50'} ${isZero?'opacity-40':''}"><span class="truncate">${escAttr(display)}</span><span class="text-xs ${isActive?'opacity-80':'text-stone-400'} ml-2 shrink-0">${cd}</span></button>`;
       }).join('')}
     </div>
   `;
@@ -7918,21 +8035,21 @@ function _renderSkillCard(sk){
         : `<p class="text-xs italic text-red-700 mt-2">${tr('quality_broken_hint')}</p>`);
   const editable = !isPlugin;
   const checkbox = editable
-    ? `<input type="checkbox" ${sk.active?'checked':''} onchange="event.stopPropagation();toggleSkill('${escAttr(sk.name)}')" class="w-4 h-4 rounded accent-green-700 shrink-0" title="${tr('toggle_skill_title')}">`
+    ? `<input type="checkbox" ${sk.active?'checked':''} onchange="event.stopPropagation();toggleSkill('${escJsAttr(sk.name)}')" class="w-4 h-4 rounded accent-green-700 shrink-0" title="${tr('toggle_skill_title')}">`
     : `<span class="w-4 h-4 inline-flex items-center justify-center text-stone-400 shrink-0" title="${tr('plugin_readonly_tooltip')}">&#128274;</span>`;
   const deleteBtn = editable
-    ? `<button type="button" onclick="event.stopPropagation();deleteSkill('${escAttr(sk.name)}')" class="text-[11px] text-stone-400 hover:text-red-700 hover:underline">${tr('btn_delete')}</button>`
+    ? `<button type="button" onclick="event.stopPropagation();deleteSkill('${escJsAttr(sk.name)}')" class="text-[11px] text-stone-400 hover:text-red-700 hover:underline">${tr('btn_delete')}</button>`
     : '';
   // v1.9.0 - bouton 'Reparer' sur skills broken/enrich, uniquement sur les
   // skills user editables (les plugins ont leur propre source de verite).
   const repairBtn = (editable && (sk.quality === 'broken' || sk.quality === 'enrich'))
-    ? `<button type="button" onclick="event.stopPropagation();openRepairSkill('${escAttr(sk.name)}')" class="text-[11px] font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-2 py-0.5">${tr('btn_repair_skill')}</button>`
+    ? `<button type="button" onclick="event.stopPropagation();openRepairSkill('${escJsAttr(sk.name)}')" class="text-[11px] font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-2 py-0.5">${tr('btn_repair_skill')}</button>`
     : '';
   const checked = SKILL_SELECTED.has(sk.name) ? 'checked' : '';
   // v1.9.8 - bulk select checkbox masque pour les plugin skills (pas
   // d'action bulk possible dessus, et c'est cohérent avec leur read-only).
   const selectCheckbox = editable
-    ? `<input type="checkbox" ${checked} onchange="event.stopPropagation();toggleSkillSelect('${escAttr(sk.name)}', this.checked)" class="w-3.5 h-3.5 rounded accent-stone-700 shrink-0" title="${tr('select_for_bulk_title')}">`
+    ? `<input type="checkbox" ${checked} onchange="event.stopPropagation();toggleSkillSelect('${escJsAttr(sk.name)}', this.checked)" class="w-3.5 h-3.5 rounded accent-stone-700 shrink-0" title="${tr('select_for_bulk_title')}">`
     : `<span class="w-3.5 h-3.5 shrink-0"></span>`;
   // v1.9.8 - dot quality discret (gris) pour plugin skills, pour ne pas
   // suggerer une action.
@@ -8059,9 +8176,11 @@ function _renderPluginMcpChip(fn, m){
   // disponible.
   const name = (typeof m === 'string') ? m : (m && m.name) || '';
   const bridged = (typeof m === 'object' && m && m.bridged === true);
+  // v1.14.12 - escJsAttr en position JS inline (cf. commentaire escJs) :
+  // escAttr seul redonne l'apostrophe au moment ou JS lit l'attribut.
   const desktopPart = bridged
     ? _badgeDesktop('plugin_mcp_bridged_tooltip')
-    : `<button type="button" onclick="bridgePluginMcp('${fn}','${escAttr(name)}')" class="text-[10px] text-emerald-700 hover:text-emerald-900 hover:underline font-medium" title="${escAttr(tr('plugin_mcp_bridge_tooltip'))}">+ ${tr('plugin_mcp_bridge_btn')}</button>`;
+    : `<button type="button" onclick="bridgePluginMcp('${escJsAttr(fn)}','${escJsAttr(name)}')" class="text-[10px] text-emerald-700 hover:text-emerald-900 hover:underline font-medium" title="${escAttr(tr('plugin_mcp_bridge_tooltip'))}">+ ${tr('plugin_mcp_bridge_btn')}</button>`;
   return `<span class="text-xs bg-stone-100 px-2 py-0.5 rounded inline-flex items-center gap-1.5">${escAttr(name)} ${_badgeCli()} ${desktopPart}</span>`;
 }
 function _renderPluginSkillChip(fn, name){
@@ -8073,7 +8192,7 @@ function _renderPluginSkillChip(fn, name){
   const packaged = PACKAGED_SKILLS.has(key);
   const desktopPart = packaged
     ? _badgeDesktop('plugin_skill_imported_tooltip', 'plugin_skill_imported_badge')
-    : `<button type="button" onclick="packagePluginSkill('${fn}','${escAttr(name)}')" class="text-[10px] text-emerald-700 hover:text-emerald-900 hover:underline font-medium" title="${escAttr(tr('plugin_skill_import_tooltip'))}">+ ${tr('plugin_skill_import_btn')}</button>`;
+    : `<button type="button" onclick="packagePluginSkill('${escJsAttr(fn)}','${escJsAttr(name)}')" class="text-[10px] text-emerald-700 hover:text-emerald-900 hover:underline font-medium" title="${escAttr(tr('plugin_skill_import_tooltip'))}">+ ${tr('plugin_skill_import_btn')}</button>`;
   const cliBadge = `<span class="text-[10px] bg-blue-50 border border-blue-200 text-blue-700 px-1.5 py-0.5 rounded font-medium" title="${escAttr(tr('plugin_skill_cli_tooltip'))}">&#10003; ${tr('badge_cli')}</span>`;
   return `<span class="text-xs bg-stone-100 px-2 py-0.5 rounded inline-flex items-center gap-1.5">${escAttr(name)} ${cliBadge} ${desktopPart}</span>`;
 }
@@ -8134,6 +8253,9 @@ async function loadPlugins(){
     if(plugins.length===0){list.innerHTML = `<p class="text-xs text-stone-400">${tr('plugins_empty')}</p>`;return;}
     list.innerHTML = plugins.map(p=>{
       const fn = escAttr(p.full_name);
+      // v1.14.12 - variante JS pour les onclick/onchange inline, comme
+      // nameJs dans _renderMcpRow : escAttr seul rend l'apostrophe au JS.
+      const fnJs = escJsAttr(p.full_name);
       const isOpen = OPEN_PLUGINS.has(p.full_name);
       const opacity = p.enabled ? '' : 'opacity-60';
       // v1.9.9 - badge orphan UX clarifie. Avant : 'orphan: vX.Y.Z' suggerait
@@ -8144,12 +8266,12 @@ async function loadPlugins(){
         const tooltip = (CURRENT_LANG === 'en'
           ? `Click to delete only the orphan cache directory v${v} of "${fn}". The active plugin v${p.version||'?'} is NOT touched.`
           : `Cliquer pour supprimer UNIQUEMENT le dossier de cache orphelin v${v} de « ${fn} ». Le plugin actif v${p.version||'?'} N'EST PAS touche.`);
-        return `<button onclick="event.stopPropagation();cleanupOrphan('${fn}','${escAttr(v)}','${escAttr(p.version||'?')}')" class="text-xs px-2 py-0.5 rounded-full font-medium update-badge text-white inline-flex items-center gap-1" title="${escAttr(tooltip)}">&#128465; ${tr('btn_cleanup_orphan_cache').split('{v}').join(escAttr(v))}</button>`;
+        return `<button onclick="event.stopPropagation();cleanupOrphan('${fnJs}','${escJsAttr(v)}','${escJsAttr(p.version||'?')}')" class="text-xs px-2 py-0.5 rounded-full font-medium update-badge text-white inline-flex items-center gap-1" title="${escAttr(tooltip)}">&#128465; ${tr('btn_cleanup_orphan_cache').split('{v}').join(escAttr(v))}</button>`;
       }).join(' ');
       return `<div data-plugin-name="${escAttr(p.name)} ${escAttr(p.marketplace||'')} ${escAttr(p.full_name)}" class="group border ${p.enabled?'border-stone-200':'border-stone-100'} rounded-lg p-3 ${opacity}">
 <div class="flex items-center gap-3">
-<input type="checkbox" ${p.enabled?'checked':''} onchange="togglePlugin('${fn}')" class="w-5 h-5 rounded accent-green-700 shrink-0">
-<button onclick="togglePluginDetail('${fn}')" class="flex-1 text-left min-w-0">
+<input type="checkbox" ${p.enabled?'checked':''} onchange="togglePlugin('${fnJs}')" class="w-5 h-5 rounded accent-green-700 shrink-0">
+<button onclick="togglePluginDetail('${fnJs}')" class="flex-1 text-left min-w-0">
 <div class="flex items-baseline gap-2 flex-wrap">
 <span class="font-medium">${escAttr(p.name)}</span>
 <span class="text-xs text-stone-400 font-mono">v${escAttr(p.version||'?')}</span>
@@ -8158,9 +8280,9 @@ ${orphans}
 </div>
 <div class="text-xs text-stone-500 mt-0.5">${pluginContentBadge(p.contents||{})}</div>
 </button>
-<button type="button" onclick="event.stopPropagation();deletePlugin('${fn}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>
+<button type="button" onclick="event.stopPropagation();deletePlugin('${fnJs}')" class="text-xs text-stone-500 hover:text-red-700 hover:underline px-2 py-1 shrink-0">${tr('btn_delete')}</button>
 </div>
-<div id="pl-detail-${fn}" class="${isOpen?'':'hidden'}">${pluginDetailHtml(p.contents||{}, fn)}</div>
+<div id="pl-detail-${fn}" class="${isOpen?'':'hidden'}">${pluginDetailHtml(p.contents||{}, p.full_name)}</div>
 </div>`;
     }).join('');
   }catch(e){console.error(e);}
@@ -8337,8 +8459,10 @@ async function diagClaudeCli(target){
     tick = setInterval(paint, 1000);
   }
   try {
-    const r = await fetch('/api/claude-cli-diagnose');
-    const d = await r.json();
+    // v1.14.12 - POST : le diagnostic lance des subprocess et consomme un
+    // vrai aller-retour API. En GET, une page tierce pouvait le declencher
+    // en boucle via <img src=...> (pas d'Origin envoye, garde inoperante).
+    const d = await api('/api/claude-cli-diagnose', {});
     const v = cliDiagVerdict(d);
     const rows = [
       'path: ' + (d.path || '—'),
@@ -8795,7 +8919,7 @@ async function loadOverview(){
       const top = o.top_skills || [];
       const meta = o.usage_meta || {};
       if(top.length){
-        const items = top.map(t=>`<button onclick="document.getElementById('skills-search').value='${escAttr(t.name)}';filterSkills();document.getElementById('skills').scrollIntoView({behavior:'smooth'});" class="text-xs px-2 py-0.5 rounded-full bg-green-50 text-green-800 border border-green-200 hover:bg-green-100 font-mono">${escAttr(t.name)} <span class="text-green-700 font-semibold">${t.count}×</span></button>`).join(' ');
+        const items = top.map(t=>`<button onclick="document.getElementById('skills-search').value='${escJsAttr(t.name)}';filterSkills();document.getElementById('skills').scrollIntoView({behavior:'smooth'});" class="text-xs px-2 py-0.5 rounded-full bg-green-50 text-green-800 border border-green-200 hover:bg-green-100 font-mono">${escAttr(t.name)} <span class="text-green-700 font-semibold">${t.count}×</span></button>`).join(' ');
         topEl.innerHTML = `<div class="text-xs font-semibold uppercase tracking-wide text-stone-600 mb-1">${tr('top_skills_30d')} <span class="text-stone-400 font-normal normal-case">&middot; ${meta.sessions||0} ${tr('sessions')} / ${meta.files_scanned||0} ${tr('files')}</span></div><div class="flex flex-wrap gap-1.5">${items}</div>`;
       }else if(meta.ok){
         // v1.10.4 - diag breakdown quand 0 invocations 'Skill' trouvees.
@@ -8824,7 +8948,7 @@ async function loadOverview(){
     if(healthEl){
       const issues = [];
       if(h.mcps_failing && h.mcps_failing.length){
-        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-amber-50 border border-amber-200 text-amber-800"><span>&#9888;</span><span><strong>${h.mcps_failing.length}</strong> ${tr('issue_mcps_not_running')} : ${h.mcps_failing.map(n=>`<button onclick="showMcpError('${escAttr(n)}')" class="underline hover:no-underline font-mono">${escAttr(n)}</button>`).join(', ')}</span></div>`);
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-amber-50 border border-amber-200 text-amber-800"><span>&#9888;</span><span><strong>${h.mcps_failing.length}</strong> ${tr('issue_mcps_not_running')} : ${h.mcps_failing.map(n=>`<button onclick="showMcpError('${escJsAttr(n)}')" class="underline hover:no-underline font-mono">${escAttr(n)}</button>`).join(', ')}</span></div>`);
       }
       if(h.plugin_orphans && h.plugin_orphans.length){
         issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded text-white" style="background:linear-gradient(135deg,#D97757,#C15F3C)"><span>&#9888;</span><span><strong>${h.plugin_orphans.length}</strong> ${tr('issue_orphans')} : ${h.plugin_orphans.map(o=>`${escAttr(o.plugin)} v${escAttr(o.version)}`).join(', ')}</span></div>`);
@@ -8889,10 +9013,11 @@ async function loadCommands(){
     if(commands.length===0){list.innerHTML = `<p class="text-xs text-stone-400">${tr('commands_empty')}</p>`;return;}
     list.innerHTML = commands.map(c=>{
       const ne = escAttr(c.name);
+      const neJs = escJsAttr(c.name);
       const sourceLabel = c.source==='user' ? tr('source_user') : c.source.replace(/^plugin:/, tr('source_plugin')+' ');
       const actions = c.editable
-        ? `<input type="checkbox" ${c.active?'checked':''} onchange="toggleCommand('${ne}')" class="w-5 h-5 rounded accent-green-700" title="${tr('toggle_command_title')}"><button onclick="editCommand('${ne}','${escAttr(c.source)}')" class="text-xs text-stone-700 hover:text-stone-900 font-medium">${tr('btn_edit')}</button>`
-        : `<button onclick="editCommand('${ne}','${escAttr(c.source)}')" class="text-xs text-stone-500 hover:text-stone-700 font-medium">${tr('btn_view')}</button>`;
+        ? `<input type="checkbox" ${c.active?'checked':''} onchange="toggleCommand('${neJs}')" class="w-5 h-5 rounded accent-green-700" title="${tr('toggle_command_title')}"><button onclick="editCommand('${neJs}','${escJsAttr(c.source)}')" class="text-xs text-stone-700 hover:text-stone-900 font-medium">${tr('btn_edit')}</button>`
+        : `<button onclick="editCommand('${neJs}','${escJsAttr(c.source)}')" class="text-xs text-stone-500 hover:text-stone-700 font-medium">${tr('btn_view')}</button>`;
       const opacity = c.active ? '' : 'opacity-60';
       return `<div class="flex items-center justify-between gap-3 p-3 rounded-lg border border-stone-200 ${opacity}">
 <div class="flex flex-col flex-1 min-w-0">
@@ -8949,7 +9074,8 @@ async function loadPresets(){
     list.innerHTML = names.map(n=>{
       const count = (presets[n]||[]).length;
       const ne = escAttr(n);
-      return `<div class="flex items-center justify-between gap-2 p-2 bg-white border border-stone-200 rounded-md"><div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${ne}</div><div class="text-xs text-stone-500">${count} MCP${count>1?'s':''}</div></div><button onclick="applyPreset('${ne}')" class="text-xs px-2.5 py-1 rounded-md bg-stone-900 hover:bg-stone-800 text-white font-medium">Apply</button><button onclick="deletePreset('${ne}')" title="${deleteTitle}" class="text-stone-400 hover:text-red-600 text-lg leading-none px-1">&times;</button></div>`;
+      const neJs = escJsAttr(n);
+      return `<div class="flex items-center justify-between gap-2 p-2 bg-white border border-stone-200 rounded-md"><div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${ne}</div><div class="text-xs text-stone-500">${count} MCP${count>1?'s':''}</div></div><button onclick="applyPreset('${neJs}')" class="text-xs px-2.5 py-1 rounded-md bg-stone-900 hover:bg-stone-800 text-white font-medium">Apply</button><button onclick="deletePreset('${neJs}')" title="${deleteTitle}" class="text-stone-400 hover:text-red-600 text-lg leading-none px-1">&times;</button></div>`;
     }).join('');
   }catch(e){}
 }
@@ -9376,10 +9502,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cli = _claude_cli_path()
             self._json({"available": bool(cli), "source": "claude_cli" if cli else None,
                         "path": cli or None})
-        elif path == "/api/claude-cli-diagnose":
-            # v1.9.4 - diag complet (path + version + sanity check) pour
-            # debug quand le CLI exit avec une erreur opaque.
-            self._json(_diagnose_claude_cli())
         elif path == "/api/watchdog":
             self._json(get_watchdog_status())
         elif path == "/api/diagnose-extensions":
@@ -9461,6 +9583,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/repair-all-cancel": lambda: cancel_bulk_repair(),
             "/api/repair-all-dismiss": lambda: dismiss_bulk_repair(),
             "/api/suggest-skill-description": lambda: suggest_skill_description(data.get("name", ""), lang=data.get("lang")),
+            # v1.14.12 - POST et non GET : le diagnostic lance des subprocess
+            # et paie un aller-retour API reel. En GET, une page tierce
+            # pouvait le declencher en boucle (<img src> n'envoie pas
+            # d'Origin, et la garde ne refuse que les Origin presents).
+            "/api/claude-cli-diagnose": lambda: (True, _diagnose_claude_cli()),
             "/api/delete-user-skill-duplicates": lambda: delete_user_skill_duplicates(),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
             "/api/delete-extension": lambda: delete_extension(data.get("name", "")),
