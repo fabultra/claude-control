@@ -142,7 +142,6 @@ class DeleteExtensionTests(unittest.TestCase):
             app.HOME, app.EXTENSIONS_INSTALL_FILE, app.EXTENSIONS_SETTINGS_DIR,
             app.BACKUP_DIR, app._list_extensions,
         )
-        app.HOME = root.parent
         app.EXTENSIONS_INSTALL_FILE = self.install_file
         app.EXTENSIONS_SETTINGS_DIR = self.settings_root
         app.BACKUP_DIR = self.backup_dir
@@ -160,23 +159,17 @@ class DeleteExtensionTests(unittest.TestCase):
         (ext_dir / "manifest.json").write_text('{"name": "foo"}')
         (self.settings_root / "com.example.foo.json").write_text('{"enabled": true}')
 
-        # Repointer le chemin construit dans delete_extension :
-        # 'HOME / "Library/Application Support/Claude/Claude Extensions" / ext_id'
-        # On contourne en monkey-patch direct du Path utilise.
-        # Plus simple : changer HOME pour pointer 2 niveaux au-dessus.
-        # (Library/Application Support/Claude/Claude Extensions = root)
-        # Donc HOME = tmpdir / .. / .. / .. = ../../..
-        # Trop fragile - on ajuste delete_extension pour utiliser EXTENSIONS_SETTINGS_DIR.parent
-        # Pas faisable sans patcher le code. On stub l'arborescence en consequence.
-        app.HOME = root.parent.parent.parent.parent
-        # Cree le path attendu par delete_extension
+        # v1.14.12 - delete_extension construit
+        # 'HOME / "Library/Application Support/Claude/Claude Extensions" / id' :
+        # on lui donne un FAUX HOME dans le tempdir et on y cree l'arborescence.
+        # L'ancienne version remontait root.parent x4 jusqu'a '/' et faisait un
+        # mkdir de /Library/... en ABSOLU : ca ne passait que la ou la suite
+        # tournait avec les droits d'ecrire a la racine (jamais sur un runner
+        # CI), et ca ecrivait hors du tempdir.
+        app.HOME = root / "home"
         expected = app.HOME / "Library/Application Support/Claude/Claude Extensions"
-        expected.mkdir(parents=True, exist_ok=True)
-        # Symlink le contenu (impossible cross-platform proprement) - on fait une copie
+        expected.mkdir(parents=True)
         target_dir = expected / "com.example.foo"
-        if target_dir.exists():
-            import shutil
-            shutil.rmtree(target_dir)
         target_dir.mkdir()
         (target_dir / "manifest.json").write_text('{"name": "foo"}')
         self.expected_install = expected
@@ -185,14 +178,6 @@ class DeleteExtensionTests(unittest.TestCase):
         (app.HOME, app.EXTENSIONS_INSTALL_FILE, app.EXTENSIONS_SETTINGS_DIR,
          app.BACKUP_DIR, app._list_extensions) = self._orig
         self.tmpdir.cleanup()
-        # Cleanup le dir cree dans HOME
-        try:
-            import shutil
-            cleanup = self._orig[0] / "Library/Application Support/Claude/Claude Extensions/com.example.foo"
-            if cleanup.exists():
-                shutil.rmtree(cleanup)
-        except Exception:
-            pass
 
     def test_delete_extension_removes_files_registry_and_creates_backups(self):
         ok, msg = app.delete_extension("Foo Ext")
