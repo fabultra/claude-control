@@ -713,6 +713,17 @@ _CLI_ENV_INHERIT = (
     "CLAUDE_CONFIG_DIR",
 )
 
+def _node_version_key(path):
+    """v1.14.11 - Cle de tri d'un repertoire nvm, par numero de version.
+
+    Un tri alphabetique classait "v9" au-dessus de "v22" : l'app choisissait
+    le node le plus ancien installe. Les composants non numeriques (rc, beta)
+    ne cassent pas le tri, ils valent 0.
+    """
+    parts = re.findall(r"\d+", path.name)
+    return tuple(int(p) for p in parts[:3]) or (0,)
+
+
 _SHELL_ENV_CACHE = {"done": False, "env": {}}
 
 # Variables recuperees lors du dernier _cli_env(). Le diagnostic les affiche :
@@ -806,17 +817,35 @@ def _cli_env():
         str(HOME / ".bun/bin"),
         str(HOME / ".volta/bin"),
     ]
+    # v1.14.11 - tri par NUMERO de version, pas par nom.
+    #
+    # `sorted(..., reverse=True)` compare des chaines : "v9.11.2" passe avant
+    # "v22.1.0", et "v8.17.0" avant "v18.20.0". L'app prependait donc au PATH
+    # du CLI le node le plus ANCIEN installe -- un node 8 ou 9 de 2017, sur
+    # lequel le CLI Claude Code ne peut pas fonctionner. Sur un Mac Apple
+    # Silicon migre depuis un Intel, ces vieux builds sont x86_64 : macOS
+    # reclame Rosetta, et le lancement attend une boite de dialogue que
+    # personne ne verra jamais.
     nvm_dir = HOME / ".nvm/versions/node"
     if nvm_dir.is_dir():
         try:
-            for v in sorted(nvm_dir.iterdir(), reverse=True):
-                extra.append(str(v / "bin"))
+            extra += [str(v / "bin")
+                      for v in sorted(nvm_dir.iterdir(), key=_node_version_key,
+                                      reverse=True)]
         except Exception:
             pass
+
+    # v1.14.11 - les chemins devines passent APRES le PATH existant.
+    #
+    # Ils etaient prepends : les suppositions de l'app battaient donc le PATH
+    # de l'utilisateur, et le CLI tournait sur un autre node que celui de son
+    # terminal. Or ces chemins n'existent que pour le cas launchd, ou le PATH
+    # est quasi vide -- comme repli, jamais comme priorite. Ce qui marche
+    # dans le terminal de l'utilisateur doit marcher dans l'app.
     cur = env.get("PATH", "")
-    parts = [p for p in extra if p not in cur]
+    parts = [p for p in extra if p not in cur.split(":")]
     if parts:
-        env["PATH"] = ":".join(parts) + (":" + cur if cur else "")
+        env["PATH"] = (cur + ":" if cur else "") + ":".join(parts)
 
     # v1.14.4 - meme cause que le PATH, autre consequence : sans les
     # variables reseau/auth du shell, le CLI demarre puis bloque a
