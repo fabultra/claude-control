@@ -968,6 +968,20 @@ def _cli_env():
     for key in [k for k in env
                 if k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_")]:
         del env[key]
+
+    # v1.14.14 - l'auto-updater du CLI est coupe pour les appels de l'app.
+    #
+    # Diagnostic reel (rapport machine, CLI 2.1.173 fige depuis des
+    # semaines) : jeton ok, reseau ok, node ok, et un journal --debug VIDE
+    # -- le CLI gele avant meme sa premiere ligne de log. Ce qui tourne
+    # avant le journal, c'est l'updater : coince (verrou, installation
+    # partielle), il gele chaque appel -p pendant que --version repond.
+    # Un appel de generation n'a aucune raison de declencher une mise a
+    # jour ; la sante du CLI appartient a l'utilisateur et au diagnostic.
+    # Pose APRES le retrait des CLAUDE_CODE_* ci-dessus : ces deux-la sont
+    # NOTRE politique pour NOS subprocess, pas un heritage de session.
+    env["DISABLE_AUTOUPDATER"] = "1"
+    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
 
 
@@ -1428,6 +1442,17 @@ def _cli_debug_tail(timeout=25):
         tail = ((r.stderr or "") + "\n" + (r.stdout or "")).strip()
     except subprocess.TimeoutExpired as e:
         tail = (_decode_partial(e.stderr) + "\n" + _decode_partial(e.stdout)).strip()
+        if not tail:
+            # v1.14.14 - un --debug MUET est un verdict en soi, pas une
+            # absence de donnee : le CLI gele avant d'ecrire la premiere
+            # ligne de son journal. Ce qui tourne avant le journal, c'est
+            # l'auto-updater / le bootstrap du binaire. Cas reel : CLI fige
+            # a une version vieille de plusieurs semaines, updater coince.
+            return ("AUCUNE sortie, meme en --debug : le CLI gele avant "
+                    "d'ecrire son journal. Cause typique : binaire perime "
+                    "dont l'auto-updater est coince. Correctif : reinstalle "
+                    "le CLI (curl -fsSL https://claude.ai/install.sh | bash) "
+                    "puis verifie `claude --version`.")
         tail = (tail + "\n[coupe au timeout de la sonde --debug : la "
                 "derniere ligne ci-dessus est l'etape qui bloque]").strip()
     except Exception as e:

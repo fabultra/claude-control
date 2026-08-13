@@ -135,6 +135,72 @@ class NoControllingTtyTests(unittest.TestCase):
         self.assertIs(self.calls[0]["kw"].get("start_new_session"), True)
 
 
+class NoAutoUpdaterTests(unittest.TestCase):
+    """Cas reel : CLI fige a 2.1.173 depuis des semaines, jeton/reseau/node
+    sains, --debug muet -> l'updater coince gele chaque appel -p. Les
+    subprocess de l'app ne declenchent plus jamais de mise a jour."""
+
+    def setUp(self):
+        self._shell = dict(app._SHELL_ENV_CACHE)
+        app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
+
+    def tearDown(self):
+        app._SHELL_ENV_CACHE.clear()
+        app._SHELL_ENV_CACHE.update(self._shell)
+
+    def test_updater_is_disabled_for_app_calls(self):
+        with patch.object(app.os, "environ", {"PATH": "/usr/bin"}):
+            env = app._cli_env()
+        self.assertEqual(env["DISABLE_AUTOUPDATER"], "1")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1")
+
+    def test_our_policy_survives_the_session_scrub(self):
+        """Le scrub v1.14.9 retire les CLAUDE_CODE_* herites ; notre
+        variable est posee APRES et doit survivre."""
+        with patch.object(app.os, "environ",
+                          {"PATH": "/usr/bin", "CLAUDECODE": "1",
+                           "CLAUDE_CODE_ENTRYPOINT": "cli"}):
+            env = app._cli_env()
+        self.assertNotIn("CLAUDE_CODE_ENTRYPOINT", env)
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1")
+
+
+class MuteDebugIsAVerdictTests(unittest.TestCase):
+    def setUp(self):
+        self._path = app._claude_cli_path
+        app._claude_cli_path = lambda: "/bin/claude"
+        self._shell = dict(app._SHELL_ENV_CACHE)
+        app._SHELL_ENV_CACHE.update({"done": True, "env": {}})
+
+    def tearDown(self):
+        app._claude_cli_path = self._path
+        app._SHELL_ENV_CACHE.clear()
+        app._SHELL_ENV_CACHE.update(self._shell)
+
+    def test_silent_timeout_names_the_stale_binary(self):
+        import subprocess as sp
+
+        def mute_hang(cmd, **kw):
+            raise sp.TimeoutExpired(cmd, kw.get("timeout", 25))
+
+        with patch.object(app.subprocess, "run", mute_hang):
+            tail = app._cli_debug_tail(timeout=1)
+        self.assertIn("AUCUNE sortie", tail)
+        self.assertIn("install.sh", tail)
+
+    def test_partial_output_is_still_relayed(self):
+        import subprocess as sp
+
+        def talky_hang(cmd, **kw):
+            raise sp.TimeoutExpired(cmd, kw.get("timeout", 25),
+                                    stderr=b"[DEBUG] loading config\n[DEBUG] checking update")
+
+        with patch.object(app.subprocess, "run", talky_hang):
+            tail = app._cli_debug_tail(timeout=1)
+        self.assertIn("checking update", tail)
+        self.assertIn("coupe au timeout", tail)
+
+
 class DiagReportTests(unittest.TestCase):
     def test_diagnosis_carries_the_app_version_and_is_logged(self):
         logged = []
