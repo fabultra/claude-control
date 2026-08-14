@@ -1455,6 +1455,76 @@ def _check_cli_freshness(env=None, timeout=6):
         return None
 
 
+# v1.14.16 - installeur officiel du CLI. Domaine epingle : on n'execute que
+# le script d'installation d'Anthropic, jamais une URL venue d'une requete.
+CLI_INSTALLER_CMD = "curl -fsSL https://claude.ai/install.sh | bash"
+
+
+def update_claude_cli():
+    """v1.14.16 - Met a jour le CLI Claude Code depuis l'app.
+
+    Demande utilisateur directe apres le cas reel : binaire fige a 2.1.173
+    (public a 2.1.232), updater interne coince, et une reinstallation
+    manuelle dans le terminal comme seul remede -- contraire a la promesse
+    de l'app ("one click, zero terminal"). Le bouton execute l'installeur
+    OFFICIEL (meme commande que la doc Anthropic), verifie la version
+    obtenue, puis rearme l'app : echelle de repli remise en haut (nouveau
+    binaire = les options optimisees meritent un nouvel essai) et capture
+    du shell invalidee (le PATH a pu changer).
+
+    Ne touche pas Claude Desktop : seul l'outil `claude` du terminal est
+    reinstalle.
+    """
+    before = None
+    cli = _claude_cli_path()
+    if cli:
+        try:
+            r = subprocess.run([cli, "--version"], capture_output=True,
+                               text=True, timeout=10, env=_cli_env(),
+                               start_new_session=True)
+            before = (r.stdout or r.stderr or "").strip()[:60] or None
+        except Exception:
+            before = None
+    try:
+        r = subprocess.run(["/bin/bash", "-c", CLI_INSTALLER_CMD],
+                           capture_output=True, text=True, timeout=300,
+                           env=_cli_env(), start_new_session=True)
+    except subprocess.TimeoutExpired:
+        return False, ("L'installeur n'a pas fini en 5 min (reseau lent ou "
+                       "bloque). Réessaie, ou lance la commande dans un "
+                       f"terminal : {CLI_INSTALLER_CMD}")
+    except Exception as e:
+        return False, f"Installation impossible : {type(e).__name__}: {e}"
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "").strip()[-300:]
+        return False, f"L'installeur a echoue (exit {r.returncode}) : {tail}"
+    # Nouveau binaire : la capture de shell peut etre perimee (PATH modifie
+    # par l'installeur) et l'echelle de repli repart du haut.
+    with _SHELL_ENV_LOCK:
+        _SHELL_ENV_CACHE["done"] = False
+        _SHELL_ENV_CACHE["env"] = {}
+    _CLI_FALLBACK.update({"used": False, "rung": 0})
+    cli = _claude_cli_path()
+    if not cli:
+        return False, ("Installation terminee mais `claude` reste introuvable "
+                       "-- ouvre un terminal et verifie `which claude`.")
+    try:
+        r = subprocess.run([cli, "--version"], capture_output=True, text=True,
+                           timeout=10, env=_cli_env(), start_new_session=True)
+        after = (r.stdout or r.stderr or "").strip()[:60] or "?"
+    except Exception as e:
+        return False, (f"Installe, mais `claude --version` ne repond pas "
+                       f"({type(e).__name__}) : le binaire est peut-etre "
+                       f"encore en cours d'ecriture, reessaie dans un instant.")
+    if before and after == before:
+        return False, (f"L'installeur a tourne mais la version n'a pas bouge "
+                       f"({after}). Un autre binaire masque peut-etre le "
+                       f"nouveau : verifie `which claude` dans un terminal.")
+    _log(f"update_claude_cli: {before or '?'} -> {after} ({cli})")
+    return True, (f"CLI mis a jour : {before or 'version inconnue'} → {after}. "
+                  f"Relance la reparation des skills.")
+
+
 def _cli_debug_tail(timeout=25):
     """v1.14.13 - Le journal de demarrage du CLI, par le CLI.
 
@@ -7365,6 +7435,10 @@ fr: {
   bulk_ok_list: "{n} réécrites — voir le détail",
   bulk_repair_synced_btn: "+ {n} skills synchronisés",
   cli_diag_copy: "Copier le rapport",
+  cli_update_btn: "Mettre à jour le CLI ({v} → {l})",
+  cli_update_latest: "dernière version",
+  cli_update_running: "Mise à jour du CLI…",
+  confirm_cli_update: "Mettre à jour le CLI Claude Code ?\n\n• Exécute l'installeur officiel Anthropic (claude.ai/install.sh)\n• Remplace uniquement l'outil `claude` du terminal\n• NE TOUCHE PAS Claude Desktop (conversations, MCPs, réglages intacts)\n• Durée : ~1-2 min selon le réseau\n\nCONTINUER ?",
   bulk_terminal_btn: "Réparer via le Terminal",
   bulk_terminal_title: "Ouvre Terminal.app et y exécute les appels claude — dans TON environnement, celui où le CLI fonctionne. L'app applique les résultats automatiquement.",
   bulk_terminal_sub: "via la fenêtre Terminal — laisse-la ouverte",
@@ -7723,6 +7797,10 @@ en: {
   bulk_ok_list: "{n} rewritten — show details",
   bulk_repair_synced_btn: "+ {n} synced skills",
   cli_diag_copy: "Copy report",
+  cli_update_btn: "Update the CLI ({v} → {l})",
+  cli_update_latest: "latest",
+  cli_update_running: "Updating the CLI…",
+  confirm_cli_update: "Update the Claude Code CLI?\n\n• Runs the official Anthropic installer (claude.ai/install.sh)\n• Replaces only the `claude` terminal tool\n• Does NOT touch Claude Desktop (conversations, MCPs, settings intact)\n• Takes ~1-2 min depending on network\n\nCONTINUE?",
   bulk_terminal_btn: "Repair via Terminal",
   bulk_terminal_title: "Opens Terminal.app and runs the claude calls there — in YOUR environment, where the CLI works. The app applies the results automatically.",
   bulk_terminal_sub: "via the Terminal window — keep it open",
@@ -9058,6 +9136,23 @@ function cliDiagVerdict(d){
     text: tr('cli_diag_ping_stuck').replace('{p}', d.partial.substring(0,300))};
   return {tone:'red', text: tr('cli_diag_ping_silent').replace('{s}', String(d.ping_seconds))};
 }
+// v1.14.16 - mise a jour du CLI depuis l'app. Confirmation explicite : on
+// nomme ce qui est touche (l'outil `claude` du terminal) et ce qui ne l'est
+// PAS (Claude Desktop) -- la confusion entre les deux est documentee.
+async function updateClaudeCli(btn){
+  if(!confirm(tr('confirm_cli_update'))) return;
+  const orig = btn ? btn.innerHTML : null;
+  if(btn){ btn.disabled = true; btn.innerHTML = '<span class="inline-block animate-spin">&#x21bb;</span> ' + escAttr(tr('cli_update_running')); }
+  try{
+    const j = await api('/api/cli-update', {});
+    banner(j.success?'green':'red', j.message);
+    if(j.success){ loadState(); }
+  }catch(e){
+    banner('red', String(e.message || e));
+  }finally{
+    if(btn){ btn.disabled = false; btn.innerHTML = orig; }
+  }
+}
 let LAST_CLI_DIAG_REPORT = '';
 function copyCliDiagReport(){
   if(!LAST_CLI_DIAG_REPORT) return;
@@ -9117,10 +9212,19 @@ async function diagClaudeCli(target){
     LAST_CLI_DIAG_REPORT = 'Claude Control ' + (d.app_version || '?')
       + ' — diagnostic CLI\n' + v.text + '\n' + facts;
     if (!box){ alert(v.text + '\n\n' + facts); return d; }
+    // v1.14.16 - le geste au bout du verdict : si le CLI ne repond pas, la
+    // mise a jour se fait d'ici, en un clic ("one click, zero terminal").
+    const updateBtn = d.ping_ok ? '' :
+      '<button onclick="updateClaudeCli(this)" class="mt-1.5 mr-3 text-xs px-2.5 py-1 rounded-full bg-green-700 hover:bg-green-800 text-white font-medium">'
+      + escAttr(tr('cli_update_btn')
+          .replace('{v}', d.version || '?')
+          .replace('{l}', d.latest_cli_version || tr('cli_update_latest')))
+      + '</button>';
     box.innerHTML = '<strong class="' + (v.tone==='green'?'text-green-700':'text-red-700') + '">'
       + escAttr(v.text) + '</strong>'
       + '<pre class="mt-1 text-[10px] bg-stone-100 rounded p-1.5 overflow-x-auto">'
       + escAttr(facts) + '</pre>'
+      + updateBtn
       + '<button onclick="copyCliDiagReport()" class="mt-1 text-[10px] underline text-stone-600 hover:text-stone-900">'
       + escAttr(tr('cli_diag_copy')) + '</button>';
     return d;
@@ -10243,6 +10347,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # pouvait le declencher en boucle (<img src> n'envoie pas
             # d'Origin, et la garde ne refuse que les Origin presents).
             "/api/claude-cli-diagnose": lambda: (True, _diagnose_claude_cli()),
+            # v1.14.16 - mise a jour du CLI en un clic (installeur officiel,
+            # domaine epingle). Demande utilisateur : "l'app devrait checker
+            # la derniere version du CLI et l'installer".
+            "/api/cli-update": lambda: update_claude_cli(),
             "/api/delete-user-skill-duplicates": lambda: delete_user_skill_duplicates(),
             "/api/delete-mcp": lambda: delete_mcp(data.get("name", "")),
             "/api/delete-extension": lambda: delete_extension(data.get("name", "")),
