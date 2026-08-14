@@ -1619,6 +1619,129 @@ def _cli_auto_heal_after_timeout():
     return False, msg
 
 
+# v1.14.19 - "si c'est la cause, l'app devrait me le demander" (demande
+# utilisateur). Le jeton OAuth du CLI porte sa date d'expiration : la lire
+# coute zero appel API et zero reseau. On extrait UNIQUEMENT expiresAt et on
+# jette le reste ; le secret n'est jamais conserve ni logge. Une expiration
+# depassee est un INDICE fort (le refresh peut theoriquement encore sauver
+# la session), donc l'app le demande -- elle ne l'affirme qu'apres l'avoir
+# constate sur un vrai appel (v1.14.18).
+_CLI_SESSION = {"status": "unknown", "detail": None, "checked_ts": 0.0}
+_CLI_SESSION_LOCK = threading.Lock()
+_CLI_SESSION_TTL = 300
+# Marge sur l'expiration : un jeton perime de quelques minutes se rafraichit
+# souvent tout seul au prochain appel. Au-dela d'une heure, la session est
+# morte en pratique (cas reel : expiree depuis des semaines).
+_CLI_SESSION_EXPIRY_GRACE = 3600
+# last_ts None = jamais montre. PAS 0.0 : time.monotonic() compte depuis le
+# boot de la machine, et sur un Mac redemarre depuis moins de 30 min,
+# `monotonic - 0 < cooldown` aurait silencieusement supprime le dialogue --
+# le piege exact deja corrige dans les tests v1.14.17, retrouve ici en
+# production par le test de cette version.
+_RELOGIN_DIALOG = {"last_ts": None, "armed": False}
+_RELOGIN_DIALOG_COOLDOWN = 1800
+
+
+def _read_cli_oauth_expiry():
+    """Retourne expiresAt (secondes epoch) ou None. Ne conserve JAMAIS le
+    contenu des credentials au-dela de l'extraction de ce seul nombre."""
+    raw = None
+    cfg_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
+    cred_file = cfg_dir / ".credentials.json"
+    try:
+        if cred_file.is_file():
+            raw = cred_file.read_text(errors="replace")
+    except OSError:
+        raw = None
+    if raw is None and sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", CLI_KEYCHAIN_SERVICE, "-w"],
+                capture_output=True, text=True, timeout=6)
+            if r.returncode == 0:
+                raw = r.stdout
+        except Exception:
+            raw = None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    finally:
+        del raw
+    try:
+        exp = (data.get("claudeAiOauth") or {}).get("expiresAt")
+        if exp is None:
+            return None
+        exp = float(exp)
+        # Les versions du CLI stockent des millisecondes.
+        return exp / 1000.0 if exp > 4e10 else exp
+    except Exception:
+        return None
+    finally:
+        del data
+
+
+def _check_cli_session(force=False):
+    """Statut de session {status: expired|ok|unknown, detail}. Cache court."""
+    now = time.time()
+    with _CLI_SESSION_LOCK:
+        if not force and now - _CLI_SESSION["checked_ts"] < _CLI_SESSION_TTL:
+            return dict(_CLI_SESSION)
+    exp = _read_cli_oauth_expiry()
+    if exp is None:
+        status, detail = "unknown", None
+    elif now - exp > _CLI_SESSION_EXPIRY_GRACE:
+        days = int((now - exp) // 86400)
+        since = (f"depuis {days} jour(s)" if days
+                 else f"depuis {int((now - exp) // 3600)} h")
+        status = "expired"
+        detail = (f"Session Claude CLI expirée {since} — reconnecte-toi "
+                  f"avec `claude /login`.")
+    else:
+        status, detail = "ok", None
+    with _CLI_SESSION_LOCK:
+        _CLI_SESSION.update({"status": status, "detail": detail,
+                             "checked_ts": now})
+        return dict(_CLI_SESSION)
+
+
+def _ask_relogin_dialog(reason=None):
+    """v1.14.19 - l'app DEMANDE la reconnexion : boite de dialogue macOS
+    native avec un bouton qui ouvre Terminal pre-rempli de `claude /login`.
+    Armee par main() seulement (jamais depuis les tests), au plus une fois
+    par _RELOGIN_DIALOG_COOLDOWN pour ne pas harceler."""
+    if not _RELOGIN_DIALOG["armed"]:
+        return
+    now = time.monotonic()
+    last = _RELOGIN_DIALOG["last_ts"]
+    if last is not None and now - last < _RELOGIN_DIALOG_COOLDOWN:
+        return
+    _RELOGIN_DIALOG["last_ts"] = now
+
+    def _ask():
+        msg = _osa_quote(
+            (reason or "Ta session Claude CLI est expirée.")
+            + " La réparation des skills ne peut pas fonctionner sans "
+            "reconnexion.", 300)
+        script = (
+            f'display dialog "{msg}" '
+            f'buttons {{"Plus tard", "Ouvrir le Terminal"}} '
+            f'default button 2 with title "Claude Control" with icon caution')
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=120)
+            if "Ouvrir le Terminal" in (r.stdout or ""):
+                open_terminal_claude_login()
+        except Exception:
+            pass
+
+    threading.Thread(target=_ask, name="claude-control-relogin-ask",
+                     daemon=True).start()
+
+
 def _cli_debug_tail(timeout=25):
     """v1.14.13 - Le journal de demarrage du CLI, par le CLI.
 
@@ -2019,7 +2142,13 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
         # error_code que l'UI peut utiliser pour afficher des instructions
         # ciblees + un bouton 'Copier la commande' au lieu d'un dump
         # technique.
+        # v1.14.19 - et l'app le DEMANDE : dialogue macOS avec bouton qui
+        # ouvre Terminal pre-rempli, + etat de session rafraichi pour que le
+        # bandeau apparaisse au prochain /api/state.
         _log(f"suggest_skill_description: CLI not logged in")
+        _check_cli_session(force=True)
+        _invalidate_state_cache()
+        _ask_relogin_dialog(str(e)[:200])
         return False, {
             "error": str(e),
             "error_code": "cli_not_logged_in",
@@ -2334,6 +2463,11 @@ def _bulk_repair_probe():
             f"{e.timeout} s. Le lot n'a pas été lancé : il "
             f"aurait échoué skill après skill.{detail}")
     except ClaudeCliNotLoggedIn as e:
+        # v1.14.19 - l'app demande la reconnexion au lieu de seulement
+        # l'ecrire dans le compte rendu du lot.
+        _check_cli_session(force=True)
+        _invalidate_state_cache()
+        _ask_relogin_dialog(str(e)[:200])
         return False, time.monotonic() - started, str(e)
     except Exception as e:
         return False, time.monotonic() - started, f"{type(e).__name__} : {e}"
@@ -3238,6 +3372,13 @@ def _compute_state():
         "mcps": mcps_list,
         "skills": skills,
     }
+    # v1.14.19 - la session CLI expiree est annoncee AVANT tout essai de
+    # reparation : lecture locale de la date d'expiration du jeton (cache
+    # 5 min, jamais le secret), bandeau + bouton "Se reconnecter" cote UI.
+    session = _check_cli_session()
+    if session["status"] == "expired":
+        out["cli_session_expired"] = True
+        out["cli_session_detail"] = session["detail"]
     # v1.14.0 - remonte l'erreur de config au lieu de la laisser lever : le JS
     # affiche desormais un bandeau au lieu de garder silencieusement la
     # derniere liste rendue.
@@ -7685,6 +7826,8 @@ fr: {
   cli_diag_copy: "Copier le rapport",
   cli_update_btn: "Mettre à jour le CLI ({v} → {l})",
   cli_update_btn_short: "Mettre à jour le CLI",
+  cli_session_expired_title: "Session Claude CLI expirée — la réparation des skills ne peut pas fonctionner sans reconnexion.",
+  btn_relogin: "Se reconnecter",
   cli_update_latest: "dernière version",
   cli_update_running: "Mise à jour du CLI…",
   confirm_cli_update: "Mettre à jour le CLI Claude Code ?\n\n• Exécute l'installeur officiel Anthropic (claude.ai/install.sh)\n• Remplace uniquement l'outil `claude` du terminal\n• NE TOUCHE PAS Claude Desktop (conversations, MCPs, réglages intacts)\n• Durée : ~1-2 min selon le réseau\n\nCONTINUER ?",
@@ -8048,6 +8191,8 @@ en: {
   cli_diag_copy: "Copy report",
   cli_update_btn: "Update the CLI ({v} → {l})",
   cli_update_btn_short: "Update the CLI",
+  cli_session_expired_title: "Claude CLI session expired — skill repair cannot work until you log in again.",
+  btn_relogin: "Log in again",
   cli_update_latest: "latest",
   cli_update_running: "Updating the CLI…",
   confirm_cli_update: "Update the Claude Code CLI?\n\n• Runs the official Anthropic installer (claude.ai/install.sh)\n• Replaces only the `claude` terminal tool\n• Does NOT touch Claude Desktop (conversations, MCPs, settings intact)\n• Takes ~1-2 min depending on network\n\nCONTINUE?",
@@ -8615,7 +8760,16 @@ function _renderHealthBanner(skills){
     : '';
   const banner = document.getElementById('skills-health-banner');
   if(!banner) return;
-  banner.innerHTML = `
+  // v1.14.19 - "si c'est la cause, l'app devrait me le demander" : la
+  // session expiree s'affiche AVANT tout essai, avec le bouton qui ouvre
+  // Terminal pre-rempli de `claude /login`.
+  const sessionWarn = (CURRENT_STATE && CURRENT_STATE.cli_session_expired)
+    ? `<div class="mb-3 p-3 rounded-lg border border-red-200 bg-red-50 text-red-800 text-sm flex flex-wrap items-center gap-3">
+         <span>&#128274; ${escAttr(CURRENT_STATE.cli_session_detail || tr('cli_session_expired_title'))}</span>
+         <button onclick="openTerminalForLogin()" class="text-xs px-2.5 py-1 rounded-full bg-red-700 hover:bg-red-800 text-white font-medium">${escAttr(tr('btn_relogin'))}</button>
+       </div>`
+    : '';
+  banner.innerHTML = sessionWarn + `
     <div class="flex items-baseline justify-between mb-2 flex-wrap gap-2">
       <h2 class="text-lg font-semibold">${tr('skills_health_title')}</h2>
       <span class="text-xs text-stone-500">${excellent}/${total} ${tr('skills_health_ready')}</span>
@@ -10716,6 +10870,23 @@ def main():
     # v1.14.18 - l'auto-reparation du CLI n'est armee QUE dans le vrai
     # serveur (cf. _CLI_AUTO_HEAL).
     _CLI_AUTO_HEAL["armed"] = True
+    # v1.14.19 - idem pour la demande de reconnexion, et l'app VERIFIE la
+    # session au demarrage : si elle est expiree, elle le demande tout de
+    # suite au lieu de laisser l'utilisateur decouvrir un echec plus tard.
+    _RELOGIN_DIALOG["armed"] = True
+
+    def _startup_session_check():
+        time.sleep(5)
+        try:
+            session = _check_cli_session()
+            if session["status"] == "expired":
+                _ask_relogin_dialog(session["detail"])
+        except Exception as e:
+            _log(f"startup session check: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_startup_session_check,
+                     name="claude-control-session-check",
+                     daemon=True).start()
     start_watchdog()
     print(f"\n  Claude Control v{get_local_version()} - http://localhost:{PORT}")
     print(f"  Cmd+C pour arreter\n")
