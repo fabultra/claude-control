@@ -1174,7 +1174,11 @@ def _check_cli_credentials(timeout=6):
         return "error", f"{type(e).__name__}: {e}"
     # r.stdout contient le jeton : on ne le lit pas, on ne le garde pas.
     if r.returncode == 0:
-        return "ok", f"jeton accessible en {time.monotonic() - started:.1f} s"
+        # v1.14.18 - "accessible" ne veut pas dire "valide" : une session
+        # expiree rend un jeton parfaitement lisible et inutilisable. La
+        # validite se lit dans le journal --debug ("login expired"), pas ici.
+        return "ok", (f"jeton accessible en {time.monotonic() - started:.1f} s "
+                      "(existence, pas validité)")
     if r.returncode == 44:
         return "missing", (f"aucun item '{CLI_KEYCHAIN_SERVICE}' dans le "
                            "Keychain (cette version du CLI le range peut-etre "
@@ -1453,6 +1457,15 @@ def _diagnose_claude_cli_stages():
         # verdict. Dernier recours : demander au CLI lui-meme ou il s'arrete.
         out["stage"] = "debug"
         out["debug_tail"] = _cli_debug_tail()
+        # v1.14.18 - si le journal du CLI dit "login expired", le verdict est
+        # la reconnexion, pas le binaire : la sonde jeton ne teste que
+        # l'EXISTENCE du jeton, pas sa validite -- c'etait l'angle mort qui a
+        # fait passer une session expiree pour un binaire en panne.
+        if _looks_not_logged_in(out["debug_tail"]):
+            out["not_logged_in"] = True
+            out["error"] = ("Ta session Anthropic est expirée : reconnecte-toi "
+                            "avec `claude /login` dans un terminal. "
+                            f"(journal du CLI : « {out['debug_tail'][:160]} »)")
     return out
 
 
@@ -1555,6 +1568,57 @@ def update_claude_cli():
                   f"Relance la reparation des skills.")
 
 
+# v1.14.18 - auto-reparation du CLI, branchee dans le flux de reparation.
+#
+# Les versions 1.14.15/16/17 diagnostiquaient la panne (binaire perime dont
+# l'updater est coince) et offraient des boutons -- mais l'utilisateur, lui,
+# clique "Suggerer via Claude Code" et attend que CA marche. Alors quand un
+# appel timeout ET que la signature etablie est confirmee (version installee
+# differente de la derniere publiee), l'app execute la mise a jour
+# elle-meme et reessaie. Une seule tentative par vie de process : si la
+# mise a jour ne repare pas, on ne boucle pas. Le consentement est celui du
+# proprietaire de l'app, donne explicitement ("l'app devrait checker la
+# derniere version du cli et l'installer").
+# "armed" n'est vrai que dans le VRAI serveur (pose par main()) : la suite
+# de tests, qui appelle les memes fonctions directement, ne peut jamais
+# declencher un vrai installeur sur la machine d'un developpeur -- une
+# invariante de construction, pas une garde ambiante (cf. la flake v1.14.17
+# sur tests/__init__ qui ne s'execute pas sous `unittest discover`).
+_CLI_AUTO_HEAL = {"attempted": False, "armed": False}
+
+
+def _cli_auto_heal_after_timeout():
+    """Retourne (healed, detail). healed=True => CLI remplace, on peut
+    reessayer l'appel. detail porte le message a montrer a l'utilisateur."""
+    if not _CLI_AUTO_HEAL["armed"] or _CLI_AUTO_HEAL["attempted"]:
+        return False, None
+    _CLI_AUTO_HEAL["attempted"] = True
+    latest = _check_cli_freshness()
+    installed = None
+    cli = _claude_cli_path()
+    if cli:
+        try:
+            r = subprocess.run([cli, "--version"], capture_output=True,
+                               text=True, timeout=10, env=_cli_env(),
+                               start_new_session=True)
+            installed = (r.stdout or r.stderr or "").strip()
+        except Exception:
+            installed = None
+    if not latest or not installed or latest in installed:
+        # Pas la signature etablie (versions inconnues ou deja a jour) : on
+        # ne remplace pas un binaire sans preuve qu'il est en retard.
+        _log(f"auto-heal: signature absente (installed={installed!r} "
+             f"latest={latest!r}), pas de mise a jour")
+        return False, None
+    _log(f"auto-heal: CLI perime detecte ({installed} vs {latest}), "
+         f"mise a jour automatique")
+    ok, msg = update_claude_cli()
+    if ok:
+        return True, msg
+    _log(f"auto-heal: echec de la mise a jour : {msg}")
+    return False, msg
+
+
 def _cli_debug_tail(timeout=25):
     """v1.14.13 - Le journal de demarrage du CLI, par le CLI.
 
@@ -1601,6 +1665,26 @@ class ClaudeCliNotLoggedIn(Exception):
     """v1.9.5 - Cas specifique : le CLI Claude Code repond mais signale
     'Not logged in'. C'est un setup utilisateur (une seule fois) : il
     doit run 'claude /login' dans un terminal pour s'authentifier."""
+
+
+# v1.14.18 - marqueurs d'authentification a re-faire, TOUTES formes
+# confondues. Le cas resolu sur la machine de reference : session OAuth
+# EXPIREE -- le CLI 2.1.173 ne sortait pas en erreur, il tentait de poser la
+# question de re-authentification sur un tty que personne ne voyait, d'ou
+# des semaines de "timeout" muets. Depuis que start_new_session (v1.14.14)
+# lui interdit le tty, le message atterrit dans la sortie capturee :
+# "Anthropic profile login expired · Re-authenticate your Anthropic
+# profile". Un gel qui PORTE ce message n'est pas un timeout : c'est une
+# reconnexion a faire.
+_NOT_LOGGED_IN_MARKERS = (
+    "not logged in", "please run /login", "please log in",
+    "login expired", "re-authenticate", "profile login",
+)
+
+
+def _looks_not_logged_in(text):
+    t = (text or "").lower()
+    return any(m in t for m in _NOT_LOGGED_IN_MARKERS)
 
 
 def _decode_partial(raw):
@@ -1711,6 +1795,17 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
             # ecrit avant le timeout (en bytes, meme avec text=True).
             partial = _decode_partial(e.stdout) + _decode_partial(e.stderr)
             _log(f"_call_claude_cli: TIMEOUT after {budget}s partial={partial[:400]!r}")
+            # v1.14.18 - un gel dont la sortie partielle dit "login expired"
+            # n'est PAS un timeout : le CLI attend une re-authentification
+            # que personne ne peut donner ici. On le route vers l'UX de
+            # reconnexion (claude /login) au lieu de l'echelle de repli --
+            # redescendre les barreaux ne reconnecte personne.
+            if _looks_not_logged_in(partial):
+                raise ClaudeCliNotLoggedIn(
+                    "Ta session Anthropic est expirée : le CLI attendait une "
+                    "re-authentification au lieu de répondre. Ouvre un "
+                    "terminal et lance : claude /login "
+                    f"(message du CLI : « {partial[:160]} »)")
             raise ClaudeCliTimeout(budget, partial)
         _log(f"_call_claude_cli: exit={res.returncode} in "
              f"{time.monotonic() - started:.1f}s "
@@ -1789,10 +1884,12 @@ def _call_claude_cli(prompt, timeout=120, system_prompt=None,
     if r.returncode != 0:
         _log(f"_call_claude_cli: stdout={stdout[:300]!r} stderr={stderr[:300]!r}")
         combined = (stdout + " " + stderr).lower()
-        # v1.9.5 - cas 'Not logged in' detecte par pattern
-        if "not logged in" in combined or "please run /login" in combined or "please log in" in combined:
+        # v1.9.5 / v1.14.18 - cas 'Not logged in' et 'login expired' detectes
+        # par les memes marqueurs que la sortie partielle d'un gel.
+        if _looks_not_logged_in(combined):
             raise ClaudeCliNotLoggedIn(
-                "Claude Code CLI n'est pas authentifie sur ce systeme. "
+                "Claude Code CLI n'est pas authentifie sur ce systeme "
+                "(ou sa session est expirée). "
                 "Ouvre un terminal et lance la commande : claude /login"
             )
         # v1.14.1 - deux erreurs de demarrage tres bavardes cote CLI mais
@@ -1929,11 +2026,38 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
             "fix_command": "claude /login",
         }
     except ClaudeCliTimeout as e:
+        # v1.14.18 - avant de rendre le timeout a l'utilisateur : si le CLI
+        # porte la signature du binaire perime, l'app le met a jour
+        # ELLE-MEME et reessaie. L'utilisateur a clique "Suggerer" ; c'est
+        # "Suggerer" qui doit aboutir, pas un parcours de boutons.
+        healed, heal_msg = _cli_auto_heal_after_timeout()
+        if healed:
+            _log(f"suggest_skill_description: auto-heal ok ({heal_msg}), "
+                 f"nouvelle tentative")
+            try:
+                raw_response = _call_claude_cli(prompt,
+                                                system_prompt=system_prompt)
+            except Exception as e2:
+                return False, {
+                    "error": (f"{heal_msg} Mais l'appel suivant a encore "
+                              f"échoué : {e2}"),
+                    "error_code": "cli_timeout",
+                    "partial": getattr(e2, "partial", "")}
+            suggestion = _clean_suggestion(raw_response)
+            if suggestion:
+                return True, {"suggestion": suggestion,
+                              "source": "claude_cli",
+                              "chars_sent": len(content),
+                              "raw_chars": len(raw_response or ""),
+                              "lang": lang, "healed": heal_msg}
         # v1.14.3 - on ne renvoie plus l'utilisateur vers un terminal : le
         # message porte ce que le CLI avait ecrit, et l'UI enchaine toute
         # seule sur un diagnostic live (meme binaire, memes flags, meme env).
         _log(f"suggest_skill_description: timeout, partial={e.partial[:200]!r}")
-        return False, {"error": str(e), "error_code": "cli_timeout",
+        err = str(e)
+        if heal_msg and not healed:
+            err = f"{err} (Tentative de mise à jour du CLI : {heal_msg})"
+        return False, {"error": err, "error_code": "cli_timeout",
                        "partial": e.partial}
     except FileNotFoundError as e:
         _log(f"suggest_skill_description: CLI not found : {e}")
@@ -2239,6 +2363,19 @@ def _bulk_repair_worker(targets, lang):
     ok, probe_seconds, probe_error = _bulk_repair_probe()
     with _BULK_REPAIR_LOCK:
         _BULK_REPAIR["probe_seconds"] = round(probe_seconds, 1)
+    if not ok:
+        # v1.14.18 - binaire perime detecte ? L'app le met a jour elle-meme
+        # et refait le preflight, au lieu d'abandonner le lot avec un
+        # message. C'est le lot qui doit aboutir.
+        healed, heal_msg = _cli_auto_heal_after_timeout()
+        if healed:
+            _notify("CLI mis a jour automatiquement", heal_msg or "")
+            _log(f"bulk_repair: auto-heal ok, nouveau preflight")
+            ok, probe_seconds, probe_error = _bulk_repair_probe()
+            with _BULK_REPAIR_LOCK:
+                _BULK_REPAIR["probe_seconds"] = round(probe_seconds, 1)
+        elif heal_msg:
+            probe_error = f"{probe_error} (Tentative de mise à jour du CLI : {heal_msg})"
     if not ok:
         _bulk_repair_abort(probe_error)
         return
@@ -9470,6 +9607,9 @@ async function suggestSkillDescription(){
       ta.value = suggestion;
       document.getElementById('repair-skill-desc-count').textContent = String(ta.value.length);
       setMeta(tr('repair_skill_suggested_via').split('{n}').join(j.chars_sent || 0), 'green');
+      // v1.14.18 - l'app a repare le CLI toute seule en cours de route : on
+      // le dit, sinon la longue attente de CETTE tentative reste inexpliquee.
+      if(j.healed) banner('green', j.healed);
       ta.focus();
     }
   } catch(e){
@@ -10573,6 +10713,9 @@ def _stay_alive_for_app():
 def main():
     SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    # v1.14.18 - l'auto-reparation du CLI n'est armee QUE dans le vrai
+    # serveur (cf. _CLI_AUTO_HEAL).
+    _CLI_AUTO_HEAL["armed"] = True
     start_watchdog()
     print(f"\n  Claude Control v{get_local_version()} - http://localhost:{PORT}")
     print(f"  Cmd+C pour arreter\n")
