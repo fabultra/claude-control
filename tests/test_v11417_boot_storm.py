@@ -157,7 +157,11 @@ class DesktopSkillsTtlTests(unittest.TestCase):
         app._list_desktop_skills()
         self._add("s2", "beta")
         with app._DESKTOP_SKILLS_LOCK:
-            app._DESKTOP_SKILLS_CACHE["ts"] = 0.0
+            # Reculer d'un TTL entier, PAS poser ts=0 : sur un runner CI
+            # fraichement demarre, time.monotonic() vaut ~90 s et
+            # `monotonic - 0 < TTL(120)` lisait le cache comme encore frais
+            # -- echec reproductible uniquement sur machine a faible uptime.
+            app._DESKTOP_SKILLS_CACHE["ts"] -= (app._DESKTOP_SKILLS_TTL + 1)
         self.assertEqual(sorted(i["name"] for i in app._list_desktop_skills()),
                          ["alpha", "beta"])
 
