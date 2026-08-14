@@ -1321,7 +1321,9 @@ def _diagnose_claude_cli_stages():
            # v1.14.13
            "creds_status": None, "creds_detail": None,
            "node_path": None, "node_version": None, "node_warning": None,
-           "debug_tail": None}
+           "debug_tail": None,
+           # v1.14.15
+           "latest_cli_version": None}
     if not cli:
         out["error"] = "claude introuvable dans le PATH"
         return out
@@ -1398,6 +1400,12 @@ def _diagnose_claude_cli_stages():
     if not out["network_ok"]:
         return out
 
+    # v1.14.15 - le reseau est bon : combien de versions de retard a le
+    # CLI ? Un binaire tres en retard dont l'updater est coince est LA
+    # cause etablie sur la machine de reference ; le chiffre rend le
+    # verdict indiscutable.
+    out["latest_cli_version"] = _check_cli_freshness()
+
     # 2. Le reseau est bon : l'appel NU passe-t-il ? Si oui, la panne est
     #    dans les flags de l'app -- typiquement un flag dont une mise a jour
     #    du CLI a change la semantique, ce qui explique un appel qui
@@ -1416,6 +1424,35 @@ def _diagnose_claude_cli_stages():
         out["stage"] = "debug"
         out["debug_tail"] = _cli_debug_tail()
     return out
+
+
+CLI_REGISTRY_URL = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest"
+
+
+def _check_cli_freshness(env=None, timeout=6):
+    """v1.14.15 - Derniere version PUBLIEE du CLI, pour mesurer le retard.
+
+    Cas reel : un binaire fige a 2.1.173 pendant que le public est a
+    2.1.232 -- 59 versions de retard, updater coince. Sans ce chiffre, le
+    diagnostic disait "version 2.1.173" comme un fait sain et l'utilisateur
+    n'avait aucune raison de s'en mefier. Best-effort : hors ligne ou
+    registre injoignable -> None, jamais d'erreur. Le numero npm suit le
+    meme produit que l'installation native.
+    """
+    env = _cli_env() if env is None else env
+    proxies = {}
+    for scheme in ("http", "https"):
+        v = env.get(scheme.upper() + "_PROXY") or env.get(scheme + "_proxy")
+        if v:
+            proxies[scheme] = v
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    try:
+        with opener.open(CLI_REGISTRY_URL, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+        v = str(data.get("version") or "").strip()
+        return v or None
+    except Exception:
+        return None
 
 
 def _cli_debug_tail(timeout=25):
@@ -7371,6 +7408,7 @@ fr: {
   cli_diag_flag_blamed: "Trouvé : l'appel passe sans les options de l'app, et cale dès qu'on ajoute {f}. C'est cette option qui bloque — typiquement parce qu'une mise à jour du CLI en a changé le comportement.",
   cli_diag_flag_generic: "L'appel nu répond en {s} s, l'appel complet non : la panne vient des options utilisées par l'app, pas du CLI ni du réseau.",
   cli_diag_auth: "Le réseau est hors de cause (api.anthropic.com répond), mais aucun appel n'aboutit, même le plus simple. Il reste l'authentification : le CLI n'accède pas à son jeton quand c'est l'app qui le lance.",
+  cli_diag_stale_binary: "Le CLI lui-même est en panne : ton binaire {v} est périmé (dernière version publiée : {l}) et gèle avant d'écrire son journal. Ce n'est ni l'app, ni le réseau, ni l'authentification (jeton ok). Réinstalle-le dans ton terminal : curl -fsSL https://claude.ai/install.sh | bash — puis vérifie avec claude --version.",
   cli_diag_not_logged_in: "Le CLI répond et signale qu'il n'est pas authentifié. Lance « claude /login » dans un terminal, une seule fois.",
   repair_skill_diag_title: "Diagnostic CLI Claude Code",
   repair_skill_not_logged_in_title: "Connexion Claude Code requise",
@@ -7728,6 +7766,7 @@ en: {
   cli_diag_flag_blamed: "Found it: the call succeeds without the app's options, and stalls as soon as {f} is added. That option is the blocker — typically because a CLI update changed its behaviour.",
   cli_diag_flag_generic: "The bare call answers in {s}s, the full one does not: the failure comes from the options the app uses, not from the CLI or the network.",
   cli_diag_auth: "The network is ruled out (api.anthropic.com answers), yet no call succeeds, not even the simplest one. Authentication is what remains: the CLI cannot reach its token when the app launches it.",
+  cli_diag_stale_binary: "The CLI itself is broken: your binary {v} is stale (latest published: {l}) and freezes before writing its own log. Not the app, not the network, not authentication (token ok). Reinstall it in your terminal: curl -fsSL https://claude.ai/install.sh | bash — then check with claude --version.",
   cli_diag_not_logged_in: "The CLI answers and reports it is not authenticated. Run 'claude /login' in a terminal, once.",
   repair_skill_diag_title: "Claude Code CLI diagnostic",
   repair_skill_not_logged_in_title: "Claude Code login required",
@@ -9005,6 +9044,15 @@ function cliDiagVerdict(d){
     text: tr('cli_diag_flag_blamed').replace('{f}', d.blamed_flag)};
   if (d.minimal_ok === true) return {tone:'red',
     text: tr('cli_diag_flag_generic').replace('{s}', String(d.minimal_seconds))};
+  // v1.14.15 - l'appel nu cale AUSSI, mais les sondes v1.14.13 ont blanchi
+  // le jeton : accuser "l'authentification" contredisait la ligne
+  // "jeton: ok" affichee juste en dessous (verdict d'avant les sondes).
+  // Le coupable restant est le binaire lui-meme -- et le retard chiffre
+  // sur la derniere version publiee rend le verdict indiscutable.
+  if (d.minimal_ok === false && d.creds_status === 'ok') return {tone:'red',
+    text: tr('cli_diag_stale_binary')
+      .replace('{v}', d.version||'?')
+      .replace('{l}', d.latest_cli_version||'?')};
   if (d.minimal_ok === false) return {tone:'red', text: tr('cli_diag_auth')};
   if (d.partial) return {tone:'red',
     text: tr('cli_diag_ping_stuck').replace('{p}', d.partial.substring(0,300))};
@@ -9061,6 +9109,7 @@ async function diagClaudeCli(target){
     if (d.minimal_ok != null) rows.push('appel nu / bare call: ' + (d.minimal_ok ? 'ok (' + d.minimal_seconds + 's)' : tr('cli_diag_failed')));
     if (d.blamed_flag) rows.push('option en cause: ' + d.blamed_flag);
     if (d.env_recovered && d.env_recovered.length) rows.push('env shell: ' + d.env_recovered.join(', '));
+    if (d.latest_cli_version) rows.push('derniere version publiee du CLI: ' + d.latest_cli_version + (d.version ? ' (la tienne: ' + d.version + ')' : ''));
     if (d.debug_tail) rows.push('--- journal --debug du CLI (la derniere ligne = ou il bloque) ---\n' + d.debug_tail);
     const facts = rows.join('\n');
     // v1.14.14 - le rapport complet est copiable en un clic : c'est la seule
