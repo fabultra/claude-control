@@ -370,31 +370,61 @@ def _auto_category(description, name=""):
     return None
 
 
+# v1.14.17 - cache par mtime : get_state() lit les meta de CHAQUE skill a
+# CHAQUE appel (N fichiers x 18 appels/min). Le mtime invalide naturellement
+# (une reparation reecrit le fichier), et le cache se vide s'il enfle.
+_SKILL_META_CACHE = {}
+_SKILL_META_LOCK = threading.Lock()
+_SKILL_META_CACHE_MAX = 4096
+
+
 def read_skill_meta(skill_dir):
     """Lit le frontmatter YAML d'un SKILL.md et retourne {category, description, tags}."""
     meta = {"category": None, "description": None, "tags": []}
     md = skill_dir / "SKILL.md"
-    if not md.exists():
+    try:
+        mtime = md.stat().st_mtime_ns
+    except OSError:
         return meta
+    cache_key = str(md)
+    with _SKILL_META_LOCK:
+        hit = _SKILL_META_CACHE.get(cache_key)
+        if hit and hit[0] == mtime:
+            cached = hit[1]
+            return {"category": cached["category"],
+                    "description": cached["description"],
+                    "tags": list(cached["tags"])}
+
+    def _store(result):
+        with _SKILL_META_LOCK:
+            if len(_SKILL_META_CACHE) >= _SKILL_META_CACHE_MAX:
+                _SKILL_META_CACHE.clear()
+            _SKILL_META_CACHE[cache_key] = (mtime, {
+                "category": result["category"],
+                "description": result["description"],
+                "tags": list(result["tags"])})
+        return result
+
     try:
         content = md.read_text(errors="replace")
     except Exception:
+        # Erreur de lecture potentiellement transitoire : on ne cache pas.
         return meta
     if not content.startswith("---"):
-        return meta
+        return _store(meta)
     end = content.find("\n---", 3)
     if end == -1:
-        return meta
+        return _store(meta)
     fm_lines = content[3:end].splitlines()
-    for key, start, stop in _frontmatter_entries(fm_lines):
-        if key in ("category", "description"):
-            meta[key] = _frontmatter_scalar(fm_lines, (key, start, stop)) or None
-        elif key == "tags":
+    for fm_key, start, stop in _frontmatter_entries(fm_lines):
+        if fm_key in ("category", "description"):
+            meta[fm_key] = _frontmatter_scalar(fm_lines, (fm_key, start, stop)) or None
+        elif fm_key == "tags":
             m = re.match(r'^\s*tags\s*:\s*\[([^\]]*)\]\s*$', fm_lines[start])
             if m:
                 meta["tags"] = [_fm_unquote(t) for t in m.group(1).split(",")
                                 if t.strip()]
-    return meta
+    return _store(meta)
 
 
 # v1.14.5 - Une cle de frontmatter n'occupe pas forcement une seule ligne.
@@ -2539,6 +2569,18 @@ def start_terminal_repair(lang=None, include_synced=False, names=None):
                   "total": len(targets), "started": True}
 
 
+# v1.14.17 - le scan Desktop etait le dernier rglob NON BORNE d'un chemin
+# polle : l'arborescence <session-uuid>/<task-uuid>/ grossit a chaque session
+# Claude Desktop et n'est jamais purgee, et get_state() la re-parcourait a
+# CHAQUE appel (18/min). Sur des mois de sessions, c'est plusieurs secondes
+# par appel -- la premiere salve d'un rechargement de page depassait le
+# timeout du fetch et faisait flasher des bandeaux d'erreur. Un TTL de 2 min
+# suffit largement : cette liste ne bouge qu'a l'ouverture d'une session.
+_DESKTOP_SKILLS_CACHE = {"ts": 0.0, "data": None, "home": None}
+_DESKTOP_SKILLS_LOCK = threading.Lock()
+_DESKTOP_SKILLS_TTL = 120
+
+
 def _list_desktop_skills():
     """v1.13.3 - Skills decompresses par Claude Desktop pour ses sessions
     actives. Path concret repere via diag fait sur la machine de Fabien :
@@ -2551,10 +2593,22 @@ def _list_desktop_skills():
     session ouverte, le dir peut etre absent ou vide. Quand on detecte
     un SKILL.md, on considere le skill 'actif' (charge actuellement par
     Claude Desktop).
+
+    v1.14.17 - resultat mis en cache _DESKTOP_SKILLS_TTL secondes (cf. bloc
+    ci-dessus).
     """
+    home_key = str(HOME)
+    with _DESKTOP_SKILLS_LOCK:
+        c = _DESKTOP_SKILLS_CACHE
+        if (c["data"] is not None and c["home"] == home_key
+                and time.monotonic() - c["ts"] < _DESKTOP_SKILLS_TTL):
+            return list(c["data"])
     items = []
     base = HOME / "Library/Application Support/Claude/local-agent-mode-sessions/skills-plugin"
     if not base.is_dir():
+        with _DESKTOP_SKILLS_LOCK:
+            _DESKTOP_SKILLS_CACHE.update({"ts": time.monotonic(), "data": [],
+                                          "home": home_key})
         return items
     seen = set()
     try:
@@ -2575,6 +2629,9 @@ def _list_desktop_skills():
                 continue
     except Exception:
         pass
+    with _DESKTOP_SKILLS_LOCK:
+        _DESKTOP_SKILLS_CACHE.update({"ts": time.monotonic(),
+                                      "data": list(items), "home": home_key})
     return items
 
 
@@ -2845,7 +2902,61 @@ def _list_plugin_mcps():
     ]
 
 
+# v1.14.17 - cache court + single-flight sur get_state().
+#
+# La page de boot tire ~12 requetes d'un coup, et /api/overview refaisait un
+# get_state() complet en plus de celui de /api/state : 18 calculs
+# integraux/minute dont un tiers redondant, chacun relisant les meta de tous
+# les skills et rescannant le dossier Desktop. La premiere salve d'un
+# rechargement pouvait depasser le timeout du fetch -> bandeaux d'erreur
+# furtifs. 2,5 s de TTL suffisent a fusionner une salve sans rendre l'UI
+# perceptiblement perimee ; toute route POST qui change l'etat invalide le
+# cache (cf. do_POST) pour que le loadState() qui suit un toggle soit frais.
+_STATE_CACHE = {"ts": 0.0, "data": None, "key": None}
+_STATE_CACHE_LOCK = threading.Lock()
+_STATE_COMPUTE_LOCK = threading.Lock()
+_STATE_TTL = 2.5
+
+
+def _state_cache_key():
+    """v1.14.17 - le cache n'est valide QUE pour les chemins depuis lesquels
+    il a ete calcule. En production ils ne bougent jamais ; dans les tests,
+    chaque cas repatche SKILLS_DIR & co vers son tempdir -- sans cette cle,
+    un test pouvait recevoir l'etat calcule pour le tempdir du test
+    precedent (flake reelle observee sous `unittest discover`)."""
+    return (str(CONFIG_PATH), str(SKILLS_DIR), str(SKILLS_DISABLED_DIR),
+            str(HOME))
+
+
+def _invalidate_state_cache():
+    with _STATE_CACHE_LOCK:
+        _STATE_CACHE["ts"] = 0.0
+        _STATE_CACHE["data"] = None
+        _STATE_CACHE["key"] = None
+
+
 def get_state():
+    key = _state_cache_key()
+    with _STATE_CACHE_LOCK:
+        c = _STATE_CACHE
+        if (c["data"] is not None and c["key"] == key
+                and time.monotonic() - c["ts"] < _STATE_TTL):
+            return c["data"]
+    with _STATE_COMPUTE_LOCK:
+        with _STATE_CACHE_LOCK:
+            c = _STATE_CACHE
+            if (c["data"] is not None and c["key"] == key
+                    and time.monotonic() - c["ts"] < _STATE_TTL):
+                return c["data"]
+        data = _compute_state()
+        with _STATE_CACHE_LOCK:
+            _STATE_CACHE["ts"] = time.monotonic()
+            _STATE_CACHE["data"] = data
+            _STATE_CACHE["key"] = _state_cache_key()
+        return data
+
+
+def _compute_state():
     config, config_error = load_config_safe()
     active = config.get("mcpServers", {})
     disabled = config.get("_disabledMcps", {})
@@ -7436,6 +7547,7 @@ fr: {
   bulk_repair_synced_btn: "+ {n} skills synchronisés",
   cli_diag_copy: "Copier le rapport",
   cli_update_btn: "Mettre à jour le CLI ({v} → {l})",
+  cli_update_btn_short: "Mettre à jour le CLI",
   cli_update_latest: "dernière version",
   cli_update_running: "Mise à jour du CLI…",
   confirm_cli_update: "Mettre à jour le CLI Claude Code ?\n\n• Exécute l'installeur officiel Anthropic (claude.ai/install.sh)\n• Remplace uniquement l'outil `claude` du terminal\n• NE TOUCHE PAS Claude Desktop (conversations, MCPs, réglages intacts)\n• Durée : ~1-2 min selon le réseau\n\nCONTINUER ?",
@@ -7798,6 +7910,7 @@ en: {
   bulk_repair_synced_btn: "+ {n} synced skills",
   cli_diag_copy: "Copy report",
   cli_update_btn: "Update the CLI ({v} → {l})",
+  cli_update_btn_short: "Update the CLI",
   cli_update_latest: "latest",
   cli_update_running: "Updating the CLI…",
   confirm_cli_update: "Update the Claude Code CLI?\n\n• Runs the official Anthropic installer (claude.ai/install.sh)\n• Replaces only the `claude` terminal tool\n• Does NOT touch Claude Desktop (conversations, MCPs, settings intact)\n• Takes ~1-2 min depending on network\n\nCONTINUE?",
@@ -7958,14 +8071,34 @@ function filterPlugins(){
   });
 }
 let CURRENT_STATE = {mcps:[], skills:[]};
+let STATE_ERR_SHOWN = false;
 async function loadState(){
   let s;
   try{
     s = await fetchJSON('/api/state');
   }catch(e){
-    // v1.14.0 - erreur visible au lieu d'une liste figee en silence.
-    banner('red', tr('state_load_failed') + ' ' + String(e.message || e));
-    return;
+    // v1.14.17 - un echec unique n'est pas une panne : au rechargement de
+    // la page, la premiere salve (~12 requetes simultanees) peut depasser
+    // le timeout pendant que le serveur rechauffe ses caches. On reessaie
+    // UNE fois en silence ; le bandeau rouge ne sort que si la seconde
+    // tentative echoue aussi. Avant : des erreurs flashaient a chaque
+    // rechargement puis disparaissaient toutes seules -- alarme sans objet.
+    try{
+      await new Promise(r=>setTimeout(r, 1500));
+      s = await fetchJSON('/api/state');
+    }catch(e2){
+      // v1.14.0 - erreur visible au lieu d'une liste figee en silence.
+      banner('red', tr('state_load_failed') + ' ' + String(e2.message || e2));
+      STATE_ERR_SHOWN = true;
+      return;
+    }
+  }
+  if(STATE_ERR_SHOWN){
+    // v1.14.17 - le serveur repond a nouveau : l'alerte ne doit pas rester
+    // affichee comme si la panne durait.
+    STATE_ERR_SHOWN = false;
+    const b = document.getElementById('banner');
+    if(b) b.classList.add('hidden');
   }
   CURRENT_STATE = s;
   // v1.14.0 - claude_desktop_config.json illisible (virgule en trop apres une
@@ -8481,7 +8614,8 @@ async function refreshBulkRepair(){
   const offerTerminal = !st.running && st.mode !== 'terminal'
     && (st.outcome === 'aborted' || st.outcome === 'all_failed' || st.outcome === 'partial');
   const terminalBtn = offerTerminal
-    ? `<button onclick="startTerminalRepair()" title="${escAttr(tr('bulk_terminal_title'))}" class="text-xs px-2.5 py-1 rounded-full bg-green-700 hover:bg-green-800 text-white font-medium">${escAttr(tr('bulk_terminal_btn'))}</button>`
+    ? `<button onclick="updateClaudeCli(this)" title="${escAttr(tr('confirm_cli_update').split('\n')[0])}" class="text-xs px-2.5 py-1 rounded-full bg-green-700 hover:bg-green-800 text-white font-medium">${escAttr(tr('cli_update_btn_short'))}</button>`
+      + `<button onclick="startTerminalRepair()" title="${escAttr(tr('bulk_terminal_title'))}" class="text-xs px-2.5 py-1 rounded-full bg-stone-700 hover:bg-stone-800 text-white font-medium">${escAttr(tr('bulk_terminal_btn'))}</button>`
     : '';
   const actions = st.running
     ? `<button onclick="cancelBulkRepair()" class="text-xs px-2.5 py-1 rounded-full bg-stone-100 text-stone-700 border border-stone-200 hover:bg-stone-200">${escAttr(tr('bulk_repair_cancel'))}</button>`
@@ -9291,12 +9425,22 @@ async function suggestSkillDescription(){
         // v1.14.13 - et la voie de secours est offerte tout de suite : le
         // meme appel, execute dans le Terminal de l'utilisateur, ou le CLI
         // fonctionne par definition.
+        // v1.14.17 - les DEUX gestes utiles apparaissent DES le timeout, pas
+        // apres les ~3 minutes du diagnostic : mettre a jour le CLI (la
+        // cause etablie : binaire perime qui gele) et reparer via le
+        // Terminal (le contournement).
         setMeta(
           '<strong>&#9888; ' + escAttr(msg) + '</strong>'
-          + '<div class="mt-2"><button onclick="var n=CURRENT_REPAIR_SKILL;closeRepairSkill();startTerminalRepair([n])" '
-          + 'title="' + escAttr(tr('bulk_terminal_title')) + '" '
+          + '<div class="mt-2 flex flex-wrap items-center gap-2">'
+          + '<button onclick="updateClaudeCli(this)" '
+          + 'title="' + escAttr(tr('confirm_cli_update').split('\n')[0]) + '" '
           + 'class="text-xs px-2.5 py-1 rounded-full bg-green-700 hover:bg-green-800 text-white font-medium">'
-          + escAttr(tr('bulk_terminal_btn')) + '</button></div>'
+          + escAttr(tr('cli_update_btn_short')) + '</button>'
+          + '<button onclick="var n=CURRENT_REPAIR_SKILL;closeRepairSkill();startTerminalRepair([n])" '
+          + 'title="' + escAttr(tr('bulk_terminal_title')) + '" '
+          + 'class="text-xs px-2.5 py-1 rounded-full bg-stone-700 hover:bg-stone-800 text-white font-medium">'
+          + escAttr(tr('bulk_terminal_btn')) + '</button>'
+          + '</div>'
           + '<div id="repair-skill-diag" class="mt-2"></div>',
           'red'
         );
@@ -10145,6 +10289,15 @@ _CONFIG_MUTATING_ROUTES = {
 # Routes qui recoivent un binaire brut (upload ZIP) : pas de Content-Type JSON.
 _RAW_BODY_ROUTES = {"/api/import-skill-zip", "/api/import-mcp-zip"}
 
+# v1.14.17 - routes qui changent l'etat SANS toucher un fichier de config
+# (kill/start de process) : elles doivent aussi invalider le cache court de
+# get_state.
+_STATE_AFFECTING_ROUTES = {
+    "/api/restart-mcp", "/api/stop-mcp", "/api/start-mcp",
+    "/api/restart-claude", "/api/restart-claude-desktop",
+    "/api/restart-extension",
+}
+
 _ALLOWED_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"[::1]:{PORT}"}
 _ALLOWED_ORIGINS = {f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}",
                     f"http://[::1]:{PORT}"}
@@ -10379,6 +10532,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     ok, msg = routes[path]()
             except Exception as e:
                 ok, msg = False, f"Erreur serveur : {e}"
+            # v1.14.17 - toute action qui peut changer l'etat invalide le
+            # cache court de get_state : le loadState() qui suit un toggle
+            # doit voir le resultat du toggle, pas la photo d'avant.
+            if path in _CONFIG_MUTATING_ROUTES or path in _STATE_AFFECTING_ROUTES:
+                _invalidate_state_cache()
             if isinstance(msg, dict):
                 self._json({"success": ok, **msg})
             else:
