@@ -361,7 +361,14 @@ class NestedSessionEnvIsStrippedTests(unittest.TestCase):
         env = self._env({"PATH": "/usr/bin",
                          "CLAUDE_CODE_ENTRYPOINT": "cli",
                          "CLAUDE_CODE_SSE_PORT": "1234"})
-        self.assertEqual([k for k in env if k.startswith("CLAUDE_CODE_")], [])
+        # v1.14.14 - l'intention reste : aucun marqueur HERITE ne survit.
+        # La seule variable CLAUDE_CODE_* restante est celle que l'app pose
+        # elle-meme apres le scrub (auto-updater coupe), deliberement.
+        self.assertNotIn("CLAUDE_CODE_ENTRYPOINT", env)
+        self.assertNotIn("CLAUDE_CODE_SSE_PORT", env)
+        self.assertEqual(
+            [k for k in env if k.startswith("CLAUDE_CODE_")],
+            ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"])
 
     def test_unrelated_variables_survive(self):
         env = self._env({"PATH": "/usr/bin", "HOME": "/Users/x",
