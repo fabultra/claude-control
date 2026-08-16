@@ -10911,6 +10911,84 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return
 
 
+# ─── v1.15.0 - Retention des backups ────────────────────────────────────────
+# Chaque action destructrice laisse un filet de securite (zip/json dans
+# BACKUP_DIR ou ORPHAN_BACKUP_DIR) et chaque reparation via le Terminal un
+# dossier de run dans TERMINAL_REPAIR_DIR. Rien n'etait jamais purge : des
+# mois d'usage accumulaient des centaines d'archives. Politique : supprimer
+# ce qui a plus de BACKUP_RETENTION_DAYS jours en conservant TOUJOURS les
+# BACKUP_RETENTION_MIN_KEEP entrees les plus recentes de chaque racine -- un
+# utilisateur inactif six mois garde ses derniers filets. La purge n'est
+# armee QUE par main(), comme _CLI_AUTO_HEAL : une suite de tests qui
+# oublierait de rediriger les chemins ne peut pas vider les vrais backups.
+BACKUP_RETENTION_DAYS = 30
+BACKUP_RETENTION_MIN_KEEP = 10
+_RETENTION_STATE = {"armed": False}
+
+
+def _purge_dir_entries(root, kind, cutoff_ts, min_keep):
+    """Purge les enfants DIRECTS de `root` plus vieux que cutoff_ts.
+
+    kind "files" : fichiers seulement -- les sous-dossiers (orphan-plugins/
+    sous BACKUP_DIR) sont des racines a part entiere, jamais des entrees.
+    kind "dirs" : dossiers de run seulement. Un symlink est detache
+    (unlink), jamais suivi ni parcouru. Retourne (supprimes, gardes,
+    erreurs).
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return 0, 0, 0
+    entries = []
+    for child in root.iterdir():
+        try:
+            real_dir = child.is_dir() and not child.is_symlink()
+            if kind == "files" and real_dir:
+                continue
+            if kind == "dirs" and not (real_dir or child.is_symlink()):
+                continue
+            entries.append((child.lstat().st_mtime, child))
+        except OSError:
+            continue
+    entries.sort(key=lambda t: t[0], reverse=True)  # plus recents d'abord
+    deleted = errors = 0
+    for i, (mtime, child) in enumerate(entries):
+        if i < min_keep or mtime >= cutoff_ts:
+            continue
+        try:
+            if child.is_symlink() or not child.is_dir():
+                child.unlink()
+            else:
+                shutil.rmtree(child)
+            deleted += 1
+        except OSError:
+            errors += 1
+    return deleted, len(entries) - deleted, errors
+
+
+def purge_old_backups():
+    """Applique la retention aux trois racines de l'app.
+
+    Les chemins sont les constantes du module, jamais une entree de requete.
+    Sans armement par main(), ne touche a rien -- invariante de
+    construction, cf. le commentaire de _RETENTION_STATE.
+    """
+    if not _RETENTION_STATE["armed"]:
+        return 0, 0
+    cutoff = time.time() - BACKUP_RETENTION_DAYS * 86400
+    total_deleted = total_errors = 0
+    for root, kind in ((BACKUP_DIR, "files"),
+                       (ORPHAN_BACKUP_DIR, "files"),
+                       (TERMINAL_REPAIR_DIR, "dirs")):
+        deleted, kept, errors = _purge_dir_entries(
+            root, kind, cutoff, BACKUP_RETENTION_MIN_KEEP)
+        total_deleted += deleted
+        total_errors += errors
+        if deleted or errors:
+            _log(f"retention {root}: {deleted} purge(s), {kept} garde(s), "
+                 f"{errors} erreur(s)")
+    return total_deleted, total_errors
+
+
 def _show_dialog(message):
     """Show a macOS dialog via osascript. Best-effort, no-op elsewhere."""
     try:
@@ -10955,6 +11033,23 @@ def main():
 
     threading.Thread(target=_startup_session_check,
                      name="claude-control-session-check",
+                     daemon=True).start()
+    # v1.15.0 - retention des backups : armee ici seulement, puis purge en
+    # fond au demarrage et une fois par jour tant que l'app tourne.
+    _RETENTION_STATE["armed"] = True
+
+    def _retention_loop():
+        delay = 15  # laisser le demarrage respirer
+        while True:
+            time.sleep(delay)
+            delay = 86400
+            try:
+                purge_old_backups()
+            except Exception as e:
+                _log(f"retention: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_retention_loop,
+                     name="claude-control-backup-retention",
                      daemon=True).start()
     start_watchdog()
     print(f"\n  Claude Control v{get_local_version()} - http://localhost:{PORT}")
