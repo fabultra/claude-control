@@ -139,9 +139,17 @@ quarantine attribute, and refreshes LaunchServices.
 
 ## Development
 
-The whole app is in [`src/app.py`](src/app.py) — a single Python file using only stdlib.
+The app ships as [`src/app.py`](src/app.py) — a single Python file using only
+stdlib. Since v1.15.0 that file is **assembled** from editable sources in
+[`src/parts/`](src/parts) (`backend.py` + `ui.html` + `server.py`) by
+[`scripts/build.py`](scripts/build.py); CI fails if the two ever drift.
+See [`docs/BUILD.md`](docs/BUILD.md), and
+[`docs/CLI-HEALTH.md`](docs/CLI-HEALTH.md) for the CLI-health state machine.
 
 ```bash
+# Edit src/parts/*, then regenerate the single-file artifact
+python3 scripts/build.py          # (--check to verify, --split to re-derive)
+
 # Run locally during development
 python3 src/app.py
 

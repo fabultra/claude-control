@@ -19,6 +19,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      # v1.15.0 - src/app.py est ASSEMBLE depuis src/parts/ par
+      # scripts/build.py. Editer l'un sans regenerer l'autre casse ici,
+      # jamais silencieusement.
+      - name: Build check (app.py == parts)
+        run: python3 scripts/build.py --check
+
       - name: Compile check
         run: python3 -m py_compile src/app.py
 
