@@ -3232,15 +3232,19 @@ def _compute_state():
     active = config.get("mcpServers", {})
     disabled = config.get("_disabledMcps", {})
     running = get_running_mcps(config)
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
+    # v1.15.0 - plus de mkdir ici : un GET /api/state ne doit rien ecrire
+    # sur le disque. Les dossiers sont crees par main() au demarrage et par
+    # chaque route POST qui en a besoin ; s'ils manquent, l'etat est
+    # simplement vide.
     active_skills = sorted([d.name for d in SKILLS_DIR.iterdir()
                             if d.is_dir() and (d / "SKILL.md").exists()
                             and not d.name.startswith(".")
-                            and d.name != SYNCED_SKILLS_DIRNAME])
+                            and d.name != SYNCED_SKILLS_DIRNAME]) \
+        if SKILLS_DIR.is_dir() else []
     disabled_skills = sorted([d.name for d in SKILLS_DISABLED_DIR.iterdir()
                               if d.is_dir() and not d.name.startswith(".")
-                              and (d / "SKILL.md").exists()])
+                              and (d / "SKILL.md").exists()]) \
+        if SKILLS_DISABLED_DIR.is_dir() else []
     # v1.7.7 - usage counts par skill via parsing JSONL des sessions Claude Code,
     # injecte par skill pour rendre actionable la qualite vs usage dans la tab.
     try:
@@ -10712,6 +10716,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin is not None and origin.strip().lower() not in _ALLOWED_ORIGINS:
             return False, f"Origin non autorise : {origin}"
+        # v1.15.0 - quatrieme verrou : Fetch Metadata. Les GET "simples"
+        # (<img src=...>, cf. le poll UI) ne portent jamais d'Origin, donc
+        # la garde ci-dessus les laissait passer depuis n'importe quel site.
+        # Les navigateurs modernes annoncent la provenance de CHAQUE requete
+        # via Sec-Fetch-Site : une requete declaree cross-site est refusee.
+        # Seule exception : la navigation HAUT NIVEAU (cliquer un lien vers
+        # http://localhost:8765 depuis une page web) -- GET + mode navigate
+        # + dest document ; un iframe cross-site (dest=iframe) reste refuse.
+        # Header absent (curl, vieux navigateurs) : on n'exige rien.
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site == "cross-site":
+            mode = (self.headers.get("Sec-Fetch-Mode") or "").strip().lower()
+            dest = (self.headers.get("Sec-Fetch-Dest") or "").strip().lower()
+            if not (self.command in ("GET", "HEAD") and mode == "navigate"
+                    and dest == "document"):
+                return False, "Requete cross-site refusee (Sec-Fetch-Site)"
         return True, ""
 
     def _json(self, data, status=200):
@@ -11035,6 +11055,9 @@ def _stay_alive_for_app():
 
 
 def main():
+    # v1.15.0 - SKILLS_DIR aussi : c'etait le mkdir de _compute_state (GET)
+    # qui le creait en douce, retire depuis.
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     SKILLS_DISABLED_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     # v1.14.18 - l'auto-reparation du CLI n'est armee QUE dans le vrai
