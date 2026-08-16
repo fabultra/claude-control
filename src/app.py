@@ -3801,26 +3801,63 @@ def delete_plugin(full_name, delete_files=False):
     return True, msg
 
 
+# ─── v1.15.0 - LE clone git de l'app ────────────────────────────────────────
+# Trois importeurs (plugin, MCP, skill) portaient chacun leur copie du meme
+# `git clone --depth 1` avec des timeouts divergents (120/90/90 s) et des
+# gestions d'erreurs differentes -- import_skill_git attrapait meme le
+# timeout dans un `except Exception` au message inexploitable. Un seul
+# chemin desormais : memes messages, meme timeout, memes exceptions.
+_GIT_CLONE_TIMEOUT = 120
+
+
+def _git_url_ok(url):
+    return (url or "").strip().startswith(("https://", "http://", "git@"))
+
+
+def _git_repo_name(url):
+    """Nom de repo derive du dernier segment de l'URL, ou None s'il n'est
+    pas un composant de chemin sur.
+
+    Garde v1.14.12 : '..' donnait target=~/.claude et le rmtree du 'clone
+    existant' EFFACAIT tout ~/.claude ; un segment vide ('https://x/.git')
+    rasait le dossier d'import lui-meme. _safe_component ferme les deux.
+    """
+    name = re.sub(r'\.git$', '',
+                  (url or "").strip().rstrip('/').split('/')[-1])
+    return name if _safe_component(name) else None
+
+
+def _git_clone_shallow(url, target):
+    """Clone --depth 1 de `url` vers `target`. Retourne (ok, erreur)."""
+    if not _git_url_ok(url):
+        return False, "URL Git invalide (doit commencer par https:// ou git@)"
+    try:
+        r = subprocess.run(
+            ["git", "clone", "--depth", "1", (url or "").strip(), str(target)],
+            capture_output=True, text=True, timeout=_GIT_CLONE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, f"Timeout git clone ({_GIT_CLONE_TIMEOUT}s)"
+    except FileNotFoundError:
+        return False, "git n'est pas installé"
+    if r.returncode != 0:
+        return False, f"git clone : {(r.stderr or '')[:200]}"
+    return True, ""
+
+
 def add_plugin_from_git(url):
     url = (url or "").strip()
-    if not (url.startswith("https://") or url.startswith("http://") or url.startswith("git@")):
+    if not _git_url_ok(url):
         return False, "URL Git invalide (doit commencer par https:// ou git@)"
-    repo_name = re.sub(r'\.git$', '', url.rstrip('/').split('/')[-1])
-    if not repo_name or "/" in repo_name:
+    repo_name = _git_repo_name(url)
+    if repo_name is None:
         return False, "Impossible de déterminer le nom du repo depuis l'URL"
     cache_dir = HOME / ".claude/plugins/cache/manual" / repo_name
     if cache_dir.exists():
         return False, f"Un plugin existe déjà dans {cache_dir}. Supprime-le d'abord."
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        r = subprocess.run(["git", "clone", "--depth", "1", url, str(cache_dir)],
-                           capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            return False, f"git clone : {r.stderr[:200]}"
-    except subprocess.TimeoutExpired:
-        return False, "Timeout git clone (120s)"
-    except FileNotFoundError:
-        return False, "git n'est pas installé"
+    cloned, err = _git_clone_shallow(url, cache_dir)
+    if not cloned:
+        return False, err
     candidates = list(cache_dir.rglob("plugin.json"))
     if not candidates:
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -6442,30 +6479,21 @@ def import_mcp_file(path):
 
 
 def import_mcp_git(url):
-    url = url.strip()
-    if not (url.startswith("https://") or url.startswith("http://") or url.startswith("git@")):
+    url = (url or "").strip()
+    if not _git_url_ok(url):
         return False, "URL Git invalide (doit commencer par https:// ou git@)"
     IMPORTED_REPOS_DIR.mkdir(parents=True, exist_ok=True)
-    name = re.sub(r'\.git$', '', url.rstrip('/').split('/')[-1])
-    # v1.14.12 - le nom derive de l'URL doit rester un composant de chemin
-    # sur. `https://x/..` donnait name='..', donc target=~/.claude, et le
-    # rmtree ci-dessous EFFACAIT tout ~/.claude (skills, settings, plugins,
-    # historique) avant meme le clone. Une URL vide de segment ('https://x/')
-    # donnait name='' -> target=imported-mcps/ lui-meme, rase pareil.
-    if not _safe_component(name):
-        return False, f"Nom de repo indeductible de l'URL ({name!r})"
+    # Garde v1.14.12 (voir _git_repo_name) : le rmtree ci-dessous rendait un
+    # nom '..' ou vide catastrophique.
+    name = _git_repo_name(url)
+    if name is None:
+        return False, "Nom de repo indéductible de l'URL"
     target = IMPORTED_REPOS_DIR / name
     if target.exists():
         shutil.rmtree(target)
-    try:
-        r = subprocess.run(["git", "clone", "--depth", "1", url, str(target)],
-                           capture_output=True, text=True, timeout=90)
-        if r.returncode != 0:
-            return False, f"git clone : {r.stderr[:200]}"
-    except subprocess.TimeoutExpired:
-        return False, "Timeout git clone (90s)"
-    except FileNotFoundError:
-        return False, "git n'est pas installe"
+    cloned, err = _git_clone_shallow(url, target)
+    if not cloned:
+        return False, err
     candidates = list(target.rglob("claude_desktop_config*.json")) + list(target.rglob("mcp.json"))
     if candidates:
         ok, msg = import_mcp_file(str(candidates[0]))
@@ -6487,25 +6515,20 @@ def import_skill_folder(path):
 
 
 def import_skill_git(url):
-    url = url.strip()
-    if not (url.startswith("https://") or url.startswith("http://") or url.startswith("git@")):
-        return False, "URL Git invalide"
-    name = re.sub(r'\.git$', '', url.rstrip('/').split('/')[-1])
-    # v1.14.12 - meme garde que import_mcp_git : un nom '..' ou '' derive de
-    # l'URL sortait de skills/ (ici sans rmtree, mais le clone atterrissait
-    # hors du dossier prevu).
-    if not _safe_component(name):
-        return False, f"Nom de repo indeductible de l'URL ({name!r})"
+    url = (url or "").strip()
+    if not _git_url_ok(url):
+        return False, "URL Git invalide (doit commencer par https:// ou git@)"
+    # Garde v1.14.12 (voir _git_repo_name) : un nom '..' ou vide sortait de
+    # skills/ (ici sans rmtree, mais le clone atterrissait hors du dossier).
+    name = _git_repo_name(url)
+    if name is None:
+        return False, "Nom de repo indéductible de l'URL"
     target = SKILLS_DIR / name
     if target.exists():
         return False, f"Skill '{name}' existe deja"
-    try:
-        r = subprocess.run(["git", "clone", "--depth", "1", url, str(target)],
-                           capture_output=True, text=True, timeout=90)
-        if r.returncode != 0:
-            return False, f"git clone : {r.stderr[:200]}"
-    except Exception as e:
-        return False, f"Erreur git : {e}"
+    cloned, err = _git_clone_shallow(url, target)
+    if not cloned:
+        return False, err
     if not (target / "SKILL.md").exists():
         nested = list(target.rglob("SKILL.md"))
         if not nested:
