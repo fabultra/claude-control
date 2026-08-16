@@ -7066,6 +7066,48 @@ def cleanup_plugin_orphan(full_name, version):
     return True, f"Version orpheline {version} de '{full_name}' supprimee (backup : {backup_path.name})"
 
 
+def cleanup_all_plugin_orphans():
+    """v1.14.20 - Nettoie TOUTES les versions orphelines en un clic.
+
+    Demande utilisateur : la Vue d'ensemble annoncait "8 version(s)
+    orpheline(s) de plugin" mais la correction demandait huit clics et huit
+    confirmations, un par carte de plugin. Ce lot reutilise, orphelin par
+    orphelin, le chemin eprouve de cleanup_plugin_orphan : backup .zip dans
+    ~/.claude/backups/claude-control/orphan-plugins/ puis suppression du
+    dossier de cache -- la version active n'est jamais touchee (refus
+    explicite dans cleanup_plugin_orphan). Un echec sur un orphelin
+    n'empeche pas les autres ; le compte rendu liste les deux camps.
+    """
+    try:
+        plugins = list_plugins()
+    except Exception as e:
+        return False, f"Listing des plugins impossible : {e}"
+    targets = [(p["full_name"], v) for p in plugins
+               for v in (p.get("extra_versions") or [])]
+    if not targets:
+        return True, {"message": "Aucune version orpheline à nettoyer",
+                      "cleaned": [], "failed": []}
+    cleaned, failed = [], []
+    for full_name, version in targets:
+        try:
+            ok, msg = cleanup_plugin_orphan(full_name, version)
+        except Exception as e:
+            ok, msg = False, f"{type(e).__name__}: {e}"
+        if ok:
+            cleaned.append({"plugin": full_name, "version": version})
+        else:
+            failed.append({"plugin": full_name, "version": version,
+                           "error": str(msg)[:200]})
+        _log(f"cleanup_all_plugin_orphans: {full_name} v{version} -> "
+             f"{'ok' if ok else msg}")
+    head = f"{len(cleaned)} version(s) orpheline(s) nettoyée(s)"
+    if failed:
+        head += f", {len(failed)} en échec"
+    head += " — backups : ~/.claude/backups/claude-control/orphan-plugins/"
+    return bool(cleaned) or not failed, {
+        "message": head, "cleaned": cleaned, "failed": failed}
+
+
 def toggle_plugin(full_name):
     if not full_name:
         return False, "Nom de plugin requis"
@@ -7828,6 +7870,9 @@ fr: {
   cli_update_btn_short: "Mettre à jour le CLI",
   cli_session_expired_title: "Session Claude CLI expirée — la réparation des skills ne peut pas fonctionner sans reconnexion.",
   btn_relogin: "Se reconnecter",
+  btn_cleanup_all_orphans: "Tout nettoyer",
+  cleanup_all_running: "Nettoyage des versions orphelines…",
+  confirm_cleanup_all_orphans: "Nettoyer les {n} versions orphelines de plugins ?\n\n• Chaque dossier de cache orphelin → backup .zip puis suppression\n• Les versions ACTIVES des plugins ne sont jamais touchées\n• Backups : ~/.claude/backups/claude-control/orphan-plugins/\n\nCONTINUER ?",
   cli_update_latest: "dernière version",
   cli_update_running: "Mise à jour du CLI…",
   confirm_cli_update: "Mettre à jour le CLI Claude Code ?\n\n• Exécute l'installeur officiel Anthropic (claude.ai/install.sh)\n• Remplace uniquement l'outil `claude` du terminal\n• NE TOUCHE PAS Claude Desktop (conversations, MCPs, réglages intacts)\n• Durée : ~1-2 min selon le réseau\n\nCONTINUER ?",
@@ -8193,6 +8238,9 @@ en: {
   cli_update_btn_short: "Update the CLI",
   cli_session_expired_title: "Claude CLI session expired — skill repair cannot work until you log in again.",
   btn_relogin: "Log in again",
+  btn_cleanup_all_orphans: "Clean up all",
+  cleanup_all_running: "Cleaning orphan versions…",
+  confirm_cleanup_all_orphans: "Clean up the {n} orphan plugin versions?\n\n• Each orphan cache directory → .zip backup then deletion\n• ACTIVE plugin versions are never touched\n• Backups: ~/.claude/backups/claude-control/orphan-plugins/\n\nCONTINUE?",
   cli_update_latest: "latest",
   cli_update_running: "Updating the CLI…",
   confirm_cli_update: "Update the Claude Code CLI?\n\n• Runs the official Anthropic installer (claude.ai/install.sh)\n• Replaces only the `claude` terminal tool\n• Does NOT touch Claude Desktop (conversations, MCPs, settings intact)\n• Takes ~1-2 min depending on network\n\nCONTINUE?",
@@ -9853,6 +9901,21 @@ async function confirmAddPlugin(){
   banner(j.success?'green':'red', j.message);
   if(j.success){closeAddPlugin();loadPlugins();loadOverview();loadCommands();}
 }
+// v1.14.20 - toutes les versions orphelines en un clic, depuis la ligne
+// sante de la Vue d'ensemble. Memes garanties que le nettoyage unitaire :
+// backup .zip par version, versions actives jamais touchees.
+async function cleanupAllOrphans(n){
+  if(!confirm(tr('confirm_cleanup_all_orphans').split('{n}').join(String(n||'?')))) return;
+  banner('blue', tr('cleanup_all_running'));
+  try{
+    const j = await api('/api/plugin-cleanup-all', {});
+    banner(j.success?'green':'red', j.message);
+    if(j.failed && j.failed.length){
+      j.failed.forEach(f=>errLogPush(`orphan ${f.plugin} v${f.version} : ${f.error}`));
+    }
+    loadPlugins(); loadOverview();
+  }catch(e){ banner('red', String(e.message || e)); }
+}
 async function cleanupOrphan(fn, version, activeVersion){
   // v1.9.9 - confirm popup detaille pour rassurer l'utilisateur. Mention
   // explicite : le plugin actif (activeVersion) reste intact, seul le
@@ -10143,7 +10206,10 @@ async function loadOverview(){
         issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-amber-50 border border-amber-200 text-amber-800"><span>&#9888;</span><span><strong>${h.mcps_failing.length}</strong> ${tr('issue_mcps_not_running')} : ${h.mcps_failing.map(n=>`<button onclick="showMcpError('${escJsAttr(n)}')" class="underline hover:no-underline font-mono">${escAttr(n)}</button>`).join(', ')}</span></div>`);
       }
       if(h.plugin_orphans && h.plugin_orphans.length){
-        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded text-white" style="background:linear-gradient(135deg,#D97757,#C15F3C)"><span>&#9888;</span><span><strong>${h.plugin_orphans.length}</strong> ${tr('issue_orphans')} : ${h.plugin_orphans.map(o=>`${escAttr(o.plugin)} v${escAttr(o.version)}`).join(', ')}</span></div>`);
+        // v1.14.20 - le constat porte enfin son action : "Tout nettoyer"
+        // fait en un clic ce qui demandait un clic + confirmation PAR
+        // orphelin dans l'onglet Plugins.
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded text-white" style="background:linear-gradient(135deg,#D97757,#C15F3C)"><span>&#9888;</span><span class="flex-1"><strong>${h.plugin_orphans.length}</strong> ${tr('issue_orphans')} : ${h.plugin_orphans.map(o=>`${escAttr(o.plugin)} v${escAttr(o.version)}`).join(', ')}</span><button onclick="cleanupAllOrphans(${h.plugin_orphans.length})" class="shrink-0 text-xs px-2.5 py-1 rounded-full bg-white/95 hover:bg-white text-orange-900 font-medium">${escAttr(tr('btn_cleanup_all_orphans'))}</button></div>`);
       }
       // v1.7.5 - duplicate_names retire de health (etait du bruit sans action).
       // Les doublons sont maintenant exclusivement remontes via les suggestions
@@ -10572,7 +10638,8 @@ _CONFIG_MUTATING_ROUTES = {
     "/api/import-mcp-json", "/api/import-mcp-file", "/api/import-mcp-git",
     "/api/preset-save", "/api/preset-apply", "/api/preset-delete",
     "/api/toggle-plugin", "/api/delete-plugin", "/api/bridge-plugin-mcp",
-    "/api/add-plugin-git", "/api/plugin-cleanup", "/api/save-settings",
+    "/api/add-plugin-git", "/api/plugin-cleanup", "/api/plugin-cleanup-all",
+    "/api/save-settings",
     "/api/watchdog-config", "/api/save-claude-md", "/api/save-command",
     "/api/toggle-skill", "/api/toggle-command", "/api/delete-skill",
     "/api/repair-skill", "/api/delete-user-skill-duplicates",
@@ -10771,6 +10838,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/preset-delete": lambda: delete_preset(data.get("name", "")),
             "/api/toggle-plugin": lambda: toggle_plugin(data.get("name", "")),
             "/api/plugin-cleanup": lambda: cleanup_plugin_orphan(data.get("name", ""), data.get("version", "")),
+            # v1.14.20 - toutes les versions orphelines en un clic.
+            "/api/plugin-cleanup-all": lambda: cleanup_all_plugin_orphans(),
             "/api/mcp-test": lambda: test_mcp(data.get("name", ""), data.get("lang", "fr")),
             "/api/mcp-set-env": lambda: set_mcp_env(data.get("name", ""), data.get("var", ""), data.get("value", "")),
             "/api/toggle-command": lambda: toggle_command(data.get("name", "")),
