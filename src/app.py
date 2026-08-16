@@ -1463,9 +1463,8 @@ def _diagnose_claude_cli_stages():
         # fait passer une session expiree pour un binaire en panne.
         if _looks_not_logged_in(out["debug_tail"]):
             out["not_logged_in"] = True
-            out["error"] = ("Ta session Anthropic est expirée : reconnecte-toi "
-                            "avec `claude /login` dans un terminal. "
-                            f"(journal du CLI : « {out['debug_tail'][:160]} »)")
+            out["error"] = _srv("diag_not_logged_in",
+                                tail=out["debug_tail"][:160])
     return out
 
 
@@ -1626,7 +1625,8 @@ def _cli_auto_heal_after_timeout():
 # depassee est un INDICE fort (le refresh peut theoriquement encore sauver
 # la session), donc l'app le demande -- elle ne l'affirme qu'apres l'avoir
 # constate sur un vrai appel (v1.14.18).
-_CLI_SESSION = {"status": "unknown", "detail": None, "checked_ts": 0.0}
+_CLI_SESSION = {"status": "unknown", "detail": None, "checked_ts": 0.0,
+                "days": None, "hours": None}
 _CLI_SESSION_LOCK = threading.Lock()
 _CLI_SESSION_TTL = 300
 # Marge sur l'expiration : un jeton perime de quelques minutes se rafraichit
@@ -1691,12 +1691,16 @@ def _check_cli_session(force=False):
         if not force and now - _CLI_SESSION["checked_ts"] < _CLI_SESSION_TTL:
             return dict(_CLI_SESSION)
     exp = _read_cli_oauth_expiry()
+    days = hours = None
     if exp is None:
         status, detail = "unknown", None
     elif now - exp > _CLI_SESSION_EXPIRY_GRACE:
+        # v1.15.0 - jours/heures exposes en plus du texte : l'UI construit
+        # la phrase dans SA langue (le detail francais reste pour les logs
+        # et la boite de dialogue macOS).
         days = int((now - exp) // 86400)
-        since = (f"depuis {days} jour(s)" if days
-                 else f"depuis {int((now - exp) // 3600)} h")
+        hours = int((now - exp) // 3600)
+        since = f"depuis {days} jour(s)" if days else f"depuis {hours} h"
         status = "expired"
         detail = (f"Session Claude CLI expirée {since} — reconnecte-toi "
                   f"avec `claude /login`.")
@@ -1704,7 +1708,7 @@ def _check_cli_session(force=False):
         status, detail = "ok", None
     with _CLI_SESSION_LOCK:
         _CLI_SESSION.update({"status": status, "detail": detail,
-                             "checked_ts": now})
+                             "checked_ts": now, "days": days, "hours": hours})
         return dict(_CLI_SESSION)
 
 
@@ -2272,6 +2276,118 @@ def _clean_suggestion(raw_response):
     return suggestion
 
 
+# === I18N DES MESSAGES SERVEUR ===
+#
+# v1.15.0 - l'UI est bilingue depuis longtemps (dicts fr/en cote JS) mais
+# les messages construits COTE SERVEUR (abandon de lot, preflight, verdicts,
+# nettoyage des orphelins) partaient en francais chez les utilisateurs en
+# anglais. Petit catalogue serveur : la langue vient soit du parametre lang
+# deja transporte par les routes de reparation, soit de l'en-tete X-CC-Lang
+# que api() ajoute a chaque POST (stocke par requete dans un threading.local
+# -- le serveur est thread-par-requete). Les jobs de fond capturent la
+# langue au lancement. Defaut : francais, la langue historique de l'app.
+_REQ_LANG = threading.local()
+
+_SRV_MSG = {
+    "fr": {
+        "bulk_already_running": "Une réparation est déjà en cours",
+        "bulk_running": "Une réparation est en cours",
+        "bulk_dismissed": "Compte rendu effacé",
+        "bulk_none": "Aucun skill à réparer",
+        "bulk_preflight": "Vérification du CLI, puis {n} skill(s)",
+        "cli_not_found": ("Claude Code CLI ('claude') introuvable dans le "
+                          "PATH. Installer avec : npm install -g "
+                          "@anthropic-ai/claude-code"),
+        "probe_timeout": ("Le CLI Claude n'a pas répondu à un appel trivial "
+                          "en {s} s. Le lot n'a pas été lancé : il aurait "
+                          "échoué skill après skill.{detail}"),
+        "probe_partial": " Il avait commencé à écrire : « {p} »",
+        "probe_nothing": " Il n'a rien écrit du tout avant de caler.",
+        "probe_empty": ("Le CLI Claude a répondu sans aucun texte. Le lot "
+                        "n'a pas été lancé. Teste : echo ping | claude -p "
+                        "--output-format text"),
+        "heal_suffix": " (Tentative de mise à jour du CLI : {msg})",
+        "abort_consecutive": ("Arrêt après {n} échecs consécutifs (dernier : "
+                              "{err}).{hint} Les skills restants n'ont pas "
+                              "été touchés."),
+        "abort_hint_fast_probe": (" Le CLI avait pourtant répondu en {s} s à "
+                                  "un appel trivial : la panne vient "
+                                  "probablement du contenu envoyé, pas du "
+                                  "CLI."),
+        "notify_bulk_stopped": "Réparation des skills arrêtée",
+        "notify_bulk_cancelled": "Réparation des skills annulée",
+        "notify_bulk_finished": "Réparation des skills terminée",
+        "notify_bulk_summary": "{r} réparés, {f} en échec, sur {t}",
+        "diag_not_logged_in": ("Ta session Anthropic est expirée : "
+                               "reconnecte-toi avec `claude /login` dans un "
+                               "terminal. (journal du CLI : « {tail} »)"),
+        "orphans_listing_failed": "Listing des plugins impossible : {e}",
+        "orphans_none": "Aucune version orpheline à nettoyer",
+        "orphans_cleaned": "{n} version(s) orpheline(s) nettoyée(s)",
+        "orphans_failed_suffix": ", {f} en échec",
+        "orphans_backup_suffix": (" — backups : "
+                                  "~/.claude/backups/claude-control/"
+                                  "orphan-plugins/"),
+    },
+    "en": {
+        "bulk_already_running": "A repair is already running",
+        "bulk_running": "A repair is running",
+        "bulk_dismissed": "Report cleared",
+        "bulk_none": "No skill needs repair",
+        "bulk_preflight": "Checking the CLI, then {n} skill(s)",
+        "cli_not_found": ("Claude Code CLI ('claude') not found in PATH. "
+                          "Install with: npm install -g "
+                          "@anthropic-ai/claude-code"),
+        "probe_timeout": ("The Claude CLI did not answer a trivial call "
+                          "within {s} s. The batch was not started: it "
+                          "would have failed skill after skill.{detail}"),
+        "probe_partial": " It had started writing: “{p}”",
+        "probe_nothing": " It wrote nothing at all before stalling.",
+        "probe_empty": ("The Claude CLI answered with no text. The batch "
+                        "was not started. Try: echo ping | claude -p "
+                        "--output-format text"),
+        "heal_suffix": " (CLI update attempt: {msg})",
+        "abort_consecutive": ("Stopped after {n} consecutive failures "
+                              "(last: {err}).{hint} Remaining skills were "
+                              "not touched."),
+        "abort_hint_fast_probe": (" Yet the CLI had answered a trivial call "
+                                  "in {s} s: the failure most likely comes "
+                                  "from the content sent, not the CLI."),
+        "notify_bulk_stopped": "Skills repair stopped",
+        "notify_bulk_cancelled": "Skills repair cancelled",
+        "notify_bulk_finished": "Skills repair finished",
+        "notify_bulk_summary": "{r} repaired, {f} failed, out of {t}",
+        "diag_not_logged_in": ("Your Anthropic session has expired: sign in "
+                               "again with `claude /login` in a terminal. "
+                               "(CLI log: “{tail}”)"),
+        "orphans_listing_failed": "Could not list plugins: {e}",
+        "orphans_none": "No orphan version to clean up",
+        "orphans_cleaned": "{n} orphan plugin version(s) cleaned up",
+        "orphans_failed_suffix": ", {f} failed",
+        "orphans_backup_suffix": (" — backups: "
+                                  "~/.claude/backups/claude-control/"
+                                  "orphan-plugins/"),
+    },
+}
+
+
+def _norm_lang(lang):
+    return "en" if str(lang or "").strip().lower().startswith("en") else "fr"
+
+
+def _srv(key, lang=None, **fmt):
+    """Message serveur traduit. lang explicite > langue de la requete en
+    cours (X-CC-Lang) > francais. Un {placeholder} manquant ne casse jamais
+    un message : on rend le texte brut plutot que lever."""
+    if lang is None:
+        lang = getattr(_REQ_LANG, "lang", None)
+    txt = _SRV_MSG[_norm_lang(lang)].get(key) or _SRV_MSG["fr"].get(key) or key
+    try:
+        return txt.format(**fmt)
+    except Exception:
+        return txt
+
+
 # === REPARATION EN LOT ===
 #
 # v1.14.1 - reparer 24 skills a la main = 24 clics et 24 modales. Chaque
@@ -2424,17 +2540,17 @@ def dismiss_bulk_repair():
     fermer."""
     with _BULK_REPAIR_LOCK:
         if _BULK_REPAIR["running"]:
-            return False, "Une réparation est en cours"
+            return False, _srv("bulk_running")
         _BULK_REPAIR.update({
             "results": [], "done": 0, "total": 0, "phase": "idle",
             "aborted": False, "abort_reason": None, "cancelled": False,
             "started_at": None, "finished_at": None, "started_monotonic": None,
             "mode": "cli",
         })
-    return True, "Compte rendu effacé"
+    return True, _srv("bulk_dismissed")
 
 
-def _bulk_repair_probe():
+def _bulk_repair_probe(lang=None):
     """v1.14.2 - Verifie que le CLI rend une reponse AVANT de lancer le lot.
 
     Motivation concrete : sur une machine ou le CLI ne repond pas, un lot de
@@ -2456,12 +2572,10 @@ def _bulk_repair_probe():
         # elle le message se reduisait a "teste a la main dans un terminal".
         # v1.14.12 - la duree annoncee est l'attente TOTALE portee par
         # l'exception (tous les barreaux de repli), pas le budget d'un seul.
-        detail = (f" Il avait commencé à écrire : « {e.partial[:200]} »"
-                  if e.partial else " Il n'a rien écrit du tout avant de caler.")
-        return False, time.monotonic() - started, (
-            f"Le CLI Claude n'a pas répondu à un appel trivial en "
-            f"{e.timeout} s. Le lot n'a pas été lancé : il "
-            f"aurait échoué skill après skill.{detail}")
+        detail = (_srv("probe_partial", lang=lang, p=e.partial[:200])
+                  if e.partial else _srv("probe_nothing", lang=lang))
+        return False, time.monotonic() - started, _srv(
+            "probe_timeout", lang=lang, s=e.timeout, detail=detail)
     except ClaudeCliNotLoggedIn as e:
         # v1.14.19 - l'app demande la reconnexion au lieu de seulement
         # l'ecrire dans le compte rendu du lot.
@@ -2476,13 +2590,11 @@ def _bulk_repair_probe():
         # v1.14.12 - la commande suggeree citait encore `--safe-mode`,
         # l'option retiree en v1.14.6 parce qu'elle GELAIT le CLI : suivre le
         # conseil bloquait le terminal de l'utilisateur.
-        return False, elapsed, (
-            "Le CLI Claude a répondu sans aucun texte. Le lot n'a pas été "
-            "lancé. Teste : echo ping | claude -p --output-format text")
+        return False, elapsed, _srv("probe_empty", lang=lang)
     return True, elapsed, None
 
 
-def _bulk_repair_abort(reason):
+def _bulk_repair_abort(reason, lang=None):
     with _BULK_REPAIR_LOCK:
         _BULK_REPAIR.update({
             "running": False, "current": None, "aborted": True,
@@ -2490,11 +2602,11 @@ def _bulk_repair_abort(reason):
             "finished_at": datetime.now().isoformat(timespec="seconds"),
         })
     _log(f"bulk_repair: arret - {reason}")
-    _notify("Reparation des skills arretee", reason)
+    _notify(_srv("notify_bulk_stopped", lang=lang), reason)
 
 
 def _bulk_repair_worker(targets, lang):
-    ok, probe_seconds, probe_error = _bulk_repair_probe()
+    ok, probe_seconds, probe_error = _bulk_repair_probe(lang=lang)
     with _BULK_REPAIR_LOCK:
         _BULK_REPAIR["probe_seconds"] = round(probe_seconds, 1)
     if not ok:
@@ -2505,13 +2617,14 @@ def _bulk_repair_worker(targets, lang):
         if healed:
             _notify("CLI mis a jour automatiquement", heal_msg or "")
             _log(f"bulk_repair: auto-heal ok, nouveau preflight")
-            ok, probe_seconds, probe_error = _bulk_repair_probe()
+            ok, probe_seconds, probe_error = _bulk_repair_probe(lang=lang)
             with _BULK_REPAIR_LOCK:
                 _BULK_REPAIR["probe_seconds"] = round(probe_seconds, 1)
         elif heal_msg:
-            probe_error = f"{probe_error} (Tentative de mise à jour du CLI : {heal_msg})"
+            probe_error = f"{probe_error}" + _srv("heal_suffix", lang=lang,
+                                                  msg=heal_msg)
     if not ok:
-        _bulk_repair_abort(probe_error)
+        _bulk_repair_abort(probe_error, lang=lang)
         return
     with _BULK_REPAIR_LOCK:
         _BULK_REPAIR["phase"] = "running"
@@ -2546,13 +2659,12 @@ def _bulk_repair_worker(targets, lang):
             # timeout). Sans ca, les deux donnent le meme "Timeout".
             hint = ""
             if probe_seconds and probe_seconds < 30:
-                hint = (f" Le CLI avait pourtant répondu en "
-                        f"{probe_seconds:.0f} s à un appel trivial : la panne "
-                        f"vient probablement du contenu envoyé, pas du CLI.")
+                hint = _srv("abort_hint_fast_probe", lang=lang,
+                            s=f"{probe_seconds:.0f}")
             _bulk_repair_abort(
-                f"Arrêt après {consecutive_failures} échecs consécutifs "
-                f"(dernier : {str(entry.get('error') or '')[:140]})."
-                f"{hint} Les skills restants n'ont pas été touchés.")
+                _srv("abort_consecutive", lang=lang, n=consecutive_failures,
+                     err=str(entry.get('error') or '')[:140], hint=hint),
+                lang=lang)
             return
     with _BULK_REPAIR_LOCK:
         _BULK_REPAIR["running"] = False
@@ -2563,8 +2675,10 @@ def _bulk_repair_worker(targets, lang):
         repaired = sum(1 for r in _BULK_REPAIR["results"] if r.get("ok"))
         failed = sum(1 for r in _BULK_REPAIR["results"] if not r.get("ok"))
         cancelled = _BULK_REPAIR["cancelled"]
-    head = "Reparation des skills annulee" if cancelled else "Reparation des skills terminee"
-    _notify(head, f"{repaired} repares, {failed} en echec, sur {total}")
+    head = _srv("notify_bulk_cancelled" if cancelled else
+                "notify_bulk_finished", lang=lang)
+    _notify(head, _srv("notify_bulk_summary", lang=lang,
+                       r=repaired, f=failed, t=total))
 
 
 def start_bulk_repair(lang=None, include_synced=False):
@@ -2572,13 +2686,13 @@ def start_bulk_repair(lang=None, include_synced=False):
     insuffisante. Retourne immediatement ; l'UI suit via /api/repair-all-status."""
     with _BULK_REPAIR_LOCK:
         if _BULK_REPAIR["running"]:
-            return False, "Une réparation est déjà en cours"
+            return False, _srv("bulk_already_running", lang=lang)
     if not _claude_cli_path():
-        return False, ("Claude Code CLI ('claude') introuvable dans le PATH. "
-                       "Installer avec : npm install -g @anthropic-ai/claude-code")
+        return False, _srv("cli_not_found", lang=lang)
     targets = _repairable_user_skills(include_synced=include_synced)
     if not targets:
-        return True, {"message": "Aucun skill à réparer", "total": 0, "started": False}
+        return True, {"message": _srv("bulk_none", lang=lang),
+                      "total": 0, "started": False}
     with _BULK_REPAIR_LOCK:
         _BULK_REPAIR.update({
             "running": True, "total": len(targets), "done": 0,
@@ -2590,7 +2704,8 @@ def start_bulk_repair(lang=None, include_synced=False):
         })
     threading.Thread(target=_bulk_repair_worker, args=(targets, lang),
                      name="claude-control-bulk-repair", daemon=True).start()
-    return True, {"message": f"Vérification du CLI, puis {len(targets)} skill(s)",
+    return True, {"message": _srv("bulk_preflight", lang=lang,
+                                  n=len(targets)),
                   "total": len(targets), "started": True}
 
 
@@ -3383,6 +3498,9 @@ def _compute_state():
     if session["status"] == "expired":
         out["cli_session_expired"] = True
         out["cli_session_detail"] = session["detail"]
+        # v1.15.0 - l'UI traduit la phrase elle-meme a partir des chiffres.
+        out["cli_session_days"] = session.get("days")
+        out["cli_session_hours"] = session.get("hours")
     # v1.14.0 - remonte l'erreur de config au lieu de la laisser lever : le JS
     # affiche desormais un bandeau au lieu de garder silencieusement la
     # derniere liste rendue.
@@ -7108,11 +7226,11 @@ def cleanup_all_plugin_orphans():
     try:
         plugins = list_plugins()
     except Exception as e:
-        return False, f"Listing des plugins impossible : {e}"
+        return False, _srv("orphans_listing_failed", e=e)
     targets = [(p["full_name"], v) for p in plugins
                for v in (p.get("extra_versions") or [])]
     if not targets:
-        return True, {"message": "Aucune version orpheline à nettoyer",
+        return True, {"message": _srv("orphans_none"),
                       "cleaned": [], "failed": []}
     cleaned, failed = [], []
     for full_name, version in targets:
@@ -7127,10 +7245,10 @@ def cleanup_all_plugin_orphans():
                            "error": str(msg)[:200]})
         _log(f"cleanup_all_plugin_orphans: {full_name} v{version} -> "
              f"{'ok' if ok else msg}")
-    head = f"{len(cleaned)} version(s) orpheline(s) nettoyée(s)"
+    head = _srv("orphans_cleaned", n=len(cleaned))
     if failed:
-        head += f", {len(failed)} en échec"
-    head += " — backups : ~/.claude/backups/claude-control/orphan-plugins/"
+        head += _srv("orphans_failed_suffix", f=len(failed))
+    head += _srv("orphans_backup_suffix")
     return bool(cleaned) or not failed, {
         "message": head, "cleaned": cleaned, "failed": failed}
 
@@ -7896,6 +8014,8 @@ fr: {
   cli_update_btn: "Mettre à jour le CLI ({v} → {l})",
   cli_update_btn_short: "Mettre à jour le CLI",
   cli_session_expired_title: "Session Claude CLI expirée — la réparation des skills ne peut pas fonctionner sans reconnexion.",
+  cli_session_expired_days: "Session Claude CLI expirée depuis {n} jour(s) — reconnecte-toi avec claude /login.",
+  cli_session_expired_hours: "Session Claude CLI expirée depuis {n} h — reconnecte-toi avec claude /login.",
   btn_relogin: "Se reconnecter",
   btn_cleanup_all_orphans: "Tout nettoyer",
   cleanup_all_running: "Nettoyage des versions orphelines…",
@@ -8264,6 +8384,8 @@ en: {
   cli_update_btn: "Update the CLI ({v} → {l})",
   cli_update_btn_short: "Update the CLI",
   cli_session_expired_title: "Claude CLI session expired — skill repair cannot work until you log in again.",
+  cli_session_expired_days: "Claude CLI session expired {n} day(s) ago — log in again with claude /login.",
+  cli_session_expired_hours: "Claude CLI session expired {n} h ago — log in again with claude /login.",
   btn_relogin: "Log in again",
   btn_cleanup_all_orphans: "Clean up all",
   cleanup_all_running: "Cleaning orphan versions…",
@@ -8838,9 +8960,18 @@ function _renderHealthBanner(skills){
   // v1.14.19 - "si c'est la cause, l'app devrait me le demander" : la
   // session expiree s'affiche AVANT tout essai, avec le bouton qui ouvre
   // Terminal pre-rempli de `claude /login`.
+  // v1.15.0 - la phrase est construite dans la langue de l'UI a partir des
+  // chiffres (jours/heures) du serveur ; le detail serveur reste le repli.
+  function sessionExpiredLabel(){
+    const d = CURRENT_STATE && CURRENT_STATE.cli_session_days;
+    const h = CURRENT_STATE && CURRENT_STATE.cli_session_hours;
+    if(d >= 1) return tr('cli_session_expired_days', {n: d});
+    if(h >= 1) return tr('cli_session_expired_hours', {n: h});
+    return (CURRENT_STATE && CURRENT_STATE.cli_session_detail) || tr('cli_session_expired_title');
+  }
   const sessionWarn = (CURRENT_STATE && CURRENT_STATE.cli_session_expired)
     ? `<div class="mb-3 p-3 rounded-lg border border-red-200 bg-red-50 text-red-800 text-sm flex flex-wrap items-center gap-3">
-         <span>&#128274; ${escAttr(CURRENT_STATE.cli_session_detail || tr('cli_session_expired_title'))}</span>
+         <span>&#128274; ${escAttr(sessionExpiredLabel())}</span>
          <button onclick="openTerminalForLogin()" class="text-xs px-2.5 py-1 rounded-full bg-red-700 hover:bg-red-800 text-white font-medium">${escAttr(tr('btn_relogin'))}</button>
        </div>`
     : '';
@@ -10380,7 +10511,9 @@ function setTab(g, sub){
   document.querySelectorAll(`[data-pane^="${p}-"]`).forEach(pn => pn.classList.toggle('hidden', pn.dataset.pane !== `${p}-${sub}`));
 }
 async function api(path, body){
-  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
+  // v1.15.0 - X-CC-Lang : le serveur traduit ses propres messages (abandon
+  // de lot, preflight, nettoyage...) dans la langue de l'UI.
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json', 'X-CC-Lang': CURRENT_LANG}, body: JSON.stringify(body||{})});
   return r.json();
 }
 async function toggleMcp(n){const j=await api('/api/toggle-mcp',{name:n});banner(j.success?'green':'red',j.message);loadState();}
@@ -10837,6 +10970,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ok, why = self._guard_request()
         if not ok:
             self._json({"success": False, "message": why}, status=403); return
+        # v1.15.0 - langue de la requete (en-tete pose par api() cote JS),
+        # rangee dans un threading.local : le serveur est thread-par-requete,
+        # donc _srv() peut la lire depuis n'importe quelle fonction appelee
+        # par cette route, sans changer aucune signature.
+        _REQ_LANG.lang = _norm_lang(self.headers.get("X-CC-Lang"))
         path = urlparse(self.path).path
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
