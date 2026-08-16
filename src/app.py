@@ -1619,6 +1619,129 @@ def _cli_auto_heal_after_timeout():
     return False, msg
 
 
+# v1.14.19 - "si c'est la cause, l'app devrait me le demander" (demande
+# utilisateur). Le jeton OAuth du CLI porte sa date d'expiration : la lire
+# coute zero appel API et zero reseau. On extrait UNIQUEMENT expiresAt et on
+# jette le reste ; le secret n'est jamais conserve ni logge. Une expiration
+# depassee est un INDICE fort (le refresh peut theoriquement encore sauver
+# la session), donc l'app le demande -- elle ne l'affirme qu'apres l'avoir
+# constate sur un vrai appel (v1.14.18).
+_CLI_SESSION = {"status": "unknown", "detail": None, "checked_ts": 0.0}
+_CLI_SESSION_LOCK = threading.Lock()
+_CLI_SESSION_TTL = 300
+# Marge sur l'expiration : un jeton perime de quelques minutes se rafraichit
+# souvent tout seul au prochain appel. Au-dela d'une heure, la session est
+# morte en pratique (cas reel : expiree depuis des semaines).
+_CLI_SESSION_EXPIRY_GRACE = 3600
+# last_ts None = jamais montre. PAS 0.0 : time.monotonic() compte depuis le
+# boot de la machine, et sur un Mac redemarre depuis moins de 30 min,
+# `monotonic - 0 < cooldown` aurait silencieusement supprime le dialogue --
+# le piege exact deja corrige dans les tests v1.14.17, retrouve ici en
+# production par le test de cette version.
+_RELOGIN_DIALOG = {"last_ts": None, "armed": False}
+_RELOGIN_DIALOG_COOLDOWN = 1800
+
+
+def _read_cli_oauth_expiry():
+    """Retourne expiresAt (secondes epoch) ou None. Ne conserve JAMAIS le
+    contenu des credentials au-dela de l'extraction de ce seul nombre."""
+    raw = None
+    cfg_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
+    cred_file = cfg_dir / ".credentials.json"
+    try:
+        if cred_file.is_file():
+            raw = cred_file.read_text(errors="replace")
+    except OSError:
+        raw = None
+    if raw is None and sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", CLI_KEYCHAIN_SERVICE, "-w"],
+                capture_output=True, text=True, timeout=6)
+            if r.returncode == 0:
+                raw = r.stdout
+        except Exception:
+            raw = None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    finally:
+        del raw
+    try:
+        exp = (data.get("claudeAiOauth") or {}).get("expiresAt")
+        if exp is None:
+            return None
+        exp = float(exp)
+        # Les versions du CLI stockent des millisecondes.
+        return exp / 1000.0 if exp > 4e10 else exp
+    except Exception:
+        return None
+    finally:
+        del data
+
+
+def _check_cli_session(force=False):
+    """Statut de session {status: expired|ok|unknown, detail}. Cache court."""
+    now = time.time()
+    with _CLI_SESSION_LOCK:
+        if not force and now - _CLI_SESSION["checked_ts"] < _CLI_SESSION_TTL:
+            return dict(_CLI_SESSION)
+    exp = _read_cli_oauth_expiry()
+    if exp is None:
+        status, detail = "unknown", None
+    elif now - exp > _CLI_SESSION_EXPIRY_GRACE:
+        days = int((now - exp) // 86400)
+        since = (f"depuis {days} jour(s)" if days
+                 else f"depuis {int((now - exp) // 3600)} h")
+        status = "expired"
+        detail = (f"Session Claude CLI expirée {since} — reconnecte-toi "
+                  f"avec `claude /login`.")
+    else:
+        status, detail = "ok", None
+    with _CLI_SESSION_LOCK:
+        _CLI_SESSION.update({"status": status, "detail": detail,
+                             "checked_ts": now})
+        return dict(_CLI_SESSION)
+
+
+def _ask_relogin_dialog(reason=None):
+    """v1.14.19 - l'app DEMANDE la reconnexion : boite de dialogue macOS
+    native avec un bouton qui ouvre Terminal pre-rempli de `claude /login`.
+    Armee par main() seulement (jamais depuis les tests), au plus une fois
+    par _RELOGIN_DIALOG_COOLDOWN pour ne pas harceler."""
+    if not _RELOGIN_DIALOG["armed"]:
+        return
+    now = time.monotonic()
+    last = _RELOGIN_DIALOG["last_ts"]
+    if last is not None and now - last < _RELOGIN_DIALOG_COOLDOWN:
+        return
+    _RELOGIN_DIALOG["last_ts"] = now
+
+    def _ask():
+        msg = _osa_quote(
+            (reason or "Ta session Claude CLI est expirée.")
+            + " La réparation des skills ne peut pas fonctionner sans "
+            "reconnexion.", 300)
+        script = (
+            f'display dialog "{msg}" '
+            f'buttons {{"Plus tard", "Ouvrir le Terminal"}} '
+            f'default button 2 with title "Claude Control" with icon caution')
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=120)
+            if "Ouvrir le Terminal" in (r.stdout or ""):
+                open_terminal_claude_login()
+        except Exception:
+            pass
+
+    threading.Thread(target=_ask, name="claude-control-relogin-ask",
+                     daemon=True).start()
+
+
 def _cli_debug_tail(timeout=25):
     """v1.14.13 - Le journal de demarrage du CLI, par le CLI.
 
@@ -2019,7 +2142,13 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
         # error_code que l'UI peut utiliser pour afficher des instructions
         # ciblees + un bouton 'Copier la commande' au lieu d'un dump
         # technique.
+        # v1.14.19 - et l'app le DEMANDE : dialogue macOS avec bouton qui
+        # ouvre Terminal pre-rempli, + etat de session rafraichi pour que le
+        # bandeau apparaisse au prochain /api/state.
         _log(f"suggest_skill_description: CLI not logged in")
+        _check_cli_session(force=True)
+        _invalidate_state_cache()
+        _ask_relogin_dialog(str(e)[:200])
         return False, {
             "error": str(e),
             "error_code": "cli_not_logged_in",
@@ -2334,6 +2463,11 @@ def _bulk_repair_probe():
             f"{e.timeout} s. Le lot n'a pas été lancé : il "
             f"aurait échoué skill après skill.{detail}")
     except ClaudeCliNotLoggedIn as e:
+        # v1.14.19 - l'app demande la reconnexion au lieu de seulement
+        # l'ecrire dans le compte rendu du lot.
+        _check_cli_session(force=True)
+        _invalidate_state_cache()
+        _ask_relogin_dialog(str(e)[:200])
         return False, time.monotonic() - started, str(e)
     except Exception as e:
         return False, time.monotonic() - started, f"{type(e).__name__} : {e}"
@@ -3238,6 +3372,13 @@ def _compute_state():
         "mcps": mcps_list,
         "skills": skills,
     }
+    # v1.14.19 - la session CLI expiree est annoncee AVANT tout essai de
+    # reparation : lecture locale de la date d'expiration du jeton (cache
+    # 5 min, jamais le secret), bandeau + bouton "Se reconnecter" cote UI.
+    session = _check_cli_session()
+    if session["status"] == "expired":
+        out["cli_session_expired"] = True
+        out["cli_session_detail"] = session["detail"]
     # v1.14.0 - remonte l'erreur de config au lieu de la laisser lever : le JS
     # affiche desormais un bandeau au lieu de garder silencieusement la
     # derniere liste rendue.
@@ -6925,6 +7066,48 @@ def cleanup_plugin_orphan(full_name, version):
     return True, f"Version orpheline {version} de '{full_name}' supprimee (backup : {backup_path.name})"
 
 
+def cleanup_all_plugin_orphans():
+    """v1.14.20 - Nettoie TOUTES les versions orphelines en un clic.
+
+    Demande utilisateur : la Vue d'ensemble annoncait "8 version(s)
+    orpheline(s) de plugin" mais la correction demandait huit clics et huit
+    confirmations, un par carte de plugin. Ce lot reutilise, orphelin par
+    orphelin, le chemin eprouve de cleanup_plugin_orphan : backup .zip dans
+    ~/.claude/backups/claude-control/orphan-plugins/ puis suppression du
+    dossier de cache -- la version active n'est jamais touchee (refus
+    explicite dans cleanup_plugin_orphan). Un echec sur un orphelin
+    n'empeche pas les autres ; le compte rendu liste les deux camps.
+    """
+    try:
+        plugins = list_plugins()
+    except Exception as e:
+        return False, f"Listing des plugins impossible : {e}"
+    targets = [(p["full_name"], v) for p in plugins
+               for v in (p.get("extra_versions") or [])]
+    if not targets:
+        return True, {"message": "Aucune version orpheline à nettoyer",
+                      "cleaned": [], "failed": []}
+    cleaned, failed = [], []
+    for full_name, version in targets:
+        try:
+            ok, msg = cleanup_plugin_orphan(full_name, version)
+        except Exception as e:
+            ok, msg = False, f"{type(e).__name__}: {e}"
+        if ok:
+            cleaned.append({"plugin": full_name, "version": version})
+        else:
+            failed.append({"plugin": full_name, "version": version,
+                           "error": str(msg)[:200]})
+        _log(f"cleanup_all_plugin_orphans: {full_name} v{version} -> "
+             f"{'ok' if ok else msg}")
+    head = f"{len(cleaned)} version(s) orpheline(s) nettoyée(s)"
+    if failed:
+        head += f", {len(failed)} en échec"
+    head += " — backups : ~/.claude/backups/claude-control/orphan-plugins/"
+    return bool(cleaned) or not failed, {
+        "message": head, "cleaned": cleaned, "failed": failed}
+
+
 def toggle_plugin(full_name):
     if not full_name:
         return False, "Nom de plugin requis"
@@ -7685,6 +7868,11 @@ fr: {
   cli_diag_copy: "Copier le rapport",
   cli_update_btn: "Mettre à jour le CLI ({v} → {l})",
   cli_update_btn_short: "Mettre à jour le CLI",
+  cli_session_expired_title: "Session Claude CLI expirée — la réparation des skills ne peut pas fonctionner sans reconnexion.",
+  btn_relogin: "Se reconnecter",
+  btn_cleanup_all_orphans: "Tout nettoyer",
+  cleanup_all_running: "Nettoyage des versions orphelines…",
+  confirm_cleanup_all_orphans: "Nettoyer les {n} versions orphelines de plugins ?\n\n• Chaque dossier de cache orphelin → backup .zip puis suppression\n• Les versions ACTIVES des plugins ne sont jamais touchées\n• Backups : ~/.claude/backups/claude-control/orphan-plugins/\n\nCONTINUER ?",
   cli_update_latest: "dernière version",
   cli_update_running: "Mise à jour du CLI…",
   confirm_cli_update: "Mettre à jour le CLI Claude Code ?\n\n• Exécute l'installeur officiel Anthropic (claude.ai/install.sh)\n• Remplace uniquement l'outil `claude` du terminal\n• NE TOUCHE PAS Claude Desktop (conversations, MCPs, réglages intacts)\n• Durée : ~1-2 min selon le réseau\n\nCONTINUER ?",
@@ -8048,6 +8236,11 @@ en: {
   cli_diag_copy: "Copy report",
   cli_update_btn: "Update the CLI ({v} → {l})",
   cli_update_btn_short: "Update the CLI",
+  cli_session_expired_title: "Claude CLI session expired — skill repair cannot work until you log in again.",
+  btn_relogin: "Log in again",
+  btn_cleanup_all_orphans: "Clean up all",
+  cleanup_all_running: "Cleaning orphan versions…",
+  confirm_cleanup_all_orphans: "Clean up the {n} orphan plugin versions?\n\n• Each orphan cache directory → .zip backup then deletion\n• ACTIVE plugin versions are never touched\n• Backups: ~/.claude/backups/claude-control/orphan-plugins/\n\nCONTINUE?",
   cli_update_latest: "latest",
   cli_update_running: "Updating the CLI…",
   confirm_cli_update: "Update the Claude Code CLI?\n\n• Runs the official Anthropic installer (claude.ai/install.sh)\n• Replaces only the `claude` terminal tool\n• Does NOT touch Claude Desktop (conversations, MCPs, settings intact)\n• Takes ~1-2 min depending on network\n\nCONTINUE?",
@@ -8615,7 +8808,16 @@ function _renderHealthBanner(skills){
     : '';
   const banner = document.getElementById('skills-health-banner');
   if(!banner) return;
-  banner.innerHTML = `
+  // v1.14.19 - "si c'est la cause, l'app devrait me le demander" : la
+  // session expiree s'affiche AVANT tout essai, avec le bouton qui ouvre
+  // Terminal pre-rempli de `claude /login`.
+  const sessionWarn = (CURRENT_STATE && CURRENT_STATE.cli_session_expired)
+    ? `<div class="mb-3 p-3 rounded-lg border border-red-200 bg-red-50 text-red-800 text-sm flex flex-wrap items-center gap-3">
+         <span>&#128274; ${escAttr(CURRENT_STATE.cli_session_detail || tr('cli_session_expired_title'))}</span>
+         <button onclick="openTerminalForLogin()" class="text-xs px-2.5 py-1 rounded-full bg-red-700 hover:bg-red-800 text-white font-medium">${escAttr(tr('btn_relogin'))}</button>
+       </div>`
+    : '';
+  banner.innerHTML = sessionWarn + `
     <div class="flex items-baseline justify-between mb-2 flex-wrap gap-2">
       <h2 class="text-lg font-semibold">${tr('skills_health_title')}</h2>
       <span class="text-xs text-stone-500">${excellent}/${total} ${tr('skills_health_ready')}</span>
@@ -9699,6 +9901,21 @@ async function confirmAddPlugin(){
   banner(j.success?'green':'red', j.message);
   if(j.success){closeAddPlugin();loadPlugins();loadOverview();loadCommands();}
 }
+// v1.14.20 - toutes les versions orphelines en un clic, depuis la ligne
+// sante de la Vue d'ensemble. Memes garanties que le nettoyage unitaire :
+// backup .zip par version, versions actives jamais touchees.
+async function cleanupAllOrphans(n){
+  if(!confirm(tr('confirm_cleanup_all_orphans').split('{n}').join(String(n||'?')))) return;
+  banner('blue', tr('cleanup_all_running'));
+  try{
+    const j = await api('/api/plugin-cleanup-all', {});
+    banner(j.success?'green':'red', j.message);
+    if(j.failed && j.failed.length){
+      j.failed.forEach(f=>errLogPush(`orphan ${f.plugin} v${f.version} : ${f.error}`));
+    }
+    loadPlugins(); loadOverview();
+  }catch(e){ banner('red', String(e.message || e)); }
+}
 async function cleanupOrphan(fn, version, activeVersion){
   // v1.9.9 - confirm popup detaille pour rassurer l'utilisateur. Mention
   // explicite : le plugin actif (activeVersion) reste intact, seul le
@@ -9989,7 +10206,10 @@ async function loadOverview(){
         issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded bg-amber-50 border border-amber-200 text-amber-800"><span>&#9888;</span><span><strong>${h.mcps_failing.length}</strong> ${tr('issue_mcps_not_running')} : ${h.mcps_failing.map(n=>`<button onclick="showMcpError('${escJsAttr(n)}')" class="underline hover:no-underline font-mono">${escAttr(n)}</button>`).join(', ')}</span></div>`);
       }
       if(h.plugin_orphans && h.plugin_orphans.length){
-        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded text-white" style="background:linear-gradient(135deg,#D97757,#C15F3C)"><span>&#9888;</span><span><strong>${h.plugin_orphans.length}</strong> ${tr('issue_orphans')} : ${h.plugin_orphans.map(o=>`${escAttr(o.plugin)} v${escAttr(o.version)}`).join(', ')}</span></div>`);
+        // v1.14.20 - le constat porte enfin son action : "Tout nettoyer"
+        // fait en un clic ce qui demandait un clic + confirmation PAR
+        // orphelin dans l'onglet Plugins.
+        issues.push(`<div class="flex items-center gap-2 text-xs p-2 rounded text-white" style="background:linear-gradient(135deg,#D97757,#C15F3C)"><span>&#9888;</span><span class="flex-1"><strong>${h.plugin_orphans.length}</strong> ${tr('issue_orphans')} : ${h.plugin_orphans.map(o=>`${escAttr(o.plugin)} v${escAttr(o.version)}`).join(', ')}</span><button onclick="cleanupAllOrphans(${h.plugin_orphans.length})" class="shrink-0 text-xs px-2.5 py-1 rounded-full bg-white/95 hover:bg-white text-orange-900 font-medium">${escAttr(tr('btn_cleanup_all_orphans'))}</button></div>`);
       }
       // v1.7.5 - duplicate_names retire de health (etait du bruit sans action).
       // Les doublons sont maintenant exclusivement remontes via les suggestions
@@ -10418,7 +10638,8 @@ _CONFIG_MUTATING_ROUTES = {
     "/api/import-mcp-json", "/api/import-mcp-file", "/api/import-mcp-git",
     "/api/preset-save", "/api/preset-apply", "/api/preset-delete",
     "/api/toggle-plugin", "/api/delete-plugin", "/api/bridge-plugin-mcp",
-    "/api/add-plugin-git", "/api/plugin-cleanup", "/api/save-settings",
+    "/api/add-plugin-git", "/api/plugin-cleanup", "/api/plugin-cleanup-all",
+    "/api/save-settings",
     "/api/watchdog-config", "/api/save-claude-md", "/api/save-command",
     "/api/toggle-skill", "/api/toggle-command", "/api/delete-skill",
     "/api/repair-skill", "/api/delete-user-skill-duplicates",
@@ -10617,6 +10838,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/preset-delete": lambda: delete_preset(data.get("name", "")),
             "/api/toggle-plugin": lambda: toggle_plugin(data.get("name", "")),
             "/api/plugin-cleanup": lambda: cleanup_plugin_orphan(data.get("name", ""), data.get("version", "")),
+            # v1.14.20 - toutes les versions orphelines en un clic.
+            "/api/plugin-cleanup-all": lambda: cleanup_all_plugin_orphans(),
             "/api/mcp-test": lambda: test_mcp(data.get("name", ""), data.get("lang", "fr")),
             "/api/mcp-set-env": lambda: set_mcp_env(data.get("name", ""), data.get("var", ""), data.get("value", "")),
             "/api/toggle-command": lambda: toggle_command(data.get("name", "")),
@@ -10716,6 +10939,23 @@ def main():
     # v1.14.18 - l'auto-reparation du CLI n'est armee QUE dans le vrai
     # serveur (cf. _CLI_AUTO_HEAL).
     _CLI_AUTO_HEAL["armed"] = True
+    # v1.14.19 - idem pour la demande de reconnexion, et l'app VERIFIE la
+    # session au demarrage : si elle est expiree, elle le demande tout de
+    # suite au lieu de laisser l'utilisateur decouvrir un echec plus tard.
+    _RELOGIN_DIALOG["armed"] = True
+
+    def _startup_session_check():
+        time.sleep(5)
+        try:
+            session = _check_cli_session()
+            if session["status"] == "expired":
+                _ask_relogin_dialog(session["detail"])
+        except Exception as e:
+            _log(f"startup session check: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_startup_session_check,
+                     name="claude-control-session-check",
+                     daemon=True).start()
     start_watchdog()
     print(f"\n  Claude Control v{get_local_version()} - http://localhost:{PORT}")
     print(f"  Cmd+C pour arreter\n")
