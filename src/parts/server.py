@@ -93,6 +93,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ok, why = self._guard_request()
         if not ok:
             self._json({"error": why}, status=403); return
+        # v1.15.0 - meme capture de langue qu'en POST (les polls de jobs
+        # passent aussi l'en-tete X-CC-Lang).
+        _REQ_LANG.lang = _norm_lang(self.headers.get("X-CC-Lang"))
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
             body = HTML.encode("utf-8")
@@ -145,6 +148,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(get_overview())
         elif path == "/api/repair-all-status":
             self._json(bulk_repair_status())
+        elif path.startswith("/api/suggest-job/"):
+            # v1.15.0 - suivi de la suggestion unitaire en job de fond.
+            snap = suggest_job_status(path[len("/api/suggest-job/"):])
+            if snap is None:
+                # Serveur redemarre entre-temps : le job n'existe plus.
+                self._json({"running": False,
+                            "result": {"success": False,
+                                       "message": _srv("suggest_job_lost")}},
+                           status=404)
+            else:
+                self._json(snap)
         elif path == "/api/skill-suggestions":
             self._json(skill_optimization_suggestions())
         elif path.startswith("/api/skill-content/"):
@@ -253,6 +267,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/repair-all-cancel": lambda: cancel_bulk_repair(),
             "/api/repair-all-dismiss": lambda: dismiss_bulk_repair(),
             "/api/suggest-skill-description": lambda: suggest_skill_description(data.get("name", ""), lang=data.get("lang")),
+            # v1.15.0 - variante job de fond : retour immediat, suivi via
+            # GET /api/suggest-job/<id>. La route synchrone reste pour
+            # compatibilite (lot et scripts).
+            "/api/suggest-skill-description-start": lambda: start_suggest_job(data.get("name", ""), lang=data.get("lang")),
             # v1.14.12 - POST et non GET : le diagnostic lance des subprocess
             # et paie un aller-retour API reel. En GET, une page tierce
             # pouvait le declencher en boucle (<img src> n'envoie pas

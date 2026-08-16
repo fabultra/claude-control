@@ -2221,6 +2221,80 @@ def suggest_skill_description(name, body_max_chars=4000, lang=None):
     }
 
 
+# === SUGGESTION UNITAIRE EN JOB DE FOND ===
+#
+# v1.15.0 - "Suggerer" sur UN skill tenait dans une seule requete HTTP qui
+# pouvait durer des minutes (echelle a 3 barreaux + auto-heal + relance) :
+# un thread serveur bloque, un fetch a la merci d'un timeout navigateur, et
+# un simple rechargement de page perdait tout. Meme motif que le lot
+# (v1.14.1) : le POST -start retourne immediatement un id de job, le
+# travail tourne en thread de fond, l'UI interroge /api/suggest-job/<id>
+# toutes les 2 s avec le temps ecoule affiche. Fermer la modale ou
+# recharger la page ne tue pas le job -- il finit et son resultat reste
+# lisible. suggest_skill_description reste inchangee : le job n'est qu'un
+# porteur.
+_SUGGEST_JOBS = {}
+_SUGGEST_JOBS_LOCK = threading.Lock()
+_SUGGEST_JOBS_KEEP = 32
+_SUGGEST_JOB_SEQ = {"n": 0}
+
+
+def start_suggest_job(name, lang=None):
+    """Retourne (True, {"job": id, ...}) immediatement. Un job deja en cours
+    pour le meme skill est reutilise (double-clic idempotent)."""
+    if not name:
+        return False, "Nom de skill requis"
+    with _SUGGEST_JOBS_LOCK:
+        for jid, job in _SUGGEST_JOBS.items():
+            if job["name"] == name and job["status"] == "running":
+                return True, {"job": jid, "already_running": True}
+        _SUGGEST_JOB_SEQ["n"] += 1
+        jid = f"sg-{_SUGGEST_JOB_SEQ['n']}"
+        job = {"name": name, "lang": lang, "status": "running",
+               "started_mono": time.monotonic(),
+               "result": None, "seconds": None}
+        _SUGGEST_JOBS[jid] = job
+        # Borne memoire : on ne garde que les _SUGGEST_JOBS_KEEP plus
+        # recents TERMINES (les jobs en cours ne sont jamais purges).
+        finished = [k for k, v in _SUGGEST_JOBS.items()
+                    if v["status"] != "running"]
+        for k in finished[:max(0, len(_SUGGEST_JOBS) - _SUGGEST_JOBS_KEEP)]:
+            _SUGGEST_JOBS.pop(k, None)
+
+    def _run():
+        started = time.monotonic()
+        try:
+            ok, payload = suggest_skill_description(name, lang=lang)
+        except Exception as e:
+            _log(f"suggest_job {jid}: {type(e).__name__}: {e}")
+            ok, payload = False, f"{type(e).__name__} : {e}"
+        # Meme enveloppe que la route synchrone (do_POST) : l'UI applique
+        # le meme rendu au resultat, quel que soit le chemin.
+        final = ({"success": ok, **payload} if isinstance(payload, dict)
+                 else {"success": ok, "message": str(payload)})
+        with _SUGGEST_JOBS_LOCK:
+            job.update({"status": "done", "result": final,
+                        "seconds": round(time.monotonic() - started, 1)})
+
+    threading.Thread(target=_run, name=f"claude-control-suggest-{jid}",
+                     daemon=True).start()
+    return True, {"job": jid}
+
+
+def suggest_job_status(job_id):
+    """Photo du job, ou None si inconnu (serveur redemarre entre-temps)."""
+    with _SUGGEST_JOBS_LOCK:
+        job = _SUGGEST_JOBS.get(job_id)
+        if job is None:
+            return None
+        if job["status"] == "running":
+            return {"running": True, "name": job["name"],
+                    "seconds": round(time.monotonic() - job["started_mono"],
+                                     1)}
+        return {"running": False, "name": job["name"],
+                "seconds": job["seconds"], "result": job["result"]}
+
+
 def _clean_suggestion(raw_response):
     """v1.9.2 / v1.14.1 / v1.14.13 - Nettoie une reponse de modele en une
     description exploitable. Extrait de suggest_skill_description pour que la
@@ -2336,6 +2410,8 @@ _SRV_MSG = {
         "orphans_backup_suffix": (" — backups : "
                                   "~/.claude/backups/claude-control/"
                                   "orphan-plugins/"),
+        "suggest_job_lost": ("Suggestion perdue (serveur redémarré ?) — "
+                             "relance « Suggérer »."),
     },
     "en": {
         "bulk_already_running": "A repair is already running",
@@ -2375,6 +2451,8 @@ _SRV_MSG = {
         "orphans_backup_suffix": (" — backups: "
                                   "~/.claude/backups/claude-control/"
                                   "orphan-plugins/"),
+        "suggest_job_lost": ("Suggestion lost (server restarted?) — click "
+                             "“Suggest” again."),
     },
 }
 

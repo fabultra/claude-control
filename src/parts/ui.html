@@ -2494,11 +2494,32 @@ async function suggestSkillDescription(){
   try {
     // v1.9.6 - lang : par defaut langue UI, override via REPAIR_SUGGEST_LANG si toggle utilise
     const lang = (typeof REPAIR_SUGGEST_LANG !== 'undefined' && REPAIR_SUGGEST_LANG) || CURRENT_LANG || 'fr';
-    const r = await fetch('/api/suggest-skill-description', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: CURRENT_REPAIR_SKILL, lang: lang}),
-    });
-    const j = await r.json();
+    // v1.15.0 - job de fond au lieu d'une requete qui pouvait durer des
+    // minutes (echelle + auto-heal + relance) : le POST -start retourne un
+    // id tout de suite, on interroge le job toutes les 2 s en affichant le
+    // temps ecoule. Recharger la page ne tue plus la suggestion, et aucun
+    // thread serveur ne reste bloque.
+    const startedFor = CURRENT_REPAIR_SKILL;
+    const start = await api('/api/suggest-skill-description-start', {name: startedFor, lang: lang});
+    if(!start.success){
+      const m = start.message || 'start failed';
+      setMeta('<strong>&#9888; ' + escAttr(m) + '</strong>', 'red');
+      banner('red', m);
+      return;
+    }
+    let st = null;
+    for(;;){
+      await new Promise(res=>setTimeout(res, 2000));
+      // Modale fermee ou passee a un autre skill : on arrete de suivre (le
+      // job finit cote serveur, sans rien casser).
+      if (CURRENT_REPAIR_SKILL !== startedFor) return;
+      try {
+        st = await (await fetch('/api/suggest-job/' + encodeURIComponent(start.job), {headers:{'X-CC-Lang': CURRENT_LANG}})).json();
+      } catch(e) { continue; }  // reseau transitoire : on repollera
+      if (!st || st.running === false) break;
+      setMeta(tr('repair_skill_suggesting') + ' (' + Math.round(st.seconds || 0) + ' s)', 'gray');
+    }
+    const j = (st && st.result) || {success: false, message: 'job perdu'};
     console.log('[repair] suggest response:', j);  // debug visibility
     if (!j.success) {
       const msg = j.error || j.message || 'Suggestion failed (no message)';
