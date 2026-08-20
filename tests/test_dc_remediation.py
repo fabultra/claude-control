@@ -7,6 +7,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -63,13 +64,44 @@ class DcFreezeClassifyTests(unittest.TestCase):
         verdict = app._dc_freeze_classify(self.cfg)["verdict"]
         self.assertEqual(verdict, "idle_legitimate")
 
-    def test_frozen_isolated_when_log_stale_and_claude_alive(self):
-        """Coeur du fix v1.7.0 : log silencieux > seuil ET Claude responsive
-        = freeze DC isole, agir."""
+    def test_idle_legitimate_when_log_stale_but_no_client_call(self):
+        """v1.8.1 - Un log silencieux n'est PAS un gel.
+
+        Ce test remplace test_frozen_isolated_when_log_stale_and_claude_alive,
+        qui encodait la doctrine v1.7.0 : "log silencieux au-dela du seuil +
+        Claude responsive = gel isole, agir". Mesure du 2026-08-20 sur 2 591
+        appels : zero appel sans reponse, DC ne gele jamais cote backend. Un
+        log muet signifie le plus souvent que personne n'appelle DC.
+
+        Sans appel client dans la fenetre analysee, le verdict doit etre
+        idle_legitimate et le watchdog ne doit rien toucher.
+        """
         self._stub_dc(log_age=300)
         app._claude_responsive = lambda timeout=2: True
-        verdict = app._dc_freeze_classify(self.cfg)["verdict"]
-        self.assertEqual(verdict, "frozen_isolated")
+        with mock.patch.object(
+                app, "_classify_dc_log_freeze_type",
+                lambda path: {"type": "inconclusive",
+                              "details": {"client_ids_count": 0}}):
+            resultat = app._dc_freeze_classify(self.cfg)
+        self.assertEqual(resultat["verdict"], "idle_legitimate")
+        self.assertEqual(resultat.get("idle_reason"),
+                         "log_silencieux_sans_appel_client")
+
+    def test_frozen_backend_when_client_calls_unanswered(self):
+        """Le vrai gel backend : des appels clients restent sans reponse.
+
+        C'est le seul cas ou le watchdog doit agir. La difference avec le test
+        precedent tient a la presence d'appels clients, pas au silence du log.
+        """
+        self._stub_dc(log_age=300)
+        app._claude_responsive = lambda timeout=2: True
+        with mock.patch.object(
+                app, "_classify_dc_log_freeze_type",
+                lambda path: {"type": "frozen_backend",
+                              "details": {"client_ids_count": 3,
+                                          "unanswered": 3}}):
+            verdict = app._dc_freeze_classify(self.cfg)["verdict"]
+        self.assertEqual(verdict, "frozen_backend")
 
     def test_global_freeze_when_claude_unresponsive(self):
         """Si Claude Desktop ne repond pas non plus, c'est un freeze global,

@@ -5566,8 +5566,21 @@ def _dc_freeze_classify(cfg, now=None):
     elif type_info["type"] == "frozen_ui_rendering":
         verdict = "frozen_ui_rendering"
     else:
-        # Pas assez de donnees pour distinguer - on garde l'ancien comportement
-        # (Type A par defaut) pour ne pas regresser le watchdog DC.
+        # v1.8.1 (2026-08-20) - Un log silencieux n'est PAS un gel.
+        # L'ancien fallback classait tout 'inconclusive' en Type A et togglait
+        # l'extension. Or 'inconclusive' arrive surtout quand la fenetre analysee
+        # ne contient AUCUN appel client : personne ne parle a DC, il est au repos.
+        # Mesure du 2026-08-20 sur 2 591 appels : 0 appel sans reponse, DC ne gele
+        # jamais cote backend. Le toggle cassait donc le transport MCP sans raison
+        # et enclenchait la boucle toggle -> toggle_failed -> dialog -> cooldown.
+        # Sans appel client dans la fenetre (ou en cas d'erreur de parsing), on ne
+        # touche a rien : ne rien faire est toujours moins nuisible qu'un toggle.
+        det = type_info.get("details", {})
+        if not det.get("client_ids_count"):
+            return {"verdict": "idle_legitimate", "dc": dc, "log_age": log_age,
+                    "threshold": threshold, "log_path": log_path,
+                    "idle_reason": "log_silencieux_sans_appel_client",
+                    "type_details": det}
         verdict = "frozen_isolated"
     return {"verdict": verdict, "dc": dc, "log_age": log_age, "threshold": threshold,
             "log_path": log_path, "type_details": type_info.get("details", {})}
@@ -5697,15 +5710,37 @@ def _dc_auto_remediation_step(cfg):
         # Pas encore expire, on patiente.
         return
 
-    # Si on vient d'expirer la fenetre de verify, le toggle a echoue.
+    # Fin de la fenetre de verification.
     if state["pending_verify_until_ts"] > 0 and now >= state["pending_verify_until_ts"]:
         state["pending_verify_until_ts"] = 0.0
+        dc = dc_status()
+        # v1.8.2 (2026-08-20) - Ne plus conclure a l'echec sur un log muet.
+        # Le toggle n'a d'effet OBSERVABLE que si quelqu'un appelle DC : le
+        # serveur n'ecrit dans son log qu'en reponse a un appel client. Une
+        # fenetre de verification sans appel client ne prouve donc rien -
+        # l'ancien code y voyait un echec et escaladait vers un dialogue a
+        # chaque fois. C'est le symetrique du correctif v1.8.1 sur le verdict
+        # 'inconclusive' : on ne conclut pas d'une absence de signal.
+        client_calls = None
+        log_path = dc.get("log_path") if dc else None
+        if log_path:
+            try:
+                info = _classify_dc_log_freeze_type(log_path)
+                client_calls = info.get("details", {}).get("client_ids_count")
+            except Exception:
+                client_calls = None
+        if not client_calls:
+            _watchdog_event(
+                "dc_verify_inconclusive_idle",
+                "Fenetre de verification sans appel client : le toggle n'est "
+                "ni confirme ni infirme, aucune escalade."
+            )
+            state["cooldown_until_ts"] = now + 120
+            return
         _watchdog_event(
             "dc_toggle_failed",
-            "Log toujours silencieux apres verify_after_toggle_seconds"
+            "Log silencieux malgre {} appel(s) client apres le toggle".format(client_calls)
         )
-        # Escalade -> dialog
-        dc = dc_status()
         if dc:
             _dc_dialog_prompt_restart_async("toggle_failed")
         return
