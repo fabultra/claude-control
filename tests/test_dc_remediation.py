@@ -65,7 +65,7 @@ class DcFreezeClassifyTests(unittest.TestCase):
         self.assertEqual(verdict, "idle_legitimate")
 
     def test_idle_legitimate_when_log_stale_but_no_client_call(self):
-        """v1.8.1 - Un log silencieux n'est PAS un gel.
+        """v1.15.1 - Un log silencieux n'est PAS un gel.
 
         Ce test remplace test_frozen_isolated_when_log_stale_and_claude_alive,
         qui encodait la doctrine v1.7.0 : "log silencieux au-dela du seuil +
