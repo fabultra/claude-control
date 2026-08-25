@@ -5566,7 +5566,7 @@ def _dc_freeze_classify(cfg, now=None):
     elif type_info["type"] == "frozen_ui_rendering":
         verdict = "frozen_ui_rendering"
     else:
-        # v1.8.1 (2026-08-20) - Un log silencieux n'est PAS un gel.
+        # v1.15.1 (2026-08-20) - Un log silencieux n'est PAS un gel.
         # L'ancien fallback classait tout 'inconclusive' en Type A et togglait
         # l'extension. Or 'inconclusive' arrive surtout quand la fenetre analysee
         # ne contient AUCUN appel client : personne ne parle a DC, il est au repos.
@@ -5714,13 +5714,14 @@ def _dc_auto_remediation_step(cfg):
     if state["pending_verify_until_ts"] > 0 and now >= state["pending_verify_until_ts"]:
         state["pending_verify_until_ts"] = 0.0
         dc = dc_status()
-        # v1.8.2 (2026-08-20) - Ne plus conclure a l'echec sur un log muet.
+        # v1.15.1 (2026-08-20) - Ne plus conclure a l'echec sur un log muet.
         # Le toggle n'a d'effet OBSERVABLE que si quelqu'un appelle DC : le
         # serveur n'ecrit dans son log qu'en reponse a un appel client. Une
         # fenetre de verification sans appel client ne prouve donc rien -
         # l'ancien code y voyait un echec et escaladait vers un dialogue a
-        # chaque fois. C'est le symetrique du correctif v1.8.1 sur le verdict
-        # 'inconclusive' : on ne conclut pas d'une absence de signal.
+        # chaque fois. C'est le symetrique du correctif applique juste
+        # precedent dans _dc_freeze_classify : on ne conclut pas d'une
+        # absence de signal.
         client_calls = None
         log_path = dc.get("log_path") if dc else None
         if log_path:
